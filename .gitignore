@@ -1,4 +1,3 @@
-EXP25033_2025us0059aX11_A.mzML
-EXP25033_2025us0059aX11_A.raw
-fischer-et-al-2008-a-fast-sequest-cross-correlation-algorithm.pdf
-EXP25033_2025us0059aX11_A.mzML
+*.mzML
+*.raw
+*.pdf
