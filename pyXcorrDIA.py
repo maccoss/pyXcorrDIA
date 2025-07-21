@@ -18,6 +18,10 @@ from typing import List, Tuple, Dict, Optional
 import argparse
 import pymzml
 import xml.etree.ElementTree as ET
+import os
+import bisect
+import sys
+from datetime import datetime
 from xml.dom import minidom
 import os
 from datetime import datetime
@@ -60,12 +64,13 @@ class FastXCorr:
     2. MakeCorrData windowing normalization (10 windows, normalize to 50.0)
     3. Fast XCorr preprocessing with sliding window (offset=75)
     4. Simple dot product scoring (CORRECTED - no 0.005 scaling)
+    5. Static modifications support (default: carbamidomethylation of cysteine +57.021464)
     
     This implementation closely follows the Comet source code to ensure 
     compatibility and reproducibility with the established search engine.
     """
     
-    def __init__(self, bin_width: float = 1.0005079):
+    def __init__(self, bin_width: float = 1.0005079, static_modifications: Optional[Dict[str, float]] = None):
         self.bin_width = bin_width
         self.mass_range = (0, 2000)  # m/z range
         self.num_bins = int((self.mass_range[1] - self.mass_range[0]) / bin_width) + 1
@@ -75,14 +80,36 @@ class FastXCorr:
         self.inverse_bin_width = 1.0 / bin_width  # g_staticParams.dInverseBinWidth
         self.bin_offset = 0.4  # g_staticParams.dOneMinusBinOffset (hardcoded as requested)
         
-        # Amino acid masses (monoisotopic)
-        self.aa_masses = {
+        # Amino acid masses (monoisotopic, unmodified)
+        self.base_aa_masses = {
             'A': 71.037114, 'R': 156.101111, 'N': 114.042927, 'D': 115.026943,
             'C': 103.009185, 'E': 129.042593, 'Q': 128.058578, 'G': 57.021464,
             'H': 137.058912, 'I': 113.084064, 'L': 113.084064, 'K': 128.094963,
             'M': 131.040485, 'F': 147.068414, 'P': 97.052764, 'S': 87.032028,
             'T': 101.047679, 'W': 186.079313, 'Y': 163.063329, 'V': 99.068414
         }
+        
+        # Static modifications (fixed modifications applied to all instances)
+        # Default: Carbamidomethylation of cysteine (+57.021464)
+        # To add other static modifications, pass a dictionary like:
+        # {'C': 57.021464, 'M': 15.994915}  # Carbamidomethyl-Cys + Oxidation-Met
+        # Common examples:
+        #   'M': 15.994915   # Oxidation of methionine
+        #   'K': 8.014199    # 13C(6)15N(2) lysine (SILAC)
+        #   'R': 10.008269   # 13C(6)15N(4) arginine (SILAC)
+        #   'S': 79.966331   # Phosphorylation of serine
+        #   'T': 79.966331   # Phosphorylation of threonine
+        #   'Y': 79.966331   # Phosphorylation of tyrosine
+        if static_modifications is None:
+            self.static_modifications = {'C': 57.021464}  # Carbamidomethylation
+        else:
+            self.static_modifications = static_modifications.copy()
+        
+        # Apply static modifications to create final aa_masses
+        self.aa_masses = self.base_aa_masses.copy()
+        for aa, mod_mass in self.static_modifications.items():
+            if aa in self.aa_masses:
+                self.aa_masses[aa] += mod_mass
         
         # Ion type masses
         self.h2o_mass = 18.010565
@@ -91,6 +118,42 @@ class FastXCorr:
         
         # Pre-sorted peptide candidates by m/z for fast lookup
         self.sorted_peptides_by_mz = {}  # Dict[charge_state, List[Tuple[mz, peptide]]]
+    
+    def get_static_modifications(self) -> Dict[str, float]:
+        """
+        Get the current static modifications.
+        
+        Returns:
+            Dictionary mapping amino acid to mass modification
+        """
+        return self.static_modifications.copy()
+    
+    def add_static_modification(self, amino_acid: str, mass_delta: float):
+        """
+        Add or update a static modification for an amino acid.
+        
+        Args:
+            amino_acid: Single letter amino acid code
+            mass_delta: Mass delta to add to the amino acid (in Da)
+        """
+        if amino_acid not in self.base_aa_masses:
+            raise ValueError(f"Unknown amino acid: {amino_acid}")
+        
+        self.static_modifications[amino_acid] = mass_delta
+        # Update the working aa_masses dictionary
+        self.aa_masses[amino_acid] = self.base_aa_masses[amino_acid] + mass_delta
+    
+    def remove_static_modification(self, amino_acid: str):
+        """
+        Remove a static modification for an amino acid.
+        
+        Args:
+            amino_acid: Single letter amino acid code
+        """
+        if amino_acid in self.static_modifications:
+            del self.static_modifications[amino_acid]
+            # Reset to base mass
+            self.aa_masses[amino_acid] = self.base_aa_masses[amino_acid]
     
     def bin_mass(self, mass: float) -> int:
         """
@@ -342,6 +405,194 @@ class FastXCorr:
                     break
         
         return scan_ids
+    
+    def generate_decoy_sequence(self, sequence: str, cycle_length: int = 1) -> str:
+        """
+        Generate decoy peptide sequence by cycling N amino acids (default 1).
+        Keep the C-terminal K/R in place if present.
+        
+        Args:
+            sequence: Original peptide sequence
+            cycle_length: Number of positions to cycle (default 1)
+            
+        Returns:
+            Decoy sequence with cycled amino acids
+        """
+        if len(sequence) <= 1:
+            return sequence
+            
+        # Check if sequence ends with K or R
+        if sequence[-1] in ['K', 'R']:
+            # Keep C-terminal K/R in place, cycle the rest
+            core_sequence = sequence[:-1]
+            c_terminal = sequence[-1]
+        else:
+            # No tryptic C-terminus, cycle entire sequence
+            core_sequence = sequence
+            c_terminal = ''
+            
+        # If core sequence too short to cycle meaningfully
+        if len(core_sequence) <= cycle_length:
+            return sequence  # Return original if can't cycle
+            
+        # Cycle the sequence by moving first N amino acids to the end
+        cycle_length = cycle_length % len(core_sequence)  # Handle cycle_length > sequence length
+        if cycle_length == 0:
+            cycled_core = core_sequence
+        else:
+            cycled_core = core_sequence[cycle_length:] + core_sequence[:cycle_length]
+            
+        return cycled_core + c_terminal
+    
+    def generate_reversed_decoy_sequence(self, sequence: str) -> str:
+        """
+        Generate decoy peptide sequence by reversing amino acids.
+        Keep the C-terminal K/R in place if present.
+        
+        Args:
+            sequence: Original peptide sequence
+            
+        Returns:
+            Decoy sequence with reversed amino acids
+        """
+        if len(sequence) <= 1:
+            return sequence
+            
+        # Check if sequence ends with K or R
+        if sequence[-1] in ['K', 'R']:
+            # Keep C-terminal K/R in place, reverse the rest
+            core_sequence = sequence[:-1]
+            c_terminal = sequence[-1]
+        else:
+            # No tryptic C-terminus, reverse entire sequence
+            core_sequence = sequence
+            c_terminal = ''
+            
+        # Reverse the core sequence
+        reversed_core = core_sequence[::-1]
+            
+        return reversed_core + c_terminal
+    
+    def make_peptides_non_redundant(self, all_peptides: List[PeptideCandidate]) -> List[PeptideCandidate]:
+        """
+        Make peptide list non-redundant by concatenating protein accessions for duplicate sequences.
+        
+        Args:
+            all_peptides: List of all peptide candidates (may contain duplicates)
+            
+        Returns:
+            List of non-redundant peptides with concatenated protein IDs
+        """
+        # Dictionary to group peptides by sequence
+        peptide_groups = defaultdict(list)
+        
+        for peptide in all_peptides:
+            peptide_groups[peptide.sequence].append(peptide)
+        
+        # Create non-redundant list
+        non_redundant_peptides = []
+        for sequence, peptides in peptide_groups.items():
+            if len(peptides) == 1:
+                # Single occurrence, keep as is
+                non_redundant_peptides.append(peptides[0])
+            else:
+                # Multiple occurrences, concatenate protein IDs
+                protein_ids = [p.protein_id for p in peptides]
+                concatenated_protein_id = ';'.join(sorted(set(protein_ids)))  # Remove duplicates and sort
+                
+                # Use first peptide as template, update protein_id
+                merged_peptide = PeptideCandidate(sequence, concatenated_protein_id, peptides[0].mass)
+                non_redundant_peptides.append(merged_peptide)
+        
+        return non_redundant_peptides
+    
+    def generate_target_decoy_pairs(self, target_peptides: List[PeptideCandidate], 
+                                  cycle_length: int = 1) -> List[Tuple[PeptideCandidate, PeptideCandidate]]:
+        """
+        Generate target-decoy pairs for proper target-decoy competition.
+        
+        Uses reversal as the default decoy generation method (keeping C-terminal K/R fixed),
+        with cycling as a fallback if reversal fails to generate a valid decoy.
+        
+        Args:
+            target_peptides: List of target peptides (should be non-redundant)
+            cycle_length: Number of positions to cycle for decoy generation (used in fallback)
+            
+        Returns:
+            List of (target_peptide, decoy_peptide) tuples
+        """
+        target_decoy_pairs = []
+        
+        # Create a set of all target sequences for collision detection
+        target_sequences = {peptide.sequence for peptide in target_peptides}
+        
+        # Track statistics
+        pairs_created = 0
+        collisions_resolved = 0
+        cycling_fallback_used = 0
+        max_retries_exceeded = 0
+        
+        for target_peptide in target_peptides:
+            decoy_generated = False
+            max_retries = min(10, len(target_peptide.sequence) - 1)
+            
+            # First, try reversal as the default method
+            decoy_sequence = self.generate_reversed_decoy_sequence(target_peptide.sequence)
+            
+            # Check if reversed decoy is valid
+            if decoy_sequence != target_peptide.sequence and decoy_sequence not in target_sequences:
+                # Create decoy peptide using reversal
+                decoy_protein_id = f"decoy_{target_peptide.protein_id}"
+                decoy_mass = self.calculate_peptide_mass(decoy_sequence)
+                decoy_peptide = PeptideCandidate(decoy_sequence, decoy_protein_id, decoy_mass)
+                
+                # Create target-decoy pair
+                target_decoy_pairs.append((target_peptide, decoy_peptide))
+                pairs_created += 1
+                decoy_generated = True
+            
+            # If reversal failed, try cycling as fallback
+            if not decoy_generated:
+                for retry_cycle in range(cycle_length, cycle_length + max_retries):
+                    decoy_sequence = self.generate_decoy_sequence(target_peptide.sequence, retry_cycle)
+                    
+                    # Check if decoy is valid (different from target and not in target database)
+                    if decoy_sequence != target_peptide.sequence and decoy_sequence not in target_sequences:
+                        # Create decoy peptide
+                        decoy_protein_id = f"decoy_{target_peptide.protein_id}"
+                        decoy_mass = self.calculate_peptide_mass(decoy_sequence)
+                        decoy_peptide = PeptideCandidate(decoy_sequence, decoy_protein_id, decoy_mass)
+                        
+                        # Create target-decoy pair
+                        target_decoy_pairs.append((target_peptide, decoy_peptide))
+                        pairs_created += 1
+                        cycling_fallback_used += 1
+                        decoy_generated = True
+                        
+                        # Track collision statistics
+                        if retry_cycle > cycle_length:
+                            collisions_resolved += retry_cycle - cycle_length
+                        
+                        break
+                    elif decoy_sequence in target_sequences:
+                        # Collision detected, try next cycle length
+                        continue
+                    else:
+                        # No meaningful decoy could be generated
+                        break
+            
+            if not decoy_generated:
+                max_retries_exceeded += 1
+        
+        # Report statistics
+        print(f"Target-decoy pair generation summary:")
+        print(f"  Target peptides: {len(target_peptides)}")
+        print(f"  Target-decoy pairs created: {pairs_created}")
+        print(f"  Collisions resolved: {collisions_resolved}")
+        print(f"  Cycling fallback used: {cycling_fallback_used}")
+        print(f"  Peptides without valid decoys: {max_retries_exceeded}")
+        
+        return target_decoy_pairs
     
     def digest_protein(self, sequence: str, protein_id: str, 
                       enzyme: str = 'trypsin', missed_cleavages: int = 2) -> List[PeptideCandidate]:
@@ -762,7 +1013,8 @@ class FastXCorr:
         
         # Perform regression while start_corr >= 0 and we have enough points
         slope = 0.0
-        intercept = 0.0
+        mean_x = 0.0
+        mean_y = 0.0
         
         while start_corr >= 0 and next_corr > start_corr + 2:
             sum_x = sum_y = sum_xy = sum_xx = 0.0
@@ -779,7 +1031,7 @@ class FastXCorr:
                 mean_x = sum_x / num_points
                 mean_y = sum_y / num_points
                 
-                # Calculate slope and intercept
+                # Calculate slope
                 for i in range(start_corr, next_corr + 1):
                     if histogram[i] > 0:
                         dx = i - mean_x
@@ -796,10 +1048,11 @@ class FastXCorr:
                     break
                 else:
                     start_corr -= 1
-                
-                intercept = mean_y - slope * mean_x
             else:
                 break
+        
+        # Calculate intercept AFTER the loop completes (Comet algorithm)
+        intercept = mean_y - slope * mean_x
         
         # Calculate E-value for top score
         if slope < 0.0:  # Valid regression
@@ -815,83 +1068,118 @@ class FastXCorr:
         
         return 1.0
     
-    def search_spectrum(self, spectrum: MassSpectrum, peptide_candidates: List[PeptideCandidate],
-                       charge_states: List[int] = [2, 3]) -> List[Tuple[PeptideCandidate, float, float, int]]:
+    def calculate_e_value_by_charge(self, score_distributions_by_charge: Dict[int, List[float]], xcorr_score: float, charge: int) -> float:
         """
-        Search a spectrum against peptide candidates using Comet-style XCorr with fast lookup.
-        
-        Uses pre-sorted peptide index for efficient binary search within isolation window.
-        Returns the best results for each charge state separately.
+        Calculate E-value for a specific charge state using charge-specific score distribution.
         
         Args:
-            spectrum: The experimental spectrum (with isolation window information)
-            peptide_candidates: List of peptide candidates (not used directly, uses pre-built index)
-            charge_states: List of charge states to consider (default: [2, 3])
-        
-        Returns list of (peptide, xcorr_score, e_value, charge) tuples, grouped by charge state.
+            score_distributions_by_charge: Dictionary mapping charge state to list of XCorr scores
+            xcorr_score: The XCorr score to calculate E-value for
+            charge: The charge state for E-value calculation
+            
+        Returns:
+            E-value for the given score and charge state
         """
-        # Apply Comet's two-stage preprocessing ONCE (without peak filtering like Comet)
+        if charge not in score_distributions_by_charge:
+            return 1.0  # No data for this charge state
+            
+        xcorr_scores = score_distributions_by_charge[charge]
+        
+        if len(xcorr_scores) < 10:  # Need minimum scores for statistical modeling
+            return 1.0
+            
+        # Use the existing calculate_e_value method with charge-specific scores
+        return self.calculate_e_value(xcorr_scores, xcorr_score)
+
+    def search_spectrum_target_decoy(self, spectrum: MassSpectrum, target_decoy_pairs: List[Tuple[PeptideCandidate, PeptideCandidate]],
+                                    charge_states: List[int] = [2, 3]) -> List[Tuple[PeptideCandidate, float, float, int]]:
+        """
+        Search spectrum with proper target-decoy competition.
+        
+        For each target-decoy pair that falls within the isolation window:
+        1. Score both target and decoy against the spectrum
+        2. Keep only the winner (higher XCorr score)
+        3. Return the top N winners across all charge states
+        
+        Args:
+            spectrum: The experimental spectrum
+            target_decoy_pairs: List of (target_peptide, decoy_peptide) tuples
+            charge_states: List of charge states to consider
+            
+        Returns:
+            List of (winning_peptide, xcorr_score, e_value, charge) tuples
+        """
+        # Apply preprocessing once
         windowed_spectrum = self.preprocess_spectrum(spectrum)
         preprocessed_spectrum = self.preprocess_for_xcorr(windowed_spectrum)
         
-        # Get the isolation window boundaries from the spectrum
+        # Get isolation window
         isolation_window_lower = spectrum.isolation_window_lower
         isolation_window_upper = spectrum.isolation_window_upper
         
         if isolation_window_lower == 0.0 or isolation_window_upper == 0.0:
-            return []  # No valid isolation window
-        
-        # Fast lookup of peptides within isolation window using binary search
-        if hasattr(self, 'sorted_peptides_by_mz') and self.sorted_peptides_by_mz:
-            peptide_charge_pairs = self.find_peptides_in_isolation_window(
-                isolation_window_lower, isolation_window_upper, charge_states)
-        else:
-            # Fallback to linear search if index not built
-            peptide_charge_pairs = []
-            for peptide in peptide_candidates:
-                for charge in charge_states:
-                    # Calculate theoretical m/z for this peptide at this charge state
-                    theoretical_mz = (peptide.mass + charge * self.proton_mass) / charge
-                    
-                    # Check if this theoretical m/z falls within the precursor isolation window
-                    if isolation_window_lower <= theoretical_mz <= isolation_window_upper:
-                        peptide_charge_pairs.append((peptide, charge))
-        
-        # If no peptides pass mass filter, return empty results
-        if not peptide_charge_pairs:
             return []
         
-        # Group results by charge state and calculate xcorr for each
-        results_by_charge = {}
-        all_xcorr_scores = []
+        # Find target-decoy pairs within isolation window and conduct competition
+        competition_winners = []
+        score_distributions_by_charge = {}  # Track scores separately for each charge state
         
-        for peptide, charge in peptide_charge_pairs:
+        for target_peptide, decoy_peptide in target_decoy_pairs:
+            for charge in charge_states:
+                # Check if either target or decoy falls within isolation window
+                target_mz = (target_peptide.mass + charge * self.proton_mass) / charge
+                decoy_mz = (decoy_peptide.mass + charge * self.proton_mass) / charge
+                
+                target_in_window = isolation_window_lower <= target_mz <= isolation_window_upper
+                decoy_in_window = isolation_window_lower <= decoy_mz <= isolation_window_upper
+                
+                # For proper target-decoy competition, both should have same mass
+                # But check both just in case there are small mass differences
+                if target_in_window or decoy_in_window:
+                    # Score both target and decoy
+                    target_theoretical = self.generate_theoretical_spectrum(target_peptide, charge)
+                    target_xcorr = self.calculate_fast_xcorr(target_theoretical, preprocessed_spectrum)
+                    
+                    decoy_theoretical = self.generate_theoretical_spectrum(decoy_peptide, charge)
+                    decoy_xcorr = self.calculate_fast_xcorr(decoy_theoretical, preprocessed_spectrum)
+                    
+                    # Target-decoy competition: keep the winner
+                    if target_xcorr >= decoy_xcorr:
+                        winner = target_peptide
+                        winning_score = target_xcorr
+                    else:
+                        winner = decoy_peptide
+                        winning_score = decoy_xcorr
+                    
+                    competition_winners.append((winner, winning_score, charge))
+                    
+                    # Track scores by charge state for separate E-value calculations
+                    if charge not in score_distributions_by_charge:
+                        score_distributions_by_charge[charge] = []
+                    score_distributions_by_charge[charge].append(winning_score)
+        
+        # Sort winners by XCorr score (descending) within each charge state
+        results_by_charge = {}
+        for winner, score, charge in competition_winners:
             if charge not in results_by_charge:
                 results_by_charge[charge] = []
-            
-            # Generate theoretical spectrum for this charge state
-            theoretical = self.generate_theoretical_spectrum(peptide, charge)
-            
-            # Calculate XCorr using Comet's method
-            xcorr_score = self.calculate_fast_xcorr(theoretical, preprocessed_spectrum)
-            all_xcorr_scores.append(xcorr_score)
-            results_by_charge[charge].append((peptide, xcorr_score, charge))
+            results_by_charge[charge].append((winner, score, charge))
         
-        # Sort results within each charge state by XCorr score (descending)
+        # Sort within each charge state
         for charge in results_by_charge:
             results_by_charge[charge].sort(key=lambda x: x[1], reverse=True)
         
-        # Calculate E-values and combine results from all charge states
+        # Calculate E-values separately for each charge state using charge-specific distributions
         final_results = []
         for charge in charge_states:
             if charge in results_by_charge:
-                charge_results = results_by_charge[charge]
-                for peptide, xcorr_score, charge in charge_results:
-                    e_value = self.calculate_e_value(all_xcorr_scores, xcorr_score)
-                    final_results.append((peptide, xcorr_score, e_value, charge))
+                for winner, xcorr_score, charge in results_by_charge[charge]:
+                    # Use charge-specific E-value calculation
+                    e_value = self.calculate_e_value_by_charge(score_distributions_by_charge, xcorr_score, charge)
+                    final_results.append((winner, xcorr_score, e_value, charge))
         
-        # Sort all results by charge state first, then by XCorr score within each charge state
-        final_results.sort(key=lambda x: (x[3], -x[1]))  # Sort by charge, then by descending XCorr
+        # Sort by charge state first, then by XCorr score
+        final_results.sort(key=lambda x: (x[3], -x[1]))
         
         return final_results
 
@@ -945,14 +1233,14 @@ class PepXMLWriter:
 '''
         self.file_handle.write(footer)
     
-    def write_spectrum_query(self, spectrum: 'MassSpectrum', search_results: List[Tuple['PeptideCandidate', float, float, int]], top_hits_per_charge: int = 5):
+    def write_spectrum_query(self, spectrum: 'MassSpectrum', search_results: List[Tuple['PeptideCandidate', float, float, int]], top_hits_per_charge: int = 3):
         """
         Write a spectrum query with its search results, grouped by charge state.
         
         Args:
             spectrum: The experimental spectrum
             search_results: List of (peptide, xcorr_score, e_value, charge) tuples
-            top_hits_per_charge: Number of top hits to report per charge state
+            top_hits_per_charge: Number of top hits to report per charge state (default: 3)
         """
         self.spectrum_counter += 1
         
@@ -1040,115 +1328,295 @@ class PepXMLWriter:
         return str(self.spectrum_counter)
 
 
+class PINWriter:
+    """Class to write results in Percolator Input (PIN) format."""
+    
+    def __init__(self, output_file: str, mzml_file: str):
+        self.output_file = output_file
+        self.mzml_file = mzml_file
+        self.file_handle = None
+        self.spectrum_counter = 0
+        # Extract base filename without extension for SpecId generation
+        self.base_filename = os.path.splitext(os.path.basename(mzml_file))[0]
+        
+    def __enter__(self):
+        self.file_handle = open(self.output_file, 'w')
+        self._write_header()
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.file_handle:
+            self.file_handle.close()
+    
+    def _write_header(self):
+        """Write PIN header."""
+        # PIN format: tab-delimited with specific columns matching Percolator input format
+        header = "SpecId\tLabel\tScanNr\tExpMass\tCalcMass\te-value\tXcorr\tIonFrac\tPepLen\tCharge1\tCharge2\tCharge3\tdM\tabsdM\tPeptide\tProteins\n"
+        self.file_handle.write(header)
+    
+    def write_spectrum_results(self, spectrum: 'MassSpectrum', search_results: List[Tuple['PeptideCandidate', float, float, int]]):
+        """
+        Write best peptide results for each charge state to PIN format.
+        
+        For each spectrum, write only the best peptide for each charge state (target and decoy).
+        
+        Args:
+            spectrum: The experimental spectrum
+            search_results: List of (peptide, xcorr_score, e_value, charge) tuples
+        """
+        self.spectrum_counter += 1
+        
+        if not search_results:
+            return
+        
+        # Extract scan number from spectrum scan_id
+        scan_nr = self._extract_scan_number(spectrum.scan_id)
+        
+        # Calculate experimental mass (center of precursor isolation window)
+        exp_mass = (spectrum.isolation_window_lower + spectrum.isolation_window_upper) / 2.0
+        
+        # Group results by charge state and keep only the best (highest XCorr) for each charge
+        best_by_charge = {}
+        for peptide, xcorr_score, e_value, charge in search_results:
+            if charge not in best_by_charge or xcorr_score > best_by_charge[charge][1]:
+                best_by_charge[charge] = (peptide, xcorr_score, e_value, charge)
+        
+        # Write the best peptide for each charge state
+        for peptide, xcorr_score, e_value, charge in best_by_charge.values():
+            # Generate SpecId: filename_scannr_scannr_charge
+            spec_id = f"{self.base_filename}_{scan_nr}_{scan_nr}_{charge}"
+            
+            # Calculate theoretical m/z
+            calc_mass = (peptide.mass + charge * 1.007276) / charge  # Using proton mass
+            
+            # Determine label (1 for target, -1 for decoy)
+            label = -1 if peptide.protein_id.startswith('decoy_') else 1
+            
+            # Calculate mass difference (dM = ExpMass - CalcMass)
+            dm = exp_mass - calc_mass
+            abs_dm = abs(dm)
+            
+            # Ion fraction (placeholder - we don't calculate this yet)
+            ion_frac = 0.0
+            
+            # Peptide length
+            pep_len = len(peptide.sequence)
+            
+            # Charge state booleans
+            charge1 = 1 if charge == 1 else 0
+            charge2 = 1 if charge == 2 else 0  
+            charge3 = 1 if charge == 3 else 0
+            
+            # Format peptide with flanking amino acids (using placeholder)
+            peptide_formatted = f"-.{peptide.sequence}.-"
+            
+            # Extract protein identifier (first part before any description)
+            proteins = peptide.protein_id.split(';')[0]  # Take first protein if multiple
+            
+            # Format the PIN line according to the new specification
+            pin_line = f"{spec_id}\t{label}\t{scan_nr}\t{exp_mass:.6f}\t{calc_mass:.6f}\t{e_value:.6f}\t{xcorr_score:.3f}\t{ion_frac:.5f}\t{pep_len}\t{charge1}\t{charge2}\t{charge3}\t{dm:.6f}\t{abs_dm:.6f}\t{peptide_formatted}\t{proteins}\n"
+            self.file_handle.write(pin_line)
+        
+        self.file_handle.flush()  # Ensure data is written immediately
+    
+    def _extract_scan_number(self, scan_id: str) -> str:
+        """Extract scan number from scan ID."""
+        # Convert to string if it's not already
+        scan_id_str = str(scan_id)
+        
+        # Try to extract number from scan ID
+        import re
+        match = re.search(r'scan[=\s]*(\d+)', scan_id_str, re.IGNORECASE)
+        if match:
+            return match.group(1)
+        
+        # Try to find any number in the scan ID
+        match = re.search(r'(\d+)', scan_id_str)
+        if match:
+            return match.group(1)
+        
+        return str(self.spectrum_counter)
+
+
 def main():
     """Main function to run the Comet-style fast XCorr search."""
-    parser = argparse.ArgumentParser(description='Comet-style Fast XCorr Database Search (CORRECTED)')
+    parser = argparse.ArgumentParser(description='Comet-style Fast XCorr Database Search with Target-Decoy Competition')
     parser.add_argument('fasta_file', help='FASTA file containing protein sequences')
     parser.add_argument('mzml_file', help='mzML file containing mass spectra')
     parser.add_argument('--output', '-o', default='', help='Output file (pepXML format). If not specified, uses mzML filename with .pepXML extension')
+    parser.add_argument('--pin_output', '-p', default='', help='Percolator Input (PIN) output file. If not specified, uses mzML filename with .pin extension')
     parser.add_argument('--top_hits', '-n', type=int, default=10, 
                        help='Number of top hits to report per spectrum (distributed across charge states)')
     parser.add_argument('--max_spectra', '-m', type=int, default=0, 
                        help='Maximum number of MS2 spectra to process (0 = process all)')
     parser.add_argument('--charge_states', '-c', type=str, default='2,3',
                        help='Comma-separated list of charge states to consider (default: 2,3)')
+    parser.add_argument('--decoy_cycle_length', '-d', type=int, default=1,
+                       help='Number of amino acids to cycle for decoy generation (default: 1)')
+    parser.add_argument('--static_mods', '-s', type=str, default='C:57.021464',
+                       help='Static modifications as AA:mass pairs separated by commas (default: C:57.021464 for carbamidomethylation). Use "none" for no modifications.')
     
     args = parser.parse_args()
+    
+    # Parse static modifications
+    static_modifications = {}
+    if args.static_mods.lower() != 'none':
+        try:
+            for mod_str in args.static_mods.split(','):
+                mod_str = mod_str.strip()
+                if ':' in mod_str:
+                    aa, mass_str = mod_str.split(':', 1)
+                    aa = aa.strip().upper()
+                    mass = float(mass_str.strip())
+                    static_modifications[aa] = mass
+        except ValueError as e:
+            print(f"Error parsing static modifications '{args.static_mods}': {e}")
+            print("Format should be: AA:mass,AA:mass (e.g., C:57.021464,M:15.994915)")
+            sys.exit(1)
     
     # Parse charge states
     charge_states = [int(c.strip()) for c in args.charge_states.split(',')]
     print(f"Using charge states: {charge_states}")
-    print("FINAL CORRECTED VERSION: Using proper Comet XCorr scaling")
-    print("- Theoretical spectrum: unit intensities (1.0)")
-    print("- Experimental spectrum: normalized to 50.0 in MakeCorrData")
-    print("- Final XCorr: raw dot product * 0.005 (Comet's scaling factor)")
+    print("pyXcorrDIA: Using Comet XCorr with target-decoy competition")
+    print(f"- Decoy generation: cycling {args.decoy_cycle_length} amino acid(s)")
+    
+    # Display static modifications
+    if static_modifications:
+        print("- Static modifications:")
+        for aa, mass in static_modifications.items():
+            print(f"    {aa}: +{mass:.6f} Da")
+    else:
+        print("- Static modifications: None")
     
     # Determine output filename
     if not args.output:
         base_name = os.path.splitext(args.mzml_file)[0]
         args.output = base_name + '.pepXML'
     
-    # Initialize Comet-style XCorr engine
-    xcorr_engine = FastXCorr()
+    # Determine PIN output filename
+    if not args.pin_output:
+        base_name = os.path.splitext(args.mzml_file)[0]
+        args.pin_output = base_name + '.pin'
+    
+    # Initialize Comet-style XCorr engine with static modifications
+    xcorr_engine = FastXCorr(static_modifications=static_modifications)
     
     print("Reading FASTA file...")
     proteins = xcorr_engine.read_fasta(args.fasta_file)
     print(f"Loaded {len(proteins)} proteins")
     
     print("Digesting proteins...")
-    all_peptides = []
+    all_target_peptides = []
     for protein_id, sequence in proteins.items():
         peptides = xcorr_engine.digest_protein(sequence, protein_id)
-        all_peptides.extend(peptides)
-    print(f"Generated {len(all_peptides)} peptide candidates")
+        all_target_peptides.extend(peptides)
+    print(f"Generated {len(all_target_peptides)} target peptide candidates")
     
-    # Build peptide index for fast isolation window lookup
-    print("Building peptide index for fast isolation window lookup...")
-    xcorr_engine.build_peptide_index(all_peptides, charge_states)
+    print("Making peptide list non-redundant...")
+    non_redundant_targets = xcorr_engine.make_peptides_non_redundant(all_target_peptides)
+    print(f"Non-redundant target peptides: {len(non_redundant_targets)} (removed {len(all_target_peptides) - len(non_redundant_targets)} duplicates)")
     
+    print("Generating target-decoy pairs for competition...")
+    target_decoy_pairs = xcorr_engine.generate_target_decoy_pairs(non_redundant_targets, args.decoy_cycle_length)
+    print(f"Target-decoy pairs: {len(target_decoy_pairs)} pairs ready for competition")
+    
+    # No need for separate peptide indexing - we'll search pairs directly
     print("Reading mzML file...")
     if args.max_spectra > 0:
         print(f"Limiting to first {args.max_spectra} MS2 spectra")
     spectra = xcorr_engine.read_mzml(args.mzml_file, args.max_spectra)
     
-    print(f"Processing {len(spectra)} MS2 spectra with CORRECTED Comet-style XCorr")
+    print(f"Processing {len(spectra)} MS2 spectra with Target-Decoy Competition")
     
-    print("Performing database search...")
+    print("Performing target-decoy competition search...")
     print(f"Writing results to {args.output}")
+    print(f"Writing PIN results to {args.pin_output}")
     
-    # Initialize pepXML writer and process spectra
+    # Initialize pepXML and PIN writers and process spectra
     total_identifications = 0
+    target_hits = 0
+    decoy_hits = 0
     
-    with PepXMLWriter(args.output, args.mzml_file, args.fasta_file) as writer:
+    with PepXMLWriter(args.output, args.mzml_file, args.fasta_file) as pepxml_writer, \
+         PINWriter(args.pin_output, args.mzml_file) as pin_writer:
         spectra_with_hits = 0
         for i, spectrum in enumerate(spectra):
-            # Calculate isolation window info from the mzML file
+            # Calculate isolation window info
             precursor_mz = spectrum.precursor_mz
             isolation_window_lower = spectrum.isolation_window_lower
             isolation_window_upper = spectrum.isolation_window_upper
             window_width = isolation_window_upper - isolation_window_lower
             
-            # Fast lookup of peptides in isolation window
-            if hasattr(xcorr_engine, 'sorted_peptides_by_mz') and xcorr_engine.sorted_peptides_by_mz:
-                peptide_charge_pairs = xcorr_engine.find_peptides_in_isolation_window(
-                    isolation_window_lower, isolation_window_upper, charge_states)
-                peptides_in_window = len(peptide_charge_pairs)
+            # Count pairs in isolation window (for reporting)
+            pairs_in_window = 0
+            for target_peptide, decoy_peptide in target_decoy_pairs:
+                for charge in charge_states:
+                    target_mz = (target_peptide.mass + charge * xcorr_engine.proton_mass) / charge
+                    if isolation_window_lower <= target_mz <= isolation_window_upper:
+                        pairs_in_window += 1
+                        break  # Count each pair only once
+            
+            # Adaptive progress reporting: more frequent for smaller datasets
+            if len(spectra) <= 100:
+                report_interval = 10
+            elif len(spectra) <= 1000:
+                report_interval = 50
             else:
-                # Fallback to counting with linear search
-                peptides_in_window = 0
-                for peptide in all_peptides:
-                    for charge in charge_states:
-                        theoretical_mz = (peptide.mass + charge * xcorr_engine.proton_mass) / charge
-                        if isolation_window_lower <= theoretical_mz <= isolation_window_upper:
-                            peptides_in_window += 1
-                            break  # Count each peptide only once even if it matches multiple charge states
+                report_interval = 100
             
-            if i % 100 == 0 or len(spectra) <= 10:  # Always show for small runs
-                print(f"Processing spectrum {i+1}/{len(spectra)} - Precursor: {precursor_mz:.4f} m/z, Window: [{isolation_window_lower:.5f}-{isolation_window_upper:.5f}] ({window_width:.5f} m/z), Peptides in window: {peptides_in_window} - {spectra_with_hits} spectra searched")
+            if i % report_interval == 0 or i == 0:
+                print(f"Processing spectrum {i+1}/{len(spectra)} - Precursor: {precursor_mz:.4f} m/z, Window: [{isolation_window_lower:.5f}-{isolation_window_upper:.5f}] ({window_width:.5f} m/z), Pairs in window: {pairs_in_window} - {spectra_with_hits} spectra searched")
             
-            # Search spectrum with Comet-style XCorr and configurable charge states
-            search_results = xcorr_engine.search_spectrum(spectrum, all_peptides, charge_states)
+            # Search spectrum with target-decoy competition
+            search_results = xcorr_engine.search_spectrum_target_decoy(spectrum, target_decoy_pairs, charge_states)
             
-            # Write results for every spectrum (even if no matches found)
-            # Report top hits per charge state (distribute across charge states)
-            top_hits_per_charge = max(1, args.top_hits // len(charge_states))  # Distribute top_hits across charge states
-            writer.write_spectrum_query(spectrum, search_results, top_hits_per_charge)
+            # Count target vs decoy hits
+            spectrum_target_hits = 0
+            spectrum_decoy_hits = 0
+            
+            # Write results to both formats
+            top_hits_per_charge = max(1, args.top_hits // len(charge_states))
+            # Ensure we get exactly 3 hits per charge state when possible
+            if args.top_hits >= 3 * len(charge_states):
+                top_hits_per_charge = 3
+            
+            # Write to pepXML (existing format)
+            pepxml_writer.write_spectrum_query(spectrum, search_results, top_hits_per_charge)
+            
+            # Write to PIN (new format - best peptide per charge state only)
+            pin_writer.write_spectrum_results(spectrum, search_results)
+            
             if search_results:
                 spectra_with_hits += 1
-                # Count total hits across all charge states
+                # Count hits and track target vs decoy
                 hits_by_charge = {}
-                for _, _, _, charge in search_results:
+                for peptide, score, e_value, charge in search_results:
                     if charge not in hits_by_charge:
                         hits_by_charge[charge] = 0
                     if hits_by_charge[charge] < top_hits_per_charge:
                         hits_by_charge[charge] += 1
                         total_identifications += 1
+                        
+                        # Count target vs decoy
+                        if peptide.protein_id.startswith('decoy_'):
+                            spectrum_decoy_hits += 1
+                        else:
+                            spectrum_target_hits += 1
+                
+                target_hits += spectrum_target_hits
+                decoy_hits += spectrum_decoy_hits
     
-    print("Search completed!")
+    print("Target-decoy competition search completed!")
     print(f"Total spectra processed: {len(spectra)}")
     print(f"Spectra with peptide matches: {spectra_with_hits}")
-    print(f"Total identifications: {total_identifications}")
-    print(f"Results saved to: {args.output}")
+    print(f"Total identifications (competition winners): {total_identifications}")
+    print(f"  Target winners: {target_hits}")
+    print(f"  Decoy winners: {decoy_hits}")
+    if total_identifications > 0:
+        fdr_estimate = (decoy_hits / total_identifications) * 100
+        print(f"  Estimated FDR: {fdr_estimate:.2f}%")
+    print(f"pepXML results saved to: {args.output}")
+    print(f"PIN results saved to: {args.pin_output}")
     
 
 
