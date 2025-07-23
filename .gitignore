@@ -1,8 +1,9 @@
 venv/*
 .venv/*
-__pycache__/
+__pycache__/*
 .env/*
-*.mzML
+Ste*.mzML
 *.raw
 *.pdf
-
+*.pepXML
+*.pin
