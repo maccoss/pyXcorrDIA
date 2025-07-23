@@ -70,7 +70,7 @@ class FastXCorr:
     compatibility and reproducibility with the established search engine.
     """
     
-    def __init__(self, bin_width: float = 1.0005079, static_modifications: Optional[Dict[str, float]] = None):
+    def __init__(self, bin_width: float = 1.0005079, bin_offset: float = 0.4, static_modifications: Optional[Dict[str, float]] = None):
         self.bin_width = bin_width
         self.mass_range = (0, 2000)  # m/z range
         self.num_bins = int((self.mass_range[1] - self.mass_range[0]) / bin_width) + 1
@@ -78,7 +78,7 @@ class FastXCorr:
         # Comet BIN macro parameters
         # BIN(dMass) = (int)((dMass)*g_staticParams.dInverseBinWidth + g_staticParams.dOneMinusBinOffset)
         self.inverse_bin_width = 1.0 / bin_width  # g_staticParams.dInverseBinWidth
-        self.bin_offset = 0.4  # g_staticParams.dOneMinusBinOffset (hardcoded as requested)
+        self.bin_offset = bin_offset  # g_staticParams.dOneMinusBinOffset (configurable via command line)
         
         # Amino acid masses (monoisotopic, unmodified)
         self.base_aa_masses = {
@@ -1455,6 +1455,10 @@ def main():
                        help='Number of amino acids to cycle for decoy generation (default: 1)')
     parser.add_argument('--static_mods', '-s', type=str, default='C:57.021464',
                        help='Static modifications as AA:mass pairs separated by commas (default: C:57.021464 for carbamidomethylation). Use "none" for no modifications.')
+    parser.add_argument('--bin_width', '-bw', type=float, default=1.0005079,
+                       help='Mass bin width in Th for spectrum binning (default: 1.0005079, Comet default)')
+    parser.add_argument('--bin_offset', '-bo', type=float, default=0.4,
+                       help='Bin offset for mass binning calculation (default: 0.4, Comet default)')
     
     args = parser.parse_args()
     
@@ -1479,12 +1483,14 @@ def main():
     print(f"Using charge states: {charge_states}")
     print("pyXcorrDIA: Using Comet XCorr with target-decoy competition")
     print(f"- Decoy generation: cycling {args.decoy_cycle_length} amino acid(s)")
+    print(f"- Bin width: {args.bin_width:.7f} Th")
+    print(f"- Bin offset: {args.bin_offset:.1f}")
     
     # Display static modifications
     if static_modifications:
         print("- Static modifications:")
         for aa, mass in static_modifications.items():
-            print(f"    {aa}: +{mass:.6f} Da")
+            print(f"    {aa}: +{mass:.6f} Th")
     else:
         print("- Static modifications: None")
     
@@ -1498,8 +1504,8 @@ def main():
         base_name = os.path.splitext(args.mzml_file)[0]
         args.pin_output = base_name + '.pin'
     
-    # Initialize Comet-style XCorr engine with static modifications
-    xcorr_engine = FastXCorr(static_modifications=static_modifications)
+    # Initialize Comet-style XCorr engine with static modifications and bin parameters
+    xcorr_engine = FastXCorr(bin_width=args.bin_width, bin_offset=args.bin_offset, static_modifications=static_modifications)
     
     print("Reading FASTA file...")
     proteins = xcorr_engine.read_fasta(args.fasta_file)
