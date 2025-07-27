@@ -715,8 +715,14 @@ class FastXCorr:
         for i in range(len(sequence) - 1):  # Exclude last residue (no b_n ion)
             b_mass += self.aa_masses.get(sequence[i], 100.0)
             
-            # Generate fragment charges 1+ and 2+ only (like Comet fragment index)
-            for frag_charge in range(1, min(3, charge + 1)):  # 1+ and 2+ only
+            # Generate fragment charges from 1+ up to (precursor_charge - 1)+
+            # For +1 precursor: only 1+ fragments
+            # For +2 precursor: only 1+ fragments
+            # For +3 precursor: 1+ and 2+ fragments  
+            # For +4 precursor: 1+, 2+, and 3+ fragments
+            max_frag_charge = min(charge - 1, 3)  # Cap at 3+ fragments (like Comet)
+            max_frag_charge = max(max_frag_charge, 1)  # Always generate at least 1+ fragments
+            for frag_charge in range(1, max_frag_charge + 1):  # 1+ to max_frag_charge
                 mz = (b_mass + (frag_charge - 1) * self.proton_mass) / frag_charge
                 if self.mass_range[0] <= mz <= self.mass_range[1]:
                     bin_idx = self.bin_mass(mz)
@@ -731,8 +737,14 @@ class FastXCorr:
         for i in range(len(sequence) - 1, 0, -1):  # Exclude first residue (no y_n ion)
             y_mass += self.aa_masses.get(sequence[i], 100.0)
             
-            # Generate fragment charges 1+ and 2+ only (like Comet fragment index)
-            for frag_charge in range(1, min(3, charge + 1)):  # 1+ and 2+ only  
+            # Generate fragment charges from 1+ up to (precursor_charge - 1)+
+            # For +1 precursor: only 1+ fragments
+            # For +2 precursor: only 1+ fragments
+            # For +3 precursor: 1+ and 2+ fragments  
+            # For +4 precursor: 1+, 2+, and 3+ fragments
+            max_frag_charge = min(charge - 1, 3)  # Cap at 3+ fragments (like Comet)
+            max_frag_charge = max(max_frag_charge, 1)  # Always generate at least 1+ fragments
+            for frag_charge in range(1, max_frag_charge + 1):  # 1+ to max_frag_charge
                 mz = (y_mass + (frag_charge - 1) * self.proton_mass) / frag_charge
                 if self.mass_range[0] <= mz <= self.mass_range[1]:
                     bin_idx = self.bin_mass(mz)
