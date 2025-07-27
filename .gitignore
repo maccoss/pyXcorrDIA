@@ -7,3 +7,5 @@ Ste*.mzML
 *.pdf
 *.pepXML
 *.pin
+__pycache__/pyXcorrDIA.cpython-312.pyc
+comet.params
