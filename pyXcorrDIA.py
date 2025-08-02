@@ -17,6 +17,7 @@ import math
 from typing import List, Tuple, Dict, Optional
 import argparse
 import pymzml
+from pyteomics import mgf
 import xml.etree.ElementTree as ET
 import os
 import bisect
@@ -269,7 +270,80 @@ class FastXCorr:
         
         return spectra
     
-    def read_single_spectrum(self, mzml_file: str, scan_id: str) -> MassSpectrum:
+    def read_mgf(self, mgf_file: str, max_spectra: int = 0) -> List[MassSpectrum]:
+        """Read mass spectra from MGF file using pyteomics."""
+        spectra = []
+        
+        with mgf.read(mgf_file) as reader:
+            for spectrum_idx, spectrum in enumerate(reader):
+                params = spectrum.get('params', {})
+                
+                # Handle pepmass which can be a float, list, or tuple (mass, intensity)
+                pepmass = params.get('pepmass', 0.0)
+                if isinstance(pepmass, (list, tuple)) and len(pepmass) > 0:
+                    precursor_mz = float(pepmass[0])  # First element is always the mass
+                elif pepmass is not None:
+                    try:
+                        precursor_mz = float(pepmass)
+                    except (ValueError, TypeError):
+                        precursor_mz = 0.0
+                else:
+                    precursor_mz = 0.0
+                
+                # Handle charge which can be an int, list, or string
+                charge_param = params.get('charge', 2)
+                if isinstance(charge_param, (list, tuple)) and len(charge_param) > 0:
+                    try:
+                        charge = int(charge_param[0])
+                    except (ValueError, TypeError):
+                        charge = 2
+                elif charge_param is not None:
+                    try:
+                        charge = int(charge_param)
+                    except (ValueError, TypeError):
+                        charge = 2
+                else:
+                    charge = 2
+                
+                # MGF typically doesn't have isolation window info, use default
+                isolation_window_lower = precursor_mz - 1.5
+                isolation_window_upper = precursor_mz + 1.5
+                
+                # Get scan_id from title or use index
+                scan_id = params.get('title', f"scan_{spectrum_idx}")
+                
+                # Get m/z and intensity arrays
+                mz_array = spectrum.get('m/z array', np.array([]))
+                intensity_array = spectrum.get('intensity array', np.array([]))
+                
+                if len(mz_array) > 0 and len(intensity_array) > 0:
+                    mass_spectrum = MassSpectrum(
+                        mz_array=mz_array,
+                        intensity_array=intensity_array,
+                        scan_id=scan_id,
+                        precursor_mz=precursor_mz,
+                        charge=charge,
+                        isolation_window_lower=isolation_window_lower,
+                        isolation_window_upper=isolation_window_upper
+                    )
+                    spectra.append(mass_spectrum)
+                    
+                    # Stop reading if we've reached the maximum number of spectra
+                    if max_spectra > 0 and len(spectra) >= max_spectra:
+                        break
+        
+        return spectra
+
+    def read_single_spectrum(self, spectrum_file: str, scan_id: str) -> MassSpectrum:
+        """Read a single spectrum by scan ID from mzML or MGF file."""
+        if spectrum_file.lower().endswith('.mzml'):
+            return self._read_single_spectrum_mzml(spectrum_file, scan_id)
+        elif spectrum_file.lower().endswith('.mgf'):
+            return self._read_single_spectrum_mgf(spectrum_file, scan_id)
+        else:
+            raise ValueError(f"Unsupported spectrum file format: {spectrum_file}")
+    
+    def _read_single_spectrum_mzml(self, mzml_file: str, scan_id: str) -> MassSpectrum:
         """Read a single spectrum by scan ID using mzML indexing for fast access."""
         try:
             # Use pymzml's indexed access for fast random access
@@ -393,6 +467,65 @@ class FastXCorr:
         
         raise ValueError(f"Scan ID {scan_id} not found in mzML file")
     
+    def _read_single_spectrum_mgf(self, mgf_file: str, scan_id: str) -> MassSpectrum:
+        """Read a single spectrum by scan ID from MGF file using pyteomics."""
+        with mgf.read(mgf_file) as reader:
+            for spectrum_idx, spectrum in enumerate(reader):
+                params = spectrum.get('params', {})
+                spectrum_scan_id = params.get('title', f"scan_{spectrum_idx}")
+                
+                if spectrum_scan_id == scan_id:
+                    # Extract spectrum data using the same logic as read_mgf
+                    params = spectrum.get('params', {})
+                    
+                    # Handle pepmass which can be a float, list, or tuple (mass, intensity)
+                    pepmass = params.get('pepmass', 0.0)
+                    if isinstance(pepmass, (list, tuple)) and len(pepmass) > 0:
+                        precursor_mz = float(pepmass[0])  # First element is always the mass
+                    elif pepmass is not None:
+                        try:
+                            precursor_mz = float(pepmass)
+                        except (ValueError, TypeError):
+                            precursor_mz = 0.0
+                    else:
+                        precursor_mz = 0.0
+                    
+                    # Handle charge which can be an int, list, or string
+                    charge_param = params.get('charge', 2)
+                    if isinstance(charge_param, (list, tuple)) and len(charge_param) > 0:
+                        try:
+                            charge = int(charge_param[0])
+                        except (ValueError, TypeError):
+                            charge = 2
+                    elif charge_param is not None:
+                        try:
+                            charge = int(charge_param)
+                        except (ValueError, TypeError):
+                            charge = 2
+                    else:
+                        charge = 2
+                    
+                    # MGF typically doesn't have isolation window info, use default
+                    isolation_window_lower = precursor_mz - 1.5
+                    isolation_window_upper = precursor_mz + 1.5
+                    
+                    # Get m/z and intensity arrays
+                    mz_array = spectrum.get('m/z array', np.array([]))
+                    intensity_array = spectrum.get('intensity array', np.array([]))
+                    
+                    if len(mz_array) > 0 and len(intensity_array) > 0:
+                        return MassSpectrum(
+                            mz_array=mz_array,
+                            intensity_array=intensity_array,
+                            scan_id=scan_id,
+                            precursor_mz=precursor_mz,
+                            charge=charge,
+                            isolation_window_lower=isolation_window_lower,
+                            isolation_window_upper=isolation_window_upper
+                        )
+        
+        raise ValueError(f"Scan ID {scan_id} not found in MGF file")
+
     def list_ms2_scan_ids(self, mzml_file: str, max_scans: int = 100) -> List[str]:
         """Get a list of available MS2 scan IDs for spectrum selection."""
         scan_ids = []

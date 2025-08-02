@@ -4,6 +4,18 @@ pandas>=1.3.0
 
 # Mass spectrometry data processing
 pymzml>=2.4.0
+pyteomics>=4.5.0
+
+# Pyteomics dependencies
+lxml>=4.6.0
+sqlalchemy>=1.4.0
+pynumpress>=0.0.9
+h5py>=3.0.0
+psims>=1.0.0
+
+# Optional pyteomics dependencies for enhanced functionality
+# hdf5plugin>=3.0.0  # Optional for enhanced HDF5 support
+# spectrum_utils>=0.3.0  # Optional for spectrum annotation
 
 # Jupyter notebook support (for XCorr_Preprocessing_Analysis.ipynb)
 jupyter>=1.0.0

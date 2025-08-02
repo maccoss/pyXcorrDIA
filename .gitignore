@@ -9,3 +9,6 @@ Ste*.mzML
 *.pin
 __pycache__/pyXcorrDIA.cpython-312.pyc
 comet.params
+/__pycache__
+*.pyc
+
