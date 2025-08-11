@@ -12,3 +12,4 @@ comet.params
 /__pycache__
 *.pyc
 
+*.mzML
