@@ -29,7 +29,7 @@ class TestProteinDigestion:
     
     def test_trypsin_cleavage_sites(self, xcorr_engine):
         """Test that trypsin cleaves at K and R."""
-        sequence = "AAAKBBBRBBBKCCC"
+        sequence = "AAAKGGGRGGGKCCC"
         peptides = xcorr_engine.digest_protein(sequence, "test", 
                                               enzyme='trypsin',
                                               missed_cleavages=0)
@@ -45,7 +45,7 @@ class TestProteinDigestion:
     
     def test_missed_cleavages(self, xcorr_engine):
         """Test missed cleavage handling."""
-        sequence = "AAAKBBBKCCCKDDD"
+        sequence = "AAAKGGGKCCCKDDD"
         
         # No missed cleavages
         peptides_0 = xcorr_engine.digest_protein(sequence, "test",
@@ -162,3 +162,231 @@ class TestPeptideNonRedundancy:
         peptide_entry = sequences["PEPTIDE"]
         assert "protein1" in peptide_entry.protein_id
         assert "protein2" in peptide_entry.protein_id
+
+
+class TestEnzymeSupport:
+    """Test all supported enzyme digestion patterns."""
+    
+    def test_trypsin_digestion(self, xcorr_engine):
+        """Test trypsin (cleaves after K, R but NOT before P - with proline suppression)."""
+        # Longer sequence with peptides that pass length filter (6-50 aa)
+        sequence = "AAAAAAKGGGGGGGRCCCCCCCCKDDDDDDKPEEEEEE"
+        peptides = xcorr_engine.digest_protein(sequence, "test", 
+                                              enzyme='trypsin',
+                                              missed_cleavages=0)
+        
+        # Should cleave after K and R, but not before P
+        sequences = [p.sequence for p in peptides]
+        assert len(sequences) > 0, "Should generate peptides"
+        # Most peptides should end at K or R (except last one and those before P)
+        has_tryptic = any(seq[-1] in ['K', 'R'] for seq in sequences[:-1])
+        assert has_tryptic, "Should have tryptic peptides ending in K or R"
+        # Should NOT cleave before P - check that KP stays together in peptide
+        kp_combined = any('KP' in seq for seq in sequences)
+        assert kp_combined, "KP should stay together (no cleavage before P)"
+    
+    def test_trypsin_no_proline_digestion(self, xcorr_engine):
+        """Test trypsin_no_proline (cleaves after K, R including before P)."""
+        # Longer sequence with peptides that pass length filter
+        sequence = "AAAAAAKGGGGGGGRCCCCCCCKKDDDDDDKPEEEEEE"
+        peptides = xcorr_engine.digest_protein(sequence, "test", 
+                                              enzyme='trypsin_no_proline',
+                                              missed_cleavages=0)
+        
+        # Should cleave after K and R, even if followed by P
+        sequences = [p.sequence for p in peptides]
+        # Check that we get peptides
+        assert len(sequences) > 0, "Should generate peptides"
+        # All peptides except last should end at K or R
+        for seq in sequences[:-1]:  # All except last peptide
+            assert seq[-1] in ['K', 'R'], f"Peptide {seq} should end with K or R"
+    
+    def test_lysc_digestion(self, xcorr_engine):
+        """Test Lys-C (cleaves after K)."""
+        sequence = "AAKGGGKCCCRDDD"
+        peptides = xcorr_engine.digest_protein(sequence, "test", 
+                                              enzyme='lysc',
+                                              missed_cleavages=0)
+        
+        sequences = [p.sequence for p in peptides]
+        # All peptides except last should end with K
+        for seq in sequences[:-1]:
+            assert seq[-1] == 'K', f"Lys-C peptide {seq} should end with K"
+    
+    def test_lysn_digestion(self, xcorr_engine):
+        """Test Lys-N (cleaves before K)."""
+        sequence = "AAAGGGKCCCRDDD"
+        peptides = xcorr_engine.digest_protein(sequence, "test", 
+                                              enzyme='lysn',
+                                              missed_cleavages=0)
+        
+        sequences = [p.sequence for p in peptides]
+        # All peptides except first should start with K
+        for seq in sequences[1:]:
+            assert seq[0] == 'K', f"Lys-N peptide {seq} should start with K"
+    
+    def test_argc_digestion(self, xcorr_engine):
+        """Test Arg-C (cleaves after R)."""
+        sequence = "AAARGGGRCCCRDDD"
+        peptides = xcorr_engine.digest_protein(sequence, "test", 
+                                              enzyme='argc',
+                                              missed_cleavages=0)
+        
+        sequences = [p.sequence for p in peptides]
+        # All peptides except last should end with R
+        for seq in sequences[:-1]:
+            assert seq[-1] == 'R', f"Arg-C peptide {seq} should end with R"
+    
+    def test_aspn_digestion(self, xcorr_engine):
+        """Test Asp-N (cleaves before D)."""
+        sequence = "AAAGGGDCCCDEEEF"
+        peptides = xcorr_engine.digest_protein(sequence, "test", 
+                                              enzyme='aspn',
+                                              missed_cleavages=0)
+        
+        sequences = [p.sequence for p in peptides]
+        # All peptides except first should start with D
+        for seq in sequences[1:]:
+            assert seq[0] == 'D', f"Asp-N peptide {seq} should start with D"
+    
+    def test_cnbr_digestion(self, xcorr_engine):
+        """Test CNBr (cleaves after M)."""
+        sequence = "AAAMGGGMCCCDDD"
+        peptides = xcorr_engine.digest_protein(sequence, "test", 
+                                              enzyme='cnbr',
+                                              missed_cleavages=0)
+        
+        sequences = [p.sequence for p in peptides]
+        # All peptides except last should end with M
+        for seq in sequences[:-1]:
+            assert seq[-1] == 'M', f"CNBr peptide {seq} should end with M"
+    
+    def test_gluc_digestion(self, xcorr_engine):
+        """Test Glu-C (cleaves after D, E)."""
+        sequence = "AAADGGGEFFFGGGD"
+        peptides = xcorr_engine.digest_protein(sequence, "test", 
+                                              enzyme='gluc',
+                                              missed_cleavages=0)
+        
+        sequences = [p.sequence for p in peptides]
+        # All peptides except last should end with D or E
+        for seq in sequences[:-1]:
+            assert seq[-1] in ['D', 'E'], f"Glu-C peptide {seq} should end with D or E"
+    
+    def test_pepsina_digestion(self, xcorr_engine):
+        """Test Pepsin A (cleaves after F, L)."""
+        sequence = "AAAFGGGFLLLCCC"
+        peptides = xcorr_engine.digest_protein(sequence, "test", 
+                                              enzyme='pepsina',
+                                              missed_cleavages=0)
+        
+        sequences = [p.sequence for p in peptides]
+        # All peptides except last should end with F or L
+        for seq in sequences[:-1]:
+            assert seq[-1] in ['F', 'L'], f"Pepsin A peptide {seq} should end with F or L"
+    
+    def test_chymotrypsin_digestion(self, xcorr_engine):
+        """Test Chymotrypsin (cleaves after F, W, Y, L)."""
+        sequence = "AAAFGGGWCCCYDDDL"
+        peptides = xcorr_engine.digest_protein(sequence, "test", 
+                                              enzyme='chymotrypsin',
+                                              missed_cleavages=0)
+        
+        sequences = [p.sequence for p in peptides]
+        # All peptides except last should end with F, W, Y, or L
+        for seq in sequences[:-1]:
+            assert seq[-1] in ['F', 'W', 'Y', 'L'], \
+                f"Chymotrypsin peptide {seq} should end with F, W, Y, or L"
+    
+    def test_enzyme_decoy_preservation_c_terminal(self, xcorr_engine):
+        """Test that C-terminal enzymes preserve C-terminal residue in decoys."""
+        # Use appropriate terminal residues for each enzyme
+        test_cases = [
+            ('trypsin', 'PEPTIDEK'),
+            ('trypsin_no_proline', 'PEPTIDER'),
+            ('lysc', 'PEPTIDEK'),
+            ('argc', 'PEPTIDER'),  # R for Arg-C
+            ('cnbr', 'PEPTIDEM'),  # M for CNBr
+            ('gluc', 'PEPTIDED'),  # D for Glu-C
+            ('pepsina', 'PEPTIDEF'),  # F for Pepsin A
+            ('chymotrypsin', 'PEPTIDEY'),  # Y for Chymotrypsin
+        ]
+        
+        for enzyme, sequence in test_cases:
+            decoy = xcorr_engine.generate_decoy_sequence(sequence, enzyme=enzyme)
+            expected_terminal = sequence[-1]
+            assert decoy[-1] == expected_terminal, \
+                f"Enzyme {enzyme} should preserve C-terminal {expected_terminal} in decoy, got {decoy[-1]}"
+    
+    def test_enzyme_decoy_preservation_n_terminal(self, xcorr_engine):
+        """Test that N-terminal enzymes preserve N-terminal residue in decoys."""
+        # Use appropriate cleavage residues for each enzyme
+        test_cases = [
+            ('lysn', 'KPEPTIDE'),  # K at N-terminus for Lys-N
+            ('aspn', 'DPEPTIDE'),  # D at N-terminus for Asp-N
+        ]
+        
+        for enzyme, sequence in test_cases:
+            decoy = xcorr_engine.generate_decoy_sequence(sequence, enzyme=enzyme)
+            assert decoy[0] == sequence[0], \
+                f"Enzyme {enzyme} should preserve N-terminal {sequence[0]} in decoy"
+    
+    def test_enzyme_reversed_decoy_c_terminal(self, xcorr_engine):
+        """Test that C-terminal enzymes preserve C-terminal in reversed decoys."""
+        # Use YQSHTK as it ends with K (good for trypsin, lysc)
+        # Use YQSHTR for argc (R-specific)
+        test_cases = [
+            ('trypsin', 'YQSHTK', 'THSQYK'),
+            ('trypsin_no_proline', 'YQSHTK', 'THSQYK'),
+            ('lysc', 'YQSHTK', 'THSQYK'),
+            ('argc', 'YQSHTR', 'THSQYR'),  # R for Arg-C
+            ('cnbr', 'YQSHTM', 'THSQYM'),  # M for CNBr
+            ('gluc', 'YQSHTD', 'THSQYD'),  # D for Glu-C
+            ('pepsina', 'YQSHTF', 'THSQYF'),  # F for Pepsin A
+            ('chymotrypsin', 'YQSHTW', 'THSQYW'),  # W for Chymotrypsin
+        ]
+        
+        for enzyme, sequence, expected in test_cases:
+            decoy = xcorr_engine.generate_reversed_decoy_sequence(sequence, enzyme=enzyme)
+            expected_terminal = sequence[-1]
+            assert decoy[-1] == expected_terminal, \
+                f"Enzyme {enzyme} should preserve C-terminal {expected_terminal} in reversed decoy"
+            # Check expected reversal
+            assert decoy == expected, \
+                f"Enzyme {enzyme} reversed decoy should be {expected}, got {decoy}"
+    
+    def test_enzyme_reversed_decoy_n_terminal(self, xcorr_engine):
+        """Test that N-terminal enzymes preserve N-terminal in reversed decoys."""
+        # Use appropriate cleavage residues for each enzyme
+        test_cases = [
+            ('lysn', 'KTHSQY', 'KYQSHT'),  # K at N-terminus for Lys-N
+            ('aspn', 'DTHSQY', 'DYQSHT'),  # D at N-terminus for Asp-N
+        ]
+        
+        for enzyme, sequence, expected in test_cases:
+            decoy = xcorr_engine.generate_reversed_decoy_sequence(sequence, enzyme=enzyme)
+            assert decoy[0] == sequence[0], \
+                f"Enzyme {enzyme} should preserve N-terminal {sequence[0]} in reversed decoy"
+            # Check reversal of internal sequence
+            assert decoy == expected, \
+                f"Enzyme {enzyme} reversed decoy should be {expected}, got {decoy}"
+    
+    def test_all_enzymes_generate_peptides(self, xcorr_engine):
+        """Test that all enzymes can successfully digest a protein."""
+        # Protein with all relevant amino acids
+        sequence = "AAKGGRCCDEFGLMWYKDFL"
+        
+        all_enzymes = ['trypsin', 'trypsin_no_proline', 'lysc', 'lysn', 'argc', 
+                      'aspn', 'cnbr', 'gluc', 'pepsina', 'chymotrypsin']
+        
+        for enzyme in all_enzymes:
+            peptides = xcorr_engine.digest_protein(sequence, "test", 
+                                                  enzyme=enzyme,
+                                                  missed_cleavages=0)
+            assert len(peptides) > 0, \
+                f"Enzyme {enzyme} should generate at least one peptide"
+            
+            # Check that all peptides have valid masses
+            for peptide in peptides:
+                assert peptide.mass > 0, \
+                    f"Enzyme {enzyme} generated peptide with invalid mass"

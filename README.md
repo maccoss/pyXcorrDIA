@@ -6,6 +6,7 @@ A fast proteomics database search engine implementing the SEQUEST Cross-Correlat
 
 - **Comet-compatible XCorr algorithm** - Faithful implementation matching Comet's preprocessing and scoring
 - **DIA peptide-centric mode** - Optimized search for data-independent acquisition with RT profiling
+- **Multi-enzyme support** - 10 protease digestion options including Trypsin, Lys-C, Arg-C, and more
 - **Fast spectrum preprocessing** - Efficient binning, windowing normalization, and Fast XCorr calculation
 - **Target-decoy search** - Built-in decoy generation and target-decoy competition
 - **Multiple file formats** - Supports mzML (via pymzml) and MGF (via pyteomics) input
@@ -79,6 +80,18 @@ python pyXcorrDIA.py database.fasta spectra.mzML --max_spectra 100
 **Report more PSMs per spectrum:**
 ```bash
 python pyXcorrDIA.py database.fasta spectra.mzML --top_hits 20
+```
+
+**Use different enzyme for digestion:**
+```bash
+# Lys-C digestion
+python pyXcorrDIA.py database.fasta spectra.mzML --enzyme lysc
+
+# Arg-C digestion
+python pyXcorrDIA.py database.fasta spectra.mzML --enzyme argc
+
+# Glu-C digestion
+python pyXcorrDIA.py database.fasta spectra.mzML --enzyme gluc
 ```
 
 ### Test Data
@@ -167,10 +180,38 @@ The `.dia.tsv` file contains tab-delimited results with these columns:
 | `-n, --top_hits` | Top PSMs to report per spectrum | 10 |
 | `-m, --max_spectra` | Max spectra to process (0 = all) | 0 |
 | `-c, --charge_states` | Charge states to search (comma-separated) | `2,3` |
+| `-e, --enzyme` | Enzyme for protein digestion | `trypsin` |
+| `--missed_cleavages` | Number of missed cleavages allowed | 2 |
 | `-s, --static_mods` | Static mods as `AA:mass` pairs | `C:57.021464` |
 | `-d, --decoy_cycle_length` | Amino acids to cycle for decoys | 1 |
 | `-bw, --bin_width` | Mass bin width (Th) | 1.0005079 |
 | `-bo, --bin_offset` | Bin offset for binning calculation | 0.4 |
+
+## Enzyme Support
+
+pyXcorrDIA supports 10 different proteolytic enzymes for protein digestion:
+
+| Enzyme | Cleavage Specificity | Common Use |
+|--------|----------------------|------------|
+| **trypsin** | After K, R (NOT before P) | Default, most common |
+| **trypsin_no_proline** | After K, R (including before P) | Without proline suppression |
+| **lysc** | After K | High specificity |
+| **lysn** | Before K | N-terminal labeling |
+| **argc** | After R | Alternative to trypsin |
+| **aspn** | Before D | Acid-rich regions |
+| **cnbr** | After M | Chemical cleavage |
+| **gluc** | After D, E | Acidic peptides |
+| **pepsina** | After F, L | Low pH digestion |
+| **chymotrypsin** | After F, W, Y, L | Large hydrophobic peptides |
+
+**Note:** The default enzyme is `trypsin` (trypsin with proline suppression), which follows the standard proteomics rule where cleavage does NOT occur when proline follows the cleavage site.
+
+### Enzyme-Aware Decoy Generation
+
+Decoy sequences are generated with enzyme-specific terminal residue preservation:
+- **C-terminal cleavage** (e.g., trypsin, Lys-C): Preserves C-terminal residue
+- **N-terminal cleavage** (e.g., Lys-N, Asp-N): Preserves N-terminal residue
+- This ensures decoys have the same enzyme-specific properties as targets
 
 ## Algorithm Details
 
@@ -189,7 +230,7 @@ pyXcorrDIA implements the Fast XCorr algorithm as described in Eng et al. (2008)
 ### Decoy Generation
 
 - Reversal method (reverse peptide sequence)
-- Keeps C-terminal K/R in place for tryptic peptides
+- Enzyme-aware terminal residue preservation (see Enzyme Support above)
 - Mass recalculated to ensure target-decoy mass matching
 - Target-decoy competition ensures proper FDR control
 
@@ -276,8 +317,7 @@ Tab-separated format for Percolator post-processing:
 ## Known Limitations
 
 - Static modifications only (no variable modifications yet)
-- Trypsin digestion only
-- No PTM localization
+- No PTM localization scoring
 - Single precursor tolerance window
 
 ## Documentation

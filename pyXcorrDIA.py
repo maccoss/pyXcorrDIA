@@ -114,6 +114,70 @@ class FastXCorr:
         
         # Pre-sorted peptide candidates by m/z for fast lookup
         self.sorted_peptides_by_mz = {}  # Dict[charge_state, List[Tuple[mz, peptide]]]
+        
+        # Enzyme cleavage patterns and properties
+        self.enzymes = {
+            'trypsin': {
+                'pattern': r'[KR](?!P)',  # Cleaves after K/R, not before P
+                'cleavage_type': 'c_terminal',  # Cleaves C-terminal to residue
+                'cleavage_residues': ['K', 'R'],  # Residues that define cleavage
+                'description': 'Trypsin with proline suppression'
+            },
+            'trypsin_no_proline': {
+                'pattern': r'[KR]',  # Cleaves after K/R
+                'cleavage_type': 'c_terminal',
+                'cleavage_residues': ['K', 'R'],
+                'description': 'Trypsin without proline suppression'
+            },
+            'lysc': {
+                'pattern': r'K(?!P)',  # Cleaves after K, not before P
+                'cleavage_type': 'c_terminal',
+                'cleavage_residues': ['K'],
+                'description': 'Lys-C with proline suppression'
+            },
+            'lysn': {
+                'pattern': r'.(?=K)',  # Cleaves before K
+                'cleavage_type': 'n_terminal',
+                'cleavage_residues': ['K'],
+                'description': 'Lys-N'
+            },
+            'argc': {
+                'pattern': r'R(?!P)',  # Cleaves after R, not before P
+                'cleavage_type': 'c_terminal',
+                'cleavage_residues': ['R'],
+                'description': 'Arg-C with proline suppression'
+            },
+            'aspn': {
+                'pattern': r'.(?=D)',  # Cleaves before D
+                'cleavage_type': 'n_terminal',
+                'cleavage_residues': ['D'],
+                'description': 'Asp-N'
+            },
+            'cnbr': {
+                'pattern': r'M',  # Cleaves after M
+                'cleavage_type': 'c_terminal',
+                'cleavage_residues': ['M'],
+                'description': 'CNBr chemical cleavage'
+            },
+            'gluc': {
+                'pattern': r'[DE](?!P)',  # Cleaves after D/E, not before P
+                'cleavage_type': 'c_terminal',
+                'cleavage_residues': ['D', 'E'],
+                'description': 'Glu-C with proline suppression'
+            },
+            'pepsina': {
+                'pattern': r'[FL](?!P)',  # Cleaves after F/L, not before P
+                'cleavage_type': 'c_terminal',
+                'cleavage_residues': ['F', 'L'],
+                'description': 'Pepsin A with proline suppression'
+            },
+            'chymotrypsin': {
+                'pattern': r'[FWYL](?!P)',  # Cleaves after F/W/Y/L, not before P
+                'cleavage_type': 'c_terminal',
+                'cleavage_residues': ['F', 'W', 'Y', 'L'],
+                'description': 'Chymotrypsin with proline suppression'
+            }
+        }
     
     def get_static_modifications(self) -> Dict[str, float]:
         """
@@ -543,72 +607,130 @@ class FastXCorr:
         
         return scan_ids
     
-    def generate_decoy_sequence(self, sequence: str, cycle_length: int = 1) -> str:
+    def generate_decoy_sequence(self, sequence: str, cycle_length: int = 1, enzyme: str = 'trypsin') -> str:
         """
         Generate decoy peptide sequence by cycling N amino acids (default 1).
-        Keep the C-terminal K/R in place if present.
+        Preserve the cleavage site residue based on the enzyme used.
         
         Args:
             sequence: Original peptide sequence
             cycle_length: Number of positions to cycle (default 1)
+            enzyme: Enzyme used for digestion (determines which residue to preserve)
             
         Returns:
             Decoy sequence with cycled amino acids
         """
         if len(sequence) <= 1:
             return sequence
-            
-        # Check if sequence ends with K or R
-        if sequence[-1] in ['K', 'R']:
-            # Keep C-terminal K/R in place, cycle the rest
-            core_sequence = sequence[:-1]
-            c_terminal = sequence[-1]
-        else:
-            # No tryptic C-terminus, cycle entire sequence
-            core_sequence = sequence
-            c_terminal = ''
-            
+        
+        # Get enzyme properties
+        if enzyme not in self.enzymes:
+            raise ValueError(f"Unknown enzyme: {enzyme}")
+        
+        enzyme_info = self.enzymes[enzyme]
+        cleavage_type = enzyme_info['cleavage_type']
+        cleavage_residues = enzyme_info['cleavage_residues']
+        
+        # Determine which residue to preserve based on cleavage type
+        if cleavage_type == 'c_terminal':
+            # C-terminal cleavage: preserve C-terminal residue if it's a cleavage residue
+            if sequence[-1] in cleavage_residues:
+                core_sequence = sequence[:-1]
+                preserved_residue = sequence[-1]
+                preserve_position = 'c_terminal'
+            else:
+                # No cleavage residue at C-terminus, cycle entire sequence
+                core_sequence = sequence
+                preserved_residue = ''
+                preserve_position = None
+        else:  # n_terminal
+            # N-terminal cleavage: preserve N-terminal residue if it's a cleavage residue
+            if sequence[0] in cleavage_residues:
+                core_sequence = sequence[1:]
+                preserved_residue = sequence[0]
+                preserve_position = 'n_terminal'
+            else:
+                # No cleavage residue at N-terminus, cycle entire sequence
+                core_sequence = sequence
+                preserved_residue = ''
+                preserve_position = None
+        
         # If core sequence too short to cycle meaningfully
         if len(core_sequence) <= cycle_length:
             return sequence  # Return original if can't cycle
-            
+        
         # Cycle the sequence by moving first N amino acids to the end
         cycle_length = cycle_length % len(core_sequence)  # Handle cycle_length > sequence length
         if cycle_length == 0:
             cycled_core = core_sequence
         else:
             cycled_core = core_sequence[cycle_length:] + core_sequence[:cycle_length]
-            
-        return cycled_core + c_terminal
+        
+        # Reconstruct with preserved residue
+        if preserve_position == 'c_terminal':
+            return cycled_core + preserved_residue
+        elif preserve_position == 'n_terminal':
+            return preserved_residue + cycled_core
+        else:
+            return cycled_core
     
-    def generate_reversed_decoy_sequence(self, sequence: str) -> str:
+    def generate_reversed_decoy_sequence(self, sequence: str, enzyme: str = 'trypsin') -> str:
         """
         Generate decoy peptide sequence by reversing amino acids.
-        Keep the C-terminal K/R in place if present.
+        Preserve the cleavage site residue based on the enzyme used.
         
         Args:
             sequence: Original peptide sequence
+            enzyme: Enzyme used for digestion (determines which residue to preserve)
             
         Returns:
             Decoy sequence with reversed amino acids
         """
         if len(sequence) <= 1:
             return sequence
-            
-        # Check if sequence ends with K or R
-        if sequence[-1] in ['K', 'R']:
-            # Keep C-terminal K/R in place, reverse the rest
-            core_sequence = sequence[:-1]
-            c_terminal = sequence[-1]
-        else:
-            # No tryptic C-terminus, reverse entire sequence
-            core_sequence = sequence
-            c_terminal = ''
-            
+        
+        # Get enzyme properties
+        if enzyme not in self.enzymes:
+            raise ValueError(f"Unknown enzyme: {enzyme}")
+        
+        enzyme_info = self.enzymes[enzyme]
+        cleavage_type = enzyme_info['cleavage_type']
+        cleavage_residues = enzyme_info['cleavage_residues']
+        
+        # Determine which residue to preserve based on cleavage type
+        if cleavage_type == 'c_terminal':
+            # C-terminal cleavage: preserve C-terminal residue if it's a cleavage residue
+            if sequence[-1] in cleavage_residues:
+                core_sequence = sequence[:-1]
+                preserved_residue = sequence[-1]
+                preserve_position = 'c_terminal'
+            else:
+                # No cleavage residue at C-terminus, reverse entire sequence
+                core_sequence = sequence
+                preserved_residue = ''
+                preserve_position = None
+        else:  # n_terminal
+            # N-terminal cleavage: preserve N-terminal residue if it's a cleavage residue
+            if sequence[0] in cleavage_residues:
+                core_sequence = sequence[1:]
+                preserved_residue = sequence[0]
+                preserve_position = 'n_terminal'
+            else:
+                # No cleavage residue at N-terminus, reverse entire sequence
+                core_sequence = sequence
+                preserved_residue = ''
+                preserve_position = None
+        
         # Reverse the core sequence
         reversed_core = core_sequence[::-1]
-            
-        return reversed_core + c_terminal
+        
+        # Reconstruct with preserved residue
+        if preserve_position == 'c_terminal':
+            return reversed_core + preserved_residue
+        elif preserve_position == 'n_terminal':
+            return preserved_residue + reversed_core
+        else:
+            return reversed_core
     
     def make_peptides_non_redundant(self, all_peptides: List[PeptideCandidate]) -> List[PeptideCandidate]:
         """
@@ -644,16 +766,17 @@ class FastXCorr:
         return non_redundant_peptides
     
     def generate_target_decoy_pairs(self, target_peptides: List[PeptideCandidate], 
-                                  cycle_length: int = 1) -> List[Tuple[PeptideCandidate, PeptideCandidate]]:
+                                  cycle_length: int = 1, enzyme: str = 'trypsin') -> List[Tuple[PeptideCandidate, PeptideCandidate]]:
         """
         Generate target-decoy pairs for proper target-decoy competition.
         
-        Uses reversal as the default decoy generation method (keeping C-terminal K/R fixed),
+        Uses reversal as the default decoy generation method (keeping cleavage site residue fixed),
         with cycling as a fallback if reversal fails to generate a valid decoy.
         
         Args:
             target_peptides: List of target peptides (should be non-redundant)
             cycle_length: Number of positions to cycle for decoy generation (used in fallback)
+            enzyme: Enzyme used for digestion (determines which residue to preserve)
             
         Returns:
             List of (target_peptide, decoy_peptide) tuples
@@ -674,7 +797,7 @@ class FastXCorr:
             max_retries = min(10, len(target_peptide.sequence) - 1)
             
             # First, try reversal as the default method
-            decoy_sequence = self.generate_reversed_decoy_sequence(target_peptide.sequence)
+            decoy_sequence = self.generate_reversed_decoy_sequence(target_peptide.sequence, enzyme)
             
             # Check if reversed decoy is valid
             if decoy_sequence != target_peptide.sequence and decoy_sequence not in target_sequences:
@@ -691,7 +814,7 @@ class FastXCorr:
             # If reversal failed, try cycling as fallback
             if not decoy_generated:
                 for retry_cycle in range(cycle_length, cycle_length + max_retries):
-                    decoy_sequence = self.generate_decoy_sequence(target_peptide.sequence, retry_cycle)
+                    decoy_sequence = self.generate_decoy_sequence(target_peptide.sequence, retry_cycle, enzyme)
                     
                     # Check if decoy is valid (different from target and not in target database)
                     if decoy_sequence != target_peptide.sequence and decoy_sequence not in target_sequences:
@@ -733,17 +856,41 @@ class FastXCorr:
     
     def digest_protein(self, sequence: str, protein_id: str, 
                       enzyme: str = 'trypsin', missed_cleavages: int = 2) -> List[PeptideCandidate]:
-        """Digest protein sequence into peptides."""
+        """
+        Digest protein sequence into peptides using specified enzyme.
+        
+        Args:
+            sequence: Protein sequence
+            protein_id: Protein identifier
+            enzyme: Enzyme name (see self.enzymes for options)
+            missed_cleavages: Maximum number of missed cleavages
+            
+        Returns:
+            List of peptide candidates
+        """
         peptides = []
         
-        if enzyme == 'trypsin':
-            # Trypsin cleaves after K and R, but not before P
-            cleavage_pattern = r'(?<=[KR])(?!P)'
-        else:
-            raise ValueError(f"Enzyme {enzyme} not supported")
+        # Validate enzyme
+        if enzyme not in self.enzymes:
+            available = ', '.join(self.enzymes.keys())
+            raise ValueError(f"Enzyme '{enzyme}' not supported. Available enzymes: {available}")
         
-        # Split sequence at cleavage sites
-        fragments = re.split(cleavage_pattern, sequence)
+        # Get cleavage pattern for the enzyme
+        cleavage_pattern = self.enzymes[enzyme]['pattern']
+        cleavage_type = self.enzymes[enzyme]['cleavage_type']
+        
+        # For C-terminal cleavage: split after the cleavage site
+        # For N-terminal cleavage: we need to handle differently
+        if cleavage_type == 'c_terminal':
+            # Pattern matches position after the cleavage residue
+            # Use lookahead to insert split marker after the residue
+            cleavage_regex = f'(?<={cleavage_pattern})'
+            fragments = re.split(cleavage_regex, sequence)
+        else:  # n_terminal
+            # Pattern matches position before the cleavage residue
+            # For N-terminal cleavage, split before the residue
+            cleavage_regex = f'(?={cleavage_pattern[4:-1]})'  # Extract residue from .(?=X) pattern
+            fragments = re.split(cleavage_regex, sequence)
         
         # Generate peptides with missed cleavages
         for i in range(len(fragments)):
@@ -1903,6 +2050,10 @@ def main():
                        help='Maximum number of MS2 spectra to process (0 = process all)')
     parser.add_argument('--charge_states', '-c', type=str, default='2,3',
                        help='Comma-separated list of charge states to consider (default: 2,3)')
+    parser.add_argument('--enzyme', '-e', type=str, default='trypsin',
+                       help='Enzyme for protein digestion (default: trypsin). Options: trypsin, trypsin_no_proline, lysc, lysn, argc, aspn, cnbr, gluc, pepsina, chymotrypsin')
+    parser.add_argument('--missed_cleavages', type=int, default=2,
+                       help='Maximum number of missed cleavages (default: 2)')
     parser.add_argument('--decoy_cycle_length', '-d', type=int, default=1,
                        help='Number of amino acids to cycle for decoy generation (default: 1)')
     parser.add_argument('--static_mods', '-s', type=str, default='C:57.021464',
@@ -1932,8 +2083,22 @@ def main():
     
     # Parse charge states
     charge_states = [int(c.strip()) for c in args.charge_states.split(',')]
+    
+    # Validate enzyme
+    if args.enzyme not in ['trypsin', 'trypsin_no_proline', 'lysc', 'lysn', 'argc', 'aspn', 'cnbr', 'gluc', 'pepsina', 'chymotrypsin']:
+        print(f"Error: Unknown enzyme '{args.enzyme}'")
+        print("Available enzymes: trypsin, trypsin_no_proline, lysc, lysn, argc, aspn, cnbr, gluc, pepsina, chymotrypsin")
+        sys.exit(1)
+    
     print(f"Using charge states: {charge_states}")
     print("pyXcorrDIA: Using Comet XCorr with target-decoy competition")
+    
+    # Initialize engine to get enzyme description
+    xcorr_engine = FastXCorr(bin_width=args.bin_width, bin_offset=args.bin_offset, static_modifications=static_modifications)
+    enzyme_desc = xcorr_engine.enzymes[args.enzyme]['description']
+    
+    print(f"- Enzyme: {args.enzyme} ({enzyme_desc})")
+    print(f"- Missed cleavages: {args.missed_cleavages}")
     print(f"- Decoy generation: cycling {args.decoy_cycle_length} amino acid(s)")
     print(f"- Bin width: {args.bin_width:.7f} Th")
     print(f"- Bin offset: {args.bin_offset:.1f}")
@@ -1956,9 +2121,6 @@ def main():
         base_name = os.path.splitext(args.mzml_file)[0]
         args.pin_output = base_name + '.pin'
     
-    # Initialize Comet-style XCorr engine with static modifications and bin parameters
-    xcorr_engine = FastXCorr(bin_width=args.bin_width, bin_offset=args.bin_offset, static_modifications=static_modifications)
-    
     print("Reading FASTA file...")
     proteins = xcorr_engine.read_fasta(args.fasta_file)
     print(f"Loaded {len(proteins)} proteins")
@@ -1966,7 +2128,7 @@ def main():
     print("Digesting proteins...")
     all_target_peptides = []
     for protein_id, sequence in proteins.items():
-        peptides = xcorr_engine.digest_protein(sequence, protein_id)
+        peptides = xcorr_engine.digest_protein(sequence, protein_id, enzyme=args.enzyme, missed_cleavages=args.missed_cleavages)
         all_target_peptides.extend(peptides)
     print(f"Generated {len(all_target_peptides)} target peptide candidates")
     
@@ -1975,7 +2137,7 @@ def main():
     print(f"Non-redundant target peptides: {len(non_redundant_targets)} (removed {len(all_target_peptides) - len(non_redundant_targets)} duplicates)")
     
     print("Generating target-decoy pairs for competition...")
-    target_decoy_pairs = xcorr_engine.generate_target_decoy_pairs(non_redundant_targets, args.decoy_cycle_length)
+    target_decoy_pairs = xcorr_engine.generate_target_decoy_pairs(non_redundant_targets, args.decoy_cycle_length, args.enzyme)
     print(f"Target-decoy pairs: {len(target_decoy_pairs)} pairs ready for competition")
     
     # No need for separate peptide indexing - we'll search pairs directly
