@@ -20,6 +20,7 @@ import os
 import bisect
 import sys
 from datetime import datetime
+from scipy.signal import savgol_filter
 
 
 class MassSpectrum:
@@ -1329,6 +1330,238 @@ class FastXCorr:
         final_results.sort(key=lambda x: (x[3], -x[1]))
         
         return final_results
+    
+    def group_spectra_by_isolation_window(self, spectra: List[MassSpectrum]) -> Dict[Tuple[float, float], List[MassSpectrum]]:
+        """
+        Group spectra by their isolation window (precursor m/z window).
+        
+        For DIA data, multiple spectra will have the same isolation window.
+        This groups them together for efficient peptide-centric searching.
+        
+        Args:
+            spectra: List of mass spectra
+            
+        Returns:
+            Dictionary mapping (lower, upper) window bounds to list of spectra
+        """
+        window_groups = defaultdict(list)
+        
+        for spectrum in spectra:
+            window_key = (spectrum.isolation_window_lower, spectrum.isolation_window_upper)
+            window_groups[window_key].append(spectrum)
+        
+        return dict(window_groups)
+    
+    def preprocess_theoretical_spectrum(self, theoretical_binned: np.ndarray) -> np.ndarray:
+        """
+        Preprocess a theoretical spectrum for peptide-centric DIA search.
+        
+        In peptide-centric mode, we preprocess the THEORETICAL spectrum instead
+        of the experimental spectrum. The experimental spectra are only binned,
+        sqrt-transformed, and windowed before scoring.
+        
+        Args:
+            theoretical_binned: Binned theoretical spectrum (binary: 0 or 1)
+            
+        Returns:
+            Preprocessed theoretical spectrum ready for scoring
+        """
+        # Find highest bin with data
+        highest_ion_bin = 0
+        for i in range(len(theoretical_binned) - 1, -1, -1):
+            if theoretical_binned[i] > 0:
+                highest_ion_bin = i
+                break
+        
+        # For theoretical spectra, treat as having intensity 1.0 at fragment positions
+        highest_intensity = 1.0
+        
+        # Apply MakeCorrData windowing (though for binary theoretical, this is simpler)
+        windowed = self._make_corr_data(theoretical_binned, highest_ion_bin, highest_intensity)
+        
+        # Apply Fast XCorr preprocessing
+        preprocessed = self.preprocess_for_xcorr(windowed)
+        
+        return preprocessed
+    
+    def calculate_peptide_centric_xcorr(self, experimental_windowed: np.ndarray, 
+                                       theoretical_preprocessed: np.ndarray) -> float:
+        """
+        Calculate XCorr for peptide-centric search.
+        
+        In this mode:
+        - Experimental spectrum is binned, sqrt-transformed, and windowed (NOT preprocessed)
+        - Theoretical spectrum is fully preprocessed (windowed + Fast XCorr)
+        - Score is the dot product
+        
+        Args:
+            experimental_windowed: Experimental spectrum after MakeCorrData windowing
+            theoretical_preprocessed: Theoretical spectrum after full preprocessing
+            
+        Returns:
+            XCorr score
+        """
+        return np.dot(experimental_windowed, theoretical_preprocessed)
+    
+    def search_dia_peptide_centric(self, 
+                                   spectra: List[MassSpectrum],
+                                   target_decoy_pairs: List[Tuple[PeptideCandidate, PeptideCandidate]],
+                                   charge_states: List[int] = [2, 3],
+                                   rt_window_spectra: int = 5) -> Dict:
+        """
+        Perform peptide-centric DIA search across multiple spectra.
+        
+        This is optimized for DIA data where:
+        1. Spectra are grouped by isolation window
+        2. Theoretical spectra are preprocessed (not experimental)
+        3. Each peptide is scored across all spectra in the window
+        4. Results track best XCorr, RT, and chromatographic profile
+        
+        Args:
+            spectra: List of spectra (should be from same isolation window)
+            target_decoy_pairs: List of (target, decoy) peptide pairs
+            charge_states: Charge states to search
+            rt_window_spectra: Number of spectra +/- around peak for profile extraction
+            
+        Returns:
+            Dictionary with results per peptide:
+            {
+                (peptide_sequence, charge): {
+                    'target_best_xcorr': float,
+                    'target_best_rt': float,
+                    'target_best_scan': str,
+                    'decoy_best_xcorr': float,
+                    'decoy_best_rt': float,
+                    'decoy_best_scan': str,
+                    'target_profile': [(rt, scan, xcorr), ...],  # smoothed
+                    'decoy_profile': [(rt, scan, xcorr), ...],   # smoothed
+                    'isolation_window': (lower, upper)
+                }
+            }
+        """
+        if not spectra:
+            return {}
+        
+        # Get isolation window (same for all spectra in this group)
+        isolation_window = (spectra[0].isolation_window_lower, spectra[0].isolation_window_upper)
+        
+        # Results dictionary
+        results = {}
+        
+        # Find peptides in this isolation window and preprocess their theoretical spectra
+        peptide_theoretical_preprocessed = {}  # (peptide, charge) -> preprocessed_spectrum
+        
+        print(f"  DIA: Preprocessing theoretical spectra for window {isolation_window}")
+        
+        for target_peptide, decoy_peptide in target_decoy_pairs:
+            for charge in charge_states:
+                # Check if target is in window
+                target_mz = (target_peptide.mass + charge * self.proton_mass) / charge
+                
+                if isolation_window[0] <= target_mz <= isolation_window[1]:
+                    # Generate and preprocess theoretical spectra
+                    target_theoretical = self.generate_theoretical_spectrum(target_peptide, charge)
+                    target_preprocessed = self.preprocess_theoretical_spectrum(target_theoretical)
+                    peptide_theoretical_preprocessed[(target_peptide, charge)] = target_preprocessed
+                    
+                    decoy_theoretical = self.generate_theoretical_spectrum(decoy_peptide, charge)
+                    decoy_preprocessed = self.preprocess_theoretical_spectrum(decoy_theoretical)
+                    peptide_theoretical_preprocessed[(decoy_peptide, charge)] = decoy_preprocessed
+                    
+                    # Initialize results entry
+                    key = (target_peptide.sequence, charge)
+                    if key not in results:
+                        results[key] = {
+                            'target_peptide': target_peptide,
+                            'decoy_peptide': decoy_peptide,
+                            'target_best_xcorr': -float('inf'),
+                            'target_best_rt': 0.0,
+                            'target_best_scan': '',
+                            'target_best_spectrum_idx': -1,
+                            'decoy_best_xcorr': -float('inf'),
+                            'decoy_best_rt': 0.0,
+                            'decoy_best_scan': '',
+                            'decoy_best_spectrum_idx': -1,
+                            'target_xcorr_series': [],  # (spectrum_idx, rt, scan, xcorr)
+                            'decoy_xcorr_series': [],
+                            'isolation_window': isolation_window,
+                            'charge': charge
+                        }
+        
+        print(f"  DIA: Scoring {len(peptide_theoretical_preprocessed)} peptide-charge combinations across {len(spectra)} spectra")
+        
+        # Score each experimental spectrum against all preprocessed theoretical spectra
+        for spectrum_idx, spectrum in enumerate(spectra):
+            # Preprocess experimental spectrum (bin, sqrt, window - NO Fast XCorr)
+            windowed_experimental = self.preprocess_spectrum(spectrum)
+            
+            # Extract RT (assume scan_id format contains RT or use index as proxy)
+            # Try to extract RT from scan_id or use spectrum index
+            rt = float(spectrum_idx)  # Default: use index as RT proxy
+            
+            # Score against all peptides
+            for (peptide, charge), theoretical_preprocessed in peptide_theoretical_preprocessed.items():
+                xcorr = self.calculate_peptide_centric_xcorr(windowed_experimental, theoretical_preprocessed)
+                
+                # Determine if this is target or decoy
+                is_target = not peptide.protein_id.startswith('decoy_')
+                
+                # Find the corresponding result entry
+                if is_target:
+                    # Find by target peptide sequence
+                    for key, result in results.items():
+                        if result['target_peptide'] == peptide and result['charge'] == charge:
+                            result['target_xcorr_series'].append((spectrum_idx, rt, spectrum.scan_id, xcorr))
+                            if xcorr > result['target_best_xcorr']:
+                                result['target_best_xcorr'] = xcorr
+                                result['target_best_rt'] = rt
+                                result['target_best_scan'] = spectrum.scan_id
+                                result['target_best_spectrum_idx'] = spectrum_idx
+                            break
+                else:
+                    # Find by decoy peptide
+                    for key, result in results.items():
+                        if result['decoy_peptide'] == peptide and result['charge'] == charge:
+                            result['decoy_xcorr_series'].append((spectrum_idx, rt, spectrum.scan_id, xcorr))
+                            if xcorr > result['decoy_best_xcorr']:
+                                result['decoy_best_xcorr'] = xcorr
+                                result['decoy_best_rt'] = rt
+                                result['decoy_best_scan'] = spectrum.scan_id
+                                result['decoy_best_spectrum_idx'] = spectrum_idx
+                            break
+        
+        # Apply Savitzky-Golay smoothing to XCorr profiles
+        print("  DIA: Smoothing chromatographic profiles with Savitzky-Golay filter")
+        
+        for key, result in results.items():
+            # Extract profiles around best peaks
+            for target_type in ['target', 'decoy']:
+                xcorr_series = result[f'{target_type}_xcorr_series']
+                best_idx = result[f'{target_type}_best_spectrum_idx']
+                
+                if best_idx >= 0 and len(xcorr_series) > 0:
+                    # Sort by spectrum index
+                    xcorr_series.sort(key=lambda x: x[0])
+                    
+                    # Get XCorr values in order
+                    xcorr_values = [x[3] for x in xcorr_series]
+                    
+                    # Apply Savitzky-Golay smoothing if we have enough points
+                    if len(xcorr_values) >= 5:
+                        window_length = min(len(xcorr_values), 7)
+                        if window_length % 2 == 0:
+                            window_length -= 1  # Must be odd
+                        smoothed = savgol_filter(xcorr_values, window_length=window_length, polyorder=2)
+                    else:
+                        smoothed = xcorr_values
+                    
+                    # Store smoothed profile
+                    result[f'{target_type}_profile'] = [
+                        (xcorr_series[i][1], xcorr_series[i][2], smoothed[i]) 
+                        for i in range(len(xcorr_series))
+                    ]
+        
+        return results
 
 
 class PepXMLWriter:
@@ -1585,6 +1818,72 @@ class PINWriter:
         return str(self.spectrum_counter)
 
 
+class DIAResultsWriter:
+    """Class to write DIA peptide-centric search results."""
+    
+    def __init__(self, output_file: str, mzml_file: str):
+        self.output_file = output_file
+        self.mzml_file = mzml_file
+        self.file_handle = None
+        
+    def __enter__(self):
+        self.file_handle = open(self.output_file, 'w')
+        self._write_header()
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.file_handle:
+            self.file_handle.close()
+    
+    def _write_header(self):
+        """Write DIA results header."""
+        header = "Peptide\tCharge\tProteinID\tMass\tIsolationWindow\t"
+        header += "TargetBestXCorr\tTargetBestRT\tTargetBestScan\t"
+        header += "DecoyBestXCorr\tDecoyBestRT\tDecoyBestScan\t"
+        header += "TargetProfile\tDecoyProfile\n"
+        self.file_handle.write(header)
+    
+    def write_dia_results(self, results: Dict):
+        """
+        Write DIA peptide-centric results.
+        
+        Args:
+            results: Dictionary from search_dia_peptide_centric
+        """
+        for (peptide_sequence, charge), result in results.items():
+            # Basic peptide info
+            target_peptide = result['target_peptide']
+            isolation_window = result['isolation_window']
+            window_str = f"[{isolation_window[0]:.4f}-{isolation_window[1]:.4f}]"
+            
+            # Best scores and RTs
+            target_best_xcorr = result['target_best_xcorr']
+            target_best_rt = result['target_best_rt']
+            target_best_scan = result['target_best_scan']
+            
+            decoy_best_xcorr = result['decoy_best_xcorr']
+            decoy_best_rt = result['decoy_best_rt']
+            decoy_best_scan = result['decoy_best_scan']
+            
+            # Smoothed profiles
+            target_profile = result.get('target_profile', [])
+            decoy_profile = result.get('decoy_profile', [])
+            
+            # Format profiles as semicolon-separated rt:scan:xcorr entries
+            target_profile_str = ";".join([f"{rt:.2f}:{scan}:{xcorr:.3f}" for rt, scan, xcorr in target_profile])
+            decoy_profile_str = ";".join([f"{rt:.2f}:{scan}:{xcorr:.3f}" for rt, scan, xcorr in decoy_profile])
+            
+            # Write line
+            line = f"{peptide_sequence}\t{charge}\t{target_peptide.protein_id}\t{target_peptide.mass:.6f}\t{window_str}\t"
+            line += f"{target_best_xcorr:.4f}\t{target_best_rt:.2f}\t{target_best_scan}\t"
+            line += f"{decoy_best_xcorr:.4f}\t{decoy_best_rt:.2f}\t{decoy_best_scan}\t"
+            line += f"{target_profile_str}\t{decoy_profile_str}\n"
+            
+            self.file_handle.write(line)
+        
+        self.file_handle.flush()
+
+
 def main():
     """Main function to run the Comet-style fast XCorr search."""
     parser = argparse.ArgumentParser(description='Comet-style Fast XCorr Database Search with Target-Decoy Competition')
@@ -1592,6 +1891,12 @@ def main():
     parser.add_argument('mzml_file', help='mzML file containing mass spectra')
     parser.add_argument('--output', '-o', default='', help='Output file (pepXML format). If not specified, uses mzML filename with .pepXML extension')
     parser.add_argument('--pin_output', '-p', default='', help='Percolator Input (PIN) output file. If not specified, uses mzML filename with .pin extension')
+    parser.add_argument('--dia_mode', action='store_true', 
+                       help='Enable DIA peptide-centric search mode (experimental)')
+    parser.add_argument('--dia_output', default='', 
+                       help='DIA results output file. If not specified, uses mzML filename with .dia.tsv extension')
+    parser.add_argument('--dia_rt_window', type=int, default=5,
+                       help='Number of spectra +/- around best peak for profile extraction in DIA mode (default: 5)')
     parser.add_argument('--top_hits', '-n', type=int, default=10, 
                        help='Number of top hits to report per spectrum (distributed across charge states)')
     parser.add_argument('--max_spectra', '-m', type=int, default=0, 
@@ -1681,97 +1986,157 @@ def main():
     
     print(f"Processing {len(spectra)} MS2 spectra with Target-Decoy Competition")
     
-    print("Performing target-decoy competition search...")
-    print(f"Writing results to {args.output}")
-    print(f"Writing PIN results to {args.pin_output}")
+    # Check if DIA mode is enabled
+    if args.dia_mode:
+        print("\n*** DIA PEPTIDE-CENTRIC SEARCH MODE ***")
+        print(f"- RT window for profile extraction: +/- {args.dia_rt_window} spectra")
+        
+        # Determine DIA output filename
+        if not args.dia_output:
+            base_name = os.path.splitext(args.mzml_file)[0]
+            args.dia_output = base_name + '.dia.tsv'
+        
+        print(f"- DIA results will be written to: {args.dia_output}")
+        
+        # Group spectra by isolation window
+        print("\nGrouping spectra by isolation window...")
+        window_groups = xcorr_engine.group_spectra_by_isolation_window(spectra)
+        print(f"Found {len(window_groups)} unique isolation windows")
+        
+        # Process each isolation window
+        all_dia_results = {}
+        for window_idx, (isolation_window, window_spectra) in enumerate(window_groups.items()):
+            print(f"\nProcessing isolation window {window_idx+1}/{len(window_groups)}: "
+                  f"[{isolation_window[0]:.4f}-{isolation_window[1]:.4f}] m/z, "
+                  f"{len(window_spectra)} spectra")
+            
+            # Perform DIA peptide-centric search
+            dia_results = xcorr_engine.search_dia_peptide_centric(
+                window_spectra,
+                target_decoy_pairs,
+                charge_states,
+                rt_window_spectra=args.dia_rt_window
+            )
+            
+            # Merge results
+            all_dia_results.update(dia_results)
+            print(f"  Found {len(dia_results)} peptide-charge combinations in this window")
+        
+        # Write DIA results
+        print(f"\nWriting DIA results to {args.dia_output}...")
+        with DIAResultsWriter(args.dia_output, args.mzml_file) as dia_writer:
+            dia_writer.write_dia_results(all_dia_results)
+        
+        # Print summary
+        print("\nDIA peptide-centric search completed!")
+        print(f"Total peptide-charge combinations: {len(all_dia_results)}")
+        print(f"Results saved to: {args.dia_output}")
+        
+        # Calculate some statistics
+        target_better = sum(1 for r in all_dia_results.values() if r['target_best_xcorr'] > r['decoy_best_xcorr'])
+        decoy_better = sum(1 for r in all_dia_results.values() if r['decoy_best_xcorr'] > r['target_best_xcorr'])
+        print(f"  Target better than decoy: {target_better}")
+        print(f"  Decoy better than target: {decoy_better}")
+        if (target_better + decoy_better) > 0:
+            fdr_estimate = (decoy_better / (target_better + decoy_better)) * 100
+            print(f"  Estimated peptide-level FDR: {fdr_estimate:.2f}%")
+        
+    else:
+        # Standard spectrum-centric search mode
+        print("Performing target-decoy competition search...")
+        print(f"Writing results to {args.output}")
+        print(f"Writing PIN results to {args.pin_output}")
+        
+        # Initialize pepXML and PIN writers and process spectra
+        total_identifications = 0
+        target_hits = 0
+        decoy_hits = 0
     
-    # Initialize pepXML and PIN writers and process spectra
-    total_identifications = 0
-    target_hits = 0
-    decoy_hits = 0
-    
-    with PepXMLWriter(args.output, args.mzml_file, args.fasta_file) as pepxml_writer, \
-         PINWriter(args.pin_output, args.mzml_file) as pin_writer:
-        spectra_with_hits = 0
-        for i, spectrum in enumerate(spectra):
-            # Calculate isolation window info
-            precursor_mz = spectrum.precursor_mz
-            isolation_window_lower = spectrum.isolation_window_lower
-            isolation_window_upper = spectrum.isolation_window_upper
-            window_width = isolation_window_upper - isolation_window_lower
-            
-            # Count pairs in isolation window (for reporting)
-            pairs_in_window = 0
-            for target_peptide, decoy_peptide in target_decoy_pairs:
-                for charge in charge_states:
-                    target_mz = (target_peptide.mass + charge * xcorr_engine.proton_mass) / charge
-                    if isolation_window_lower <= target_mz <= isolation_window_upper:
-                        pairs_in_window += 1
-                        break  # Count each pair only once
-            
-            # Adaptive progress reporting: more frequent for smaller datasets
-            if len(spectra) <= 100:
-                report_interval = 10
-            elif len(spectra) <= 1000:
-                report_interval = 50
-            else:
-                report_interval = 100
-            
-            if i % report_interval == 0 or i == 0:
-                print(f"Processing spectrum {i+1}/{len(spectra)} - Precursor: {precursor_mz:.4f} m/z, Window: [{isolation_window_lower:.5f}-{isolation_window_upper:.5f}] ({window_width:.5f} m/z), Pairs in window: {pairs_in_window} - {spectra_with_hits} spectra searched")
-            
-            # Search spectrum with target-decoy competition
-            search_results = xcorr_engine.search_spectrum_target_decoy(spectrum, target_decoy_pairs, charge_states)
-            
-            # Count target vs decoy hits
-            spectrum_target_hits = 0
-            spectrum_decoy_hits = 0
-            
-            # Write results to both formats
-            top_hits_per_charge = max(1, args.top_hits // len(charge_states))
-            # Ensure we get exactly 3 hits per charge state when possible
-            if args.top_hits >= 3 * len(charge_states):
-                top_hits_per_charge = 3
-            
-            # Write to pepXML (existing format)
-            pepxml_writer.write_spectrum_query(spectrum, search_results, top_hits_per_charge)
-            
-            # Write to PIN (new format - best peptide per charge state only)
-            pin_writer.write_spectrum_results(spectrum, search_results)
-            
-            if search_results:
-                spectra_with_hits += 1
-                # Count hits and track target vs decoy
-                hits_by_charge = {}
-                for peptide, score, e_value, charge in search_results:
-                    if charge not in hits_by_charge:
-                        hits_by_charge[charge] = 0
-                    if hits_by_charge[charge] < top_hits_per_charge:
-                        hits_by_charge[charge] += 1
-                        total_identifications += 1
-                        
-                        # Count target vs decoy
-                        if peptide.protein_id.startswith('decoy_'):
-                            spectrum_decoy_hits += 1
-                        else:
-                            spectrum_target_hits += 1
+        # Initialize pepXML and PIN writers and process spectra
+        total_identifications = 0
+        target_hits = 0
+        decoy_hits = 0
+        
+        with PepXMLWriter(args.output, args.mzml_file, args.fasta_file) as pepxml_writer, \
+             PINWriter(args.pin_output, args.mzml_file) as pin_writer:
+            spectra_with_hits = 0
+            for i, spectrum in enumerate(spectra):
+                # Calculate isolation window info
+                precursor_mz = spectrum.precursor_mz
+                isolation_window_lower = spectrum.isolation_window_lower
+                isolation_window_upper = spectrum.isolation_window_upper
+                window_width = isolation_window_upper - isolation_window_lower
                 
-                target_hits += spectrum_target_hits
-                decoy_hits += spectrum_decoy_hits
-    
-    print("Target-decoy competition search completed!")
-    print(f"Total spectra processed: {len(spectra)}")
-    print(f"Spectra with peptide matches: {spectra_with_hits}")
-    print(f"Total identifications (competition winners): {total_identifications}")
-    print(f"  Target winners: {target_hits}")
-    print(f"  Decoy winners: {decoy_hits}")
-    if total_identifications > 0:
-        fdr_estimate = (decoy_hits / total_identifications) * 100
-        print(f"  Estimated FDR: {fdr_estimate:.2f}%")
-    print(f"pepXML results saved to: {args.output}")
-    print(f"PIN results saved to: {args.pin_output}")
-    
-
+                # Count pairs in isolation window (for reporting)
+                pairs_in_window = 0
+                for target_peptide, decoy_peptide in target_decoy_pairs:
+                    for charge in charge_states:
+                        target_mz = (target_peptide.mass + charge * xcorr_engine.proton_mass) / charge
+                        if isolation_window_lower <= target_mz <= isolation_window_upper:
+                            pairs_in_window += 1
+                            break  # Count each pair only once
+                
+                # Adaptive progress reporting: more frequent for smaller datasets
+                if len(spectra) <= 100:
+                    report_interval = 10
+                elif len(spectra) <= 1000:
+                    report_interval = 50
+                else:
+                    report_interval = 100
+                
+                if i % report_interval == 0 or i == 0:
+                    print(f"Processing spectrum {i+1}/{len(spectra)} - Precursor: {precursor_mz:.4f} m/z, Window: [{isolation_window_lower:.5f}-{isolation_window_upper:.5f}] ({window_width:.5f} m/z), Pairs in window: {pairs_in_window} - {spectra_with_hits} spectra searched")
+                
+                # Search spectrum with target-decoy competition
+                search_results = xcorr_engine.search_spectrum_target_decoy(spectrum, target_decoy_pairs, charge_states)
+                
+                # Count target vs decoy hits
+                spectrum_target_hits = 0
+                spectrum_decoy_hits = 0
+                
+                # Write results to both formats
+                top_hits_per_charge = max(1, args.top_hits // len(charge_states))
+                # Ensure we get exactly 3 hits per charge state when possible
+                if args.top_hits >= 3 * len(charge_states):
+                    top_hits_per_charge = 3
+                
+                # Write to pepXML (existing format)
+                pepxml_writer.write_spectrum_query(spectrum, search_results, top_hits_per_charge)
+                
+                # Write to PIN (new format - best peptide per charge state only)
+                pin_writer.write_spectrum_results(spectrum, search_results)
+                
+                if search_results:
+                    spectra_with_hits += 1
+                    # Count hits and track target vs decoy
+                    hits_by_charge = {}
+                    for peptide, score, e_value, charge in search_results:
+                        if charge not in hits_by_charge:
+                            hits_by_charge[charge] = 0
+                        if hits_by_charge[charge] < top_hits_per_charge:
+                            hits_by_charge[charge] += 1
+                            total_identifications += 1
+                            
+                            # Count target vs decoy
+                            if peptide.protein_id.startswith('decoy_'):
+                                spectrum_decoy_hits += 1
+                            else:
+                                spectrum_target_hits += 1
+                    
+                    target_hits += spectrum_target_hits
+                    decoy_hits += spectrum_decoy_hits
+        
+        print("Target-decoy competition search completed!")
+        print(f"Total spectra processed: {len(spectra)}")
+        print(f"Spectra with peptide matches: {spectra_with_hits}")
+        print(f"Total identifications (competition winners): {total_identifications}")
+        print(f"  Target winners: {target_hits}")
+        print(f"  Decoy winners: {decoy_hits}")
+        if total_identifications > 0:
+            fdr_estimate = (decoy_hits / total_identifications) * 100
+            print(f"  Estimated FDR: {fdr_estimate:.2f}%")
+        print(f"pepXML results saved to: {args.output}")
+        print(f"PIN results saved to: {args.pin_output}")
 
 
 if __name__ == '__main__':

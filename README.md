@@ -5,6 +5,7 @@ A fast proteomics database search engine implementing the SEQUEST Cross-Correlat
 ## Features
 
 - **Comet-compatible XCorr algorithm** - Faithful implementation matching Comet's preprocessing and scoring
+- **DIA peptide-centric mode** - Optimized search for data-independent acquisition with RT profiling
 - **Fast spectrum preprocessing** - Efficient binning, windowing normalization, and Fast XCorr calculation
 - **Target-decoy search** - Built-in decoy generation and target-decoy competition
 - **Multiple file formats** - Supports mzML (via pymzml) and MGF (via pyteomics) input
@@ -88,6 +89,70 @@ Try the included test data:
 python pyXcorrDIA.py YQSHTK.fasta YQSHTK.mzML --charge_states 1
 ```
 
+## DIA Peptide-Centric Search Mode
+
+pyXcorrDIA supports **DIA (Data-Independent Acquisition) peptide-centric search**, optimized for analyzing DIA data where multiple MS/MS spectra share the same precursor isolation window.
+
+### DIA vs Standard Mode
+
+| Mode | Preprocessing | Use Case | Output |
+|------|---------------|----------|--------|
+| **Spectrum-Centric** (default) | Experimental spectra preprocessed | DDA, single peptide/spectrum | Best peptides per spectrum |
+| **Peptide-Centric** (--dia_mode) | Theoretical spectra preprocessed | DIA, multiple spectra/window | Best XCorr per peptide across RT |
+
+### DIA Usage
+
+**Basic DIA search:**
+```bash
+python pyXcorrDIA.py database.fasta dia_data.mzML --dia_mode
+```
+
+**DIA with custom parameters:**
+```bash
+python pyXcorrDIA.py database.fasta dia_data.mzML \
+    --dia_mode \
+    --dia_output results.dia.tsv \
+    --dia_rt_window 10 \
+    --charge_states 2,3,4
+```
+
+### DIA Workflow
+
+1. **Group spectra** by isolation window
+2. **Preprocess theoretical spectra** for peptides in each window (binning → MakeCorrData → Fast XCorr)
+3. **Score each peptide** across all spectra in the window
+4. **Track best XCorr** and RT for target and decoy
+5. **Apply Savitzky-Golay smoothing** to chromatographic profiles
+6. **Output** peptide-level results with RT profiles
+
+### DIA Output Format
+
+The `.dia.tsv` file contains tab-delimited results with these columns:
+
+| Column | Description |
+|--------|-------------|
+| `Peptide` | Peptide sequence |
+| `Charge` | Charge state |
+| `ProteinID` | Source protein identifier |
+| `Mass` | Neutral peptide mass |
+| `IsolationWindow` | Precursor m/z window `[lower-upper]` |
+| `TargetBestXCorr` | Highest XCorr for target peptide |
+| `TargetBestRT` | RT where best XCorr occurred |
+| `TargetBestScan` | Scan ID where best XCorr occurred |
+| `DecoyBestXCorr` | Highest XCorr for decoy peptide |
+| `DecoyBestRT` | RT where decoy best XCorr occurred |
+| `DecoyBestScan` | Scan ID where decoy best XCorr occurred |
+| `TargetProfile` | Smoothed XCorr profile: `rt:scan:xcorr;...` |
+| `DecoyProfile` | Smoothed decoy XCorr profile |
+
+### DIA Mode Notes
+
+- **Performance**: Faster for true DIA data (theoretical spectra reused across RT)
+- **Memory**: Higher usage (all spectra per window loaded simultaneously)
+- **FDR**: Compare `TargetBestXCorr` vs `DecoyBestXCorr` for each peptide
+- **Smoothing**: Savitzky-Golay filter (window=7, polynomial=2) applied to profiles
+- **Best for**: Data with multiple spectra per isolation window
+
 ## Command-Line Options
 
 | Option | Description | Default |
@@ -96,6 +161,9 @@ python pyXcorrDIA.py YQSHTK.fasta YQSHTK.mzML --charge_states 1
 | `mzml_file` | mzML or MGF spectrum file (positional) | Required |
 | `-o, --output` | Output pepXML file path | `{mzml}.pepXML` |
 | `-p, --pin_output` | Percolator PIN file path | `{mzml}.pin` |
+| `--dia_mode` | Enable DIA peptide-centric search | Off |
+| `--dia_output` | DIA results output file | `{mzml}.dia.tsv` |
+| `--dia_rt_window` | Spectra +/- around peak for profile | 5 |
 | `-n, --top_hits` | Top PSMs to report per spectrum | 10 |
 | `-m, --max_spectra` | Max spectra to process (0 = all) | 0 |
 | `-c, --charge_states` | Charge states to search (comma-separated) | `2,3` |
@@ -248,4 +316,5 @@ Project maintained by the MacCoss Lab: https://github.com/maccoss
 - **SEQUEST**: Eng JK, McCormack AL, Yates JR (1994) *J Am Soc Mass Spectrom* 5(11):976-989
 - **Fast XCorr**: Eng JK, et al. (2008) *J Proteome Res* 7(10):4598-4602
 - **Target-Decoy**: Elias JE, Gygi SP (2007) *Nat Methods* 4(3):207-214
+- **DIA**: Gillet LC, et al. (2012) *Mol Cell Proteomics* 11(6):O111.016717
 

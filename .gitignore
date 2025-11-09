@@ -10,3 +10,4 @@ comet.params
 *.pyc
 
 *.mzML
+__pycache__/pyXcorrDIA.cpython-312.pyc
