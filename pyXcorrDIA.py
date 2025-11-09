@@ -10,21 +10,15 @@ CORRECTED VERSION - Fixed XCorr calculation to match Comet exactly
 """
 
 import numpy as np
-import pandas as pd
 from collections import defaultdict
 import re
-import math
 from typing import List, Tuple, Dict, Optional
 import argparse
 import pymzml
 from pyteomics import mgf
-import xml.etree.ElementTree as ET
 import os
 import bisect
 import sys
-from datetime import datetime
-from xml.dom import minidom
-import os
 from datetime import datetime
 
 
@@ -212,13 +206,22 @@ class FastXCorr:
                 # Try to get charge from the precursor element
                 if 'element' in precursor:
                     element = precursor['element']
-                    # Look for charge state in child elements
+                    
+                    # Look for charge state in selectedIonList/selectedIon/cvParam elements
                     for child in element:
-                        if 'charge' in child.attrib or 'selectedIonMZ' in child.tag:
-                            for sub_child in child:
-                                if 'charge' in sub_child.attrib:
-                                    charge = int(sub_child.attrib['charge'])
-                                    break
+                        if 'selectedIonList' in child.tag:
+                            for selected_ion in child:
+                                if 'selectedIon' in selected_ion.tag:
+                                    for cv_param in selected_ion:
+                                        if 'cvParam' in cv_param.tag:
+                                            # MS:1000633 = possible charge state
+                                            # MS:1000041 = charge state
+                                            accession = cv_param.attrib.get('accession', '')
+                                            if accession in ['MS:1000633', 'MS:1000041']:
+                                                value = cv_param.attrib.get('value', '')
+                                                if value:
+                                                    charge = int(float(value))
+                                                    break
                     
                     # Look for isolation window information in the precursor element
                     for child in element:
@@ -718,7 +721,7 @@ class FastXCorr:
                 max_retries_exceeded += 1
         
         # Report statistics
-        print(f"Target-decoy pair generation summary:")
+        print("Target-decoy pair generation summary:")
         print(f"  Target peptides: {len(target_peptides)}")
         print(f"  Target-decoy pairs created: {pairs_created}")
         print(f"  Collisions resolved: {collisions_resolved}")
@@ -792,7 +795,6 @@ class FastXCorr:
         Returns:
             List of (peptide, charge) tuples for peptides within the window
         """
-        import bisect
         
         peptide_charge_pairs = []
         

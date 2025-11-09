@@ -1,14 +1,11 @@
-venv/*
-.venv/*
-__pycache__/*
-.env/*
+/venv
+/.venv
 Ste*.mzML
 *.raw
 *.pdf
 *.pepXML
 *.pin
-__pycache__/pyXcorrDIA.cpython-312.pyc
-comet.params
 /__pycache__
+comet.params
 *.pyc
 
