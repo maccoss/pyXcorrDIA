@@ -1,6 +1,5 @@
-/venv
 /.venv
-Ste*.mzML
+Ast*.mzML
 *.raw
 *.pdf
 *.pepXML
@@ -8,6 +7,8 @@ Ste*.mzML
 /__pycache__
 comet.params
 *.pyc
-
 *.mzML
+__pycache__/pyXcorrDIA.cpython-312.pyc
+*.parquet
+*.dia.tsv
 __pycache__/pyXcorrDIA.cpython-312.pyc

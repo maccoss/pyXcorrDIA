@@ -1,8 +1,6 @@
 """
 Test protein digestion and peptide generation functionality.
 """
-import pytest
-from pyXcorrDIA import FastXCorr
 
 
 class TestProteinDigestion:

@@ -1,9 +1,7 @@
 """
 Test spectrum preprocessing and XCorr calculation.
 """
-import pytest
 import numpy as np
-from pyXcorrDIA import FastXCorr
 
 
 class TestSpectrumPreprocessing:

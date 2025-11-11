@@ -1,6 +1,7 @@
 # Core scientific computing libraries
 numpy>=1.21.0
 pandas>=1.3.0
+pyarrow>=10.0.0  # For Parquet file format support
 
 # Mass spectrometry data processing
 pymzml>=2.4.0

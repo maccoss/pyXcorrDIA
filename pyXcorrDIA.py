@@ -12,7 +12,7 @@ CORRECTED VERSION - Fixed XCorr calculation to match Comet exactly
 import numpy as np
 from collections import defaultdict
 import re
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Union
 import argparse
 import pymzml
 from pyteomics import mgf
@@ -21,6 +21,7 @@ import bisect
 import sys
 from datetime import datetime
 from scipy.signal import savgol_filter
+from multiprocessing import Pool, cpu_count
 
 
 class MassSpectrum:
@@ -59,7 +60,7 @@ class FastXCorr:
     1. Spectrum binning (1.0005079 Da bins)
     2. MakeCorrData windowing normalization (10 windows, normalize to 50.0)
     3. Fast XCorr preprocessing with sliding window (offset=75)
-    4. Simple dot product scoring (CORRECTED - no 0.005 scaling)
+    4. Unified dot product scoring (supports both single and matrix operations)
     5. Static modifications support (default: carbamidomethylation of cysteine +57.021464)
     
     This implementation closely follows the Comet source code to ensure 
@@ -855,7 +856,7 @@ class FastXCorr:
         return target_decoy_pairs
     
     def digest_protein(self, sequence: str, protein_id: str, 
-                      enzyme: str = 'trypsin', missed_cleavages: int = 2) -> List[PeptideCandidate]:
+                      enzyme: str = 'trypsin', missed_cleavages: int = 1) -> List[PeptideCandidate]:
         """
         Digest protein sequence into peptides using specified enzyme.
         
@@ -1185,31 +1186,84 @@ class FastXCorr:
         
         return final_preprocessed
     
+    def calculate_xcorr(self, spectrum_a: np.ndarray, spectrum_b: np.ndarray, 
+                       scaling_factor: float = 0.005) -> Union[float, np.ndarray]:
+        """
+        Unified XCorr calculation supporting both single and batch (matrix) scoring.
+        
+        This function handles:
+        1. Single spectrum scoring: spectrum_a and spectrum_b are 1D arrays
+        2. Batch matrix scoring: spectrum_a is 2D (n_spectra, n_bins), spectrum_b is 2D (m_spectra, n_bins)
+        
+        The core algorithm is identical for both spectrum-centric and peptide-centric searches:
+        - XCorr = dot_product(spectrum_a, spectrum_b) * scaling_factor
+        
+        The only differences are:
+        - Which spectrum is preprocessed (experimental vs theoretical)
+        - Scaling factor: 0.005 for spectrum-centric, 0.0001 for peptide-centric
+        
+        Args:
+            spectrum_a: First spectrum/spectra (1D array or 2D matrix)
+            spectrum_b: Second spectrum/spectra (1D array or 2D matrix)
+            scaling_factor: XCorr scaling factor (0.005 for spectrum-centric, 0.0001 for peptide-centric)
+            
+        Returns:
+            XCorr score (float) or XCorr matrix (2D array) for batch scoring
+        """
+        # Detect if this is matrix multiplication (batch scoring)
+        is_matrix = spectrum_a.ndim == 2 or spectrum_b.ndim == 2
+        
+        if is_matrix:
+            # Matrix multiplication: (n, bins) @ (m, bins).T = (n, m)
+            # This scores n spectra against m spectra in one optimized operation
+            if spectrum_a.ndim == 1:
+                spectrum_a = spectrum_a.reshape(1, -1)
+            if spectrum_b.ndim == 1:
+                spectrum_b = spectrum_b.reshape(1, -1)
+            
+            # Use @ operator for matrix multiplication (calls optimized BLAS)
+            raw_xcorr = spectrum_a @ spectrum_b.T
+            
+            # Apply scaling and round
+            final_xcorr = np.round(raw_xcorr * scaling_factor, 4)
+            
+            # Return scalar if result is 1x1, otherwise return matrix
+            if final_xcorr.shape == (1, 1):
+                return float(final_xcorr[0, 0])
+            return final_xcorr
+        else:
+            # Vector dot product: single spectrum vs single spectrum
+            # Ensure both spectra have the same length
+            min_len = min(len(spectrum_a), len(spectrum_b))
+            
+            # Calculate dot product
+            raw_xcorr = np.dot(spectrum_a[:min_len], spectrum_b[:min_len])
+            
+            # Apply scaling factor and round
+            final_xcorr = round(raw_xcorr * scaling_factor, 4)
+            
+            return final_xcorr
+    
     def calculate_fast_xcorr(self, theoretical_spectrum: np.ndarray, 
                            preprocessed_experimental: np.ndarray) -> float:
         """
-        Calculate fast cross-correlation score using Comet's approach.
+        Calculate fast cross-correlation score for spectrum-centric search.
         
-        FINAL CORRECTION: Apply the 0.005 scaling factor correctly.
-        From Comet source: k = (int)(dFastXcorr*10.0*0.005 + 0.5) and comment 0.005=50/10000
-        This means the final XCorr score SHOULD be scaled by 0.005.
+        This is a convenience wrapper around calculate_xcorr() for spectrum-centric mode:
+        - Theoretical spectrum: raw (unit intensities)
+        - Experimental spectrum: fully preprocessed (windowed + Fast XCorr)
+        - Scaling: 0.005 (Comet's standard scaling)
+        
+        Args:
+            theoretical_spectrum: Theoretical spectrum (raw, unit intensities)
+            preprocessed_experimental: Experimental spectrum (windowed + Fast XCorr preprocessing)
+            
+        Returns:
+            XCorr score scaled by 0.005
         """
-        # Ensure both spectra have the same length
-        min_len = min(len(theoretical_spectrum), len(preprocessed_experimental))
-        
-        # Calculate dot product (Comet's core XCorr calculation)
-        raw_xcorr = np.dot(theoretical_spectrum[:min_len], 
-                          preprocessed_experimental[:min_len])
-        
-        # FINAL CORRECTION: Apply the 0.005 scaling factor
-        # This is the scaling that Comet uses: 0.005 = 50/10000
-        # It accounts for the 50.0 normalization and additional scaling for score range
-        final_xcorr = raw_xcorr * 0.005
-        
-        # Round to reasonable precision like Comet
-        final_xcorr = round(final_xcorr, 4)
-        
-        return final_xcorr
+        result = self.calculate_xcorr(theoretical_spectrum, preprocessed_experimental, 
+                                      scaling_factor=0.005)
+        return float(result)  # Guaranteed to be float for 1D inputs
     
     def calculate_e_value(self, xcorr_scores: List[float], top_score: float) -> float:
         """
@@ -1536,179 +1590,271 @@ class FastXCorr:
         """
         Calculate XCorr for peptide-centric search.
         
-        In this mode:
-        - Experimental spectrum is binned, sqrt-transformed, and windowed (NOT preprocessed)
-        - Theoretical spectrum is fully preprocessed (windowed + Fast XCorr)
-        - Score is the dot product
+        This is a convenience wrapper around calculate_xcorr() for peptide-centric mode:
+        - Experimental spectrum: windowed only (NOT preprocessed with Fast XCorr)
+        - Theoretical spectrum: fully preprocessed (windowed + Fast XCorr)
+        - Scaling: 0.0001 (50x smaller than spectrum-centric due to preprocessing asymmetry)
+        
+        IMPORTANT: The scaling factor is different from spectrum-centric search!
+        In peptide-centric mode, preprocessing the theoretical spectrum (instead of experimental)
+        produces dot products that are ~50x larger. Therefore we use 0.0001 instead of 0.005.
         
         Args:
             experimental_windowed: Experimental spectrum after MakeCorrData windowing
             theoretical_preprocessed: Theoretical spectrum after full preprocessing
             
         Returns:
-            XCorr score
+            XCorr score (scaled to match typical 0-10 range)
         """
-        return np.dot(experimental_windowed, theoretical_preprocessed)
+        result = self.calculate_xcorr(experimental_windowed, theoretical_preprocessed, 
+                                      scaling_factor=0.0001)
+        return float(result)  # Guaranteed to be float for 1D inputs
     
     def search_dia_peptide_centric(self, 
                                    spectra: List[MassSpectrum],
                                    target_decoy_pairs: List[Tuple[PeptideCandidate, PeptideCandidate]],
                                    charge_states: List[int] = [2, 3],
-                                   rt_window_spectra: int = 5) -> Dict:
+                                   rt_window_spectra: int = 5,
+                                   parquet_output: str = None,
+                                   verbose: int = 0) -> Dict:
         """
-        Perform peptide-centric DIA search across multiple spectra.
+        Perform comprehensive peptide-centric DIA search.
         
-        This is optimized for DIA data where:
-        1. Spectra are grouped by isolation window
-        2. Theoretical spectra are preprocessed (not experimental)
-        3. Each peptide is scored across all spectra in the window
-        4. Results track best XCorr, RT, and chromatographic profile
+        Key improvements:
+        1. Score ALL spectra against ALL peptides in the isolation window
+        2. Write XCorr chromatograms to Parquet file incrementally
+        3. Apply Savitzky-Golay smoothing and store both raw and smoothed XCorr
+        4. Store all XCorr values for e-value calculation
+        5. E-value: best peptide XCorr vs all its XCorr scores across spectra
         
         Args:
             spectra: List of spectra (should be from same isolation window)
             target_decoy_pairs: List of (target, decoy) peptide pairs
             charge_states: Charge states to search
             rt_window_spectra: Number of spectra +/- around peak for profile extraction
+            parquet_output: Path to write Parquet file (if None, uses temp file)
             
         Returns:
-            Dictionary with results per peptide:
-            {
-                (peptide_sequence, charge): {
-                    'target_best_xcorr': float,
-                    'target_best_rt': float,
-                    'target_best_scan': str,
-                    'decoy_best_xcorr': float,
-                    'decoy_best_rt': float,
-                    'decoy_best_scan': str,
-                    'target_profile': [(rt, scan, xcorr), ...],  # smoothed
-                    'decoy_profile': [(rt, scan, xcorr), ...],   # smoothed
-                    'isolation_window': (lower, upper)
-                }
-            }
+            Dictionary with results per peptide (and path to Parquet file)
         """
+        import pandas as pd
+        
         if not spectra:
-            return {}
+            return {'results': {}, 'parquet_file': None}
         
         # Get isolation window (same for all spectra in this group)
         isolation_window = (spectra[0].isolation_window_lower, spectra[0].isolation_window_upper)
         
-        # Results dictionary
-        results = {}
+        # Set up Parquet output file
+        if parquet_output is None:
+            window_str = f"{isolation_window[0]:.1f}_{isolation_window[1]:.1f}"
+            parquet_output = f"dia_chromatograms_window_{window_str}.parquet"
         
-        # Find peptides in this isolation window and preprocess their theoretical spectra
-        peptide_theoretical_preprocessed = {}  # (peptide, charge) -> preprocessed_spectrum
-        
-        print(f"  DIA: Preprocessing theoretical spectra for window {isolation_window}")
+        # Find all peptides in this isolation window
+        peptides_in_window = []  # List of (peptide, charge, is_target)
         
         for target_peptide, decoy_peptide in target_decoy_pairs:
             for charge in charge_states:
-                # Check if target is in window
                 target_mz = (target_peptide.mass + charge * self.proton_mass) / charge
                 
                 if isolation_window[0] <= target_mz <= isolation_window[1]:
-                    # Generate and preprocess theoretical spectra
-                    target_theoretical = self.generate_theoretical_spectrum(target_peptide, charge)
-                    target_preprocessed = self.preprocess_theoretical_spectrum(target_theoretical)
-                    peptide_theoretical_preprocessed[(target_peptide, charge)] = target_preprocessed
-                    
-                    decoy_theoretical = self.generate_theoretical_spectrum(decoy_peptide, charge)
-                    decoy_preprocessed = self.preprocess_theoretical_spectrum(decoy_theoretical)
-                    peptide_theoretical_preprocessed[(decoy_peptide, charge)] = decoy_preprocessed
-                    
-                    # Initialize results entry
-                    key = (target_peptide.sequence, charge)
-                    if key not in results:
-                        results[key] = {
-                            'target_peptide': target_peptide,
-                            'decoy_peptide': decoy_peptide,
-                            'target_best_xcorr': -float('inf'),
-                            'target_best_rt': 0.0,
-                            'target_best_scan': '',
-                            'target_best_spectrum_idx': -1,
-                            'decoy_best_xcorr': -float('inf'),
-                            'decoy_best_rt': 0.0,
-                            'decoy_best_scan': '',
-                            'decoy_best_spectrum_idx': -1,
-                            'target_xcorr_series': [],  # (spectrum_idx, rt, scan, xcorr)
-                            'decoy_xcorr_series': [],
-                            'isolation_window': isolation_window,
-                            'charge': charge
-                        }
+                    peptides_in_window.append((target_peptide, charge, True))
+                    peptides_in_window.append((decoy_peptide, charge, False))
         
-        print(f"  DIA: Scoring {len(peptide_theoretical_preprocessed)} peptide-charge combinations across {len(spectra)} spectra")
+        # Preprocess all theoretical spectra once (show at verbose=0, once per window)
+        # Count targets and decoys
+        n_targets = sum(1 for _, _, is_target in peptides_in_window if is_target)
+        n_decoys = len(peptides_in_window) - n_targets
+        window_str = f"{isolation_window[0]:.1f}-{isolation_window[1]:.1f}"
+        print(f"  DIA: Preprocessing {len(peptides_in_window)} theoretical spectra from {n_targets//len(charge_states)} targets and {n_decoys//len(charge_states)} decoys for isolation window {window_str}")
+        peptide_theoretical_preprocessed = {}
         
-        # Score each experimental spectrum against all preprocessed theoretical spectra
+        for peptide, charge, is_target in peptides_in_window:
+            theoretical = self.generate_theoretical_spectrum(peptide, charge)
+            preprocessed = self.preprocess_theoretical_spectrum(theoretical)
+            peptide_theoretical_preprocessed[(peptide, charge)] = preprocessed
+        
+        # Preprocess all experimental spectra (show at verbose=0, once per window)
+        print(f"  DIA: Preprocessing {len(spectra)} experimental spectra for isolation window {window_str}")
+        experimental_preprocessed = []
+        spectrum_metadata = []  # (scan_id, rt, spectrum_idx)
+        
         for spectrum_idx, spectrum in enumerate(spectra):
-            # Preprocess experimental spectrum (bin, sqrt, window - NO Fast XCorr)
-            windowed_experimental = self.preprocess_spectrum(spectrum)
+            windowed = self.preprocess_spectrum(spectrum)
+            experimental_preprocessed.append(windowed)
             
-            # Extract RT (assume scan_id format contains RT or use index as proxy)
-            # Try to extract RT from scan_id or use spectrum index
-            rt = float(spectrum_idx)  # Default: use index as RT proxy
+            # Extract RT - try to get from scan_id or use index
+            rt = float(spectrum_idx)  # Default fallback
+            spectrum_metadata.append((spectrum.scan_id, rt, spectrum_idx))
+        
+        # **VECTORIZED SCORING**: Score ALL peptides against ALL spectra using matrix multiplication
+        # (show at verbose=0, once per window)
+        print(f"  DIA: Scoring {len(peptides_in_window)} peptides vs {len(spectra)} spectra using vectorized matrix multiplication for isolation window {window_str}")
+        
+        # Stack all theoretical spectra into a matrix: (n_peptides, n_bins)
+        theoretical_matrix = np.vstack([peptide_theoretical_preprocessed[(p, c)] 
+                                        for p, c, t in peptides_in_window])
+        
+        # Stack all experimental spectra into a matrix: (n_spectra, n_bins)
+        experimental_matrix = np.vstack(experimental_preprocessed)
+        
+        # Matrix multiply: (n_peptides, n_spectra) in one operation using unified calculate_xcorr()
+        # This replaces the nested loops with a single optimized BLAS call
+        # Use peptide-centric scaling factor (0.0001 instead of 0.005)
+        xcorr_result = self.calculate_xcorr(theoretical_matrix, experimental_matrix, 
+                                             scaling_factor=0.0001)
+        # Type assertion: matrix inputs always return ndarray
+        assert isinstance(xcorr_result, np.ndarray), "Matrix scoring should return ndarray"
+        xcorr_matrix_raw: np.ndarray = xcorr_result
+        
+        # Show matrix scoring complete at verbose=0 (once per window)
+        print("  DIA: Matrix scoring complete, processing results...")
+        
+        chromatogram_data = []  # Collect chromatogram rows
+        peptide_info_data = []  # Collect peptide metadata (one row per peptide)
+        batch_size = 100  # Write every 100 peptides
+        peptide_results = {}  # Track results for summary
+        
+        for pep_idx, (peptide, charge, is_target) in enumerate(peptides_in_window):
+            # Create peptide ID for this peptide
+            peptide_id = f"{peptide.sequence}_{charge}_{'T' if is_target else 'D'}"
             
-            # Score against all peptides
-            for (peptide, charge), theoretical_preprocessed in peptide_theoretical_preprocessed.items():
-                xcorr = self.calculate_peptide_centric_xcorr(windowed_experimental, theoretical_preprocessed)
+            # Store peptide metadata (once per peptide, not per spectrum)
+            peptide_info_data.append({
+                'peptide_id': peptide_id,
+                'peptide_sequence': peptide.sequence,
+                'protein_id': peptide.protein_id,
+                'charge': charge,
+                'is_target': is_target,
+                'peptide_mass': peptide.mass,
+                'isolation_window_lower': isolation_window[0],
+                'isolation_window_upper': isolation_window[1]
+            })
+            
+            # Extract XCorr scores for this peptide from the matrix (one row)
+            xcorr_raw_series = xcorr_matrix_raw[pep_idx, :].tolist()
+            
+            # Store raw XCorr values in chromatogram data
+            for spec_idx, xcorr_raw in enumerate(xcorr_raw_series):
+                scan_id, rt, _ = spectrum_metadata[spec_idx]
+                chromatogram_data.append({
+                    'peptide_id': peptide_id,
+                    'spectrum_idx': spec_idx,
+                    'scan_id': scan_id,
+                    'rt': rt,
+                    'xcorr_raw': xcorr_raw,
+                    'xcorr_smoothed': None  # Will fill in after smoothing
+                })
+            
+            # Apply Savitzky-Golay smoothing to the raw XCorr chromatogram
+            if len(xcorr_raw_series) >= 5:
+                window_length = min(len(xcorr_raw_series), 7)
+                if window_length % 2 == 0:
+                    window_length -= 1  # Must be odd
+                xcorr_smoothed_series = savgol_filter(xcorr_raw_series, window_length=window_length, polyorder=2)
+            else:
+                # Not enough points to smooth - use raw values
+                xcorr_smoothed_series = xcorr_raw_series
+            
+            # Update chromatogram_data with smoothed values
+            start_idx = len(chromatogram_data) - len(xcorr_raw_series)
+            for i, smoothed_val in enumerate(xcorr_smoothed_series):
+                chromatogram_data[start_idx + i]['xcorr_smoothed'] = smoothed_val
+            
+            # Find best scores (both raw and smoothed)
+            best_raw_xcorr = max(xcorr_raw_series)
+            best_raw_idx = xcorr_raw_series.index(best_raw_xcorr)
+            
+            best_smoothed_xcorr = max(xcorr_smoothed_series)
+            best_smoothed_idx = list(xcorr_smoothed_series).index(best_smoothed_xcorr)
+            
+            best_raw_scan_id, best_raw_rt, _ = spectrum_metadata[best_raw_idx]
+            best_smoothed_scan_id, best_smoothed_rt, _ = spectrum_metadata[best_smoothed_idx]
+            
+            # Store result for this peptide
+            key = (peptide.sequence, charge, is_target)
+            peptide_results[key] = {
+                'peptide': peptide,
+                'charge': charge,
+                'is_target': is_target,
+                'best_xcorr': best_raw_xcorr,
+                'best_rt': best_raw_rt,
+                'best_scan': best_raw_scan_id,
+                'best_spectrum_idx': best_raw_idx,
+                'best_smoothed_xcorr': best_smoothed_xcorr,
+                'best_smoothed_rt': best_smoothed_rt,
+                'best_smoothed_scan': best_smoothed_scan_id,
+                'best_smoothed_spectrum_idx': best_smoothed_idx,
+                'all_xcorr_values': xcorr_raw_series,  # Raw values for e-value
+                'all_smoothed_xcorr_values': list(xcorr_smoothed_series),  # Smoothed values
+                'isolation_window': isolation_window
+            }
+            
+            # Write batch to Parquet incrementally
+            if (pep_idx + 1) % batch_size == 0 or (pep_idx + 1) == len(peptides_in_window):
+                # Create DataFrames
+                chrom_df = pd.DataFrame(chromatogram_data)
                 
-                # Determine if this is target or decoy
-                is_target = not peptide.protein_id.startswith('decoy_')
-                
-                # Find the corresponding result entry
-                if is_target:
-                    # Find by target peptide sequence
-                    for key, result in results.items():
-                        if result['target_peptide'] == peptide and result['charge'] == charge:
-                            result['target_xcorr_series'].append((spectrum_idx, rt, spectrum.scan_id, xcorr))
-                            if xcorr > result['target_best_xcorr']:
-                                result['target_best_xcorr'] = xcorr
-                                result['target_best_rt'] = rt
-                                result['target_best_scan'] = spectrum.scan_id
-                                result['target_best_spectrum_idx'] = spectrum_idx
-                            break
+                # For first batch, also write peptide info to separate file
+                if pep_idx < batch_size:
+                    # First batch - create files
+                    chrom_df.to_parquet(parquet_output, engine='pyarrow', index=False)
+                    
+                    # Write peptide metadata to companion file
+                    peptide_info_file = parquet_output.replace('.parquet', '_peptides.parquet')
+                    pd.DataFrame(peptide_info_data).to_parquet(peptide_info_file, engine='pyarrow', index=False)
                 else:
-                    # Find by decoy peptide
-                    for key, result in results.items():
-                        if result['decoy_peptide'] == peptide and result['charge'] == charge:
-                            result['decoy_xcorr_series'].append((spectrum_idx, rt, spectrum.scan_id, xcorr))
-                            if xcorr > result['decoy_best_xcorr']:
-                                result['decoy_best_xcorr'] = xcorr
-                                result['decoy_best_rt'] = rt
-                                result['decoy_best_scan'] = spectrum.scan_id
-                                result['decoy_best_spectrum_idx'] = spectrum_idx
-                            break
-        
-        # Apply Savitzky-Golay smoothing to XCorr profiles
-        print("  DIA: Smoothing chromatographic profiles with Savitzky-Golay filter")
-        
-        for key, result in results.items():
-            # Extract profiles around best peaks
-            for target_type in ['target', 'decoy']:
-                xcorr_series = result[f'{target_type}_xcorr_series']
-                best_idx = result[f'{target_type}_best_spectrum_idx']
+                    # Subsequent batches - append
+                    existing_chrom = pd.read_parquet(parquet_output)
+                    combined_chrom = pd.concat([existing_chrom, chrom_df], ignore_index=True)
+                    combined_chrom.to_parquet(parquet_output, engine='pyarrow', index=False)
+                    
+                    # Append peptide metadata
+                    peptide_info_file = parquet_output.replace('.parquet', '_peptides.parquet')
+                    existing_pep = pd.read_parquet(peptide_info_file)
+                    combined_pep = pd.concat([existing_pep, pd.DataFrame(peptide_info_data)], ignore_index=True)
+                    combined_pep.to_parquet(peptide_info_file, engine='pyarrow', index=False)
                 
-                if best_idx >= 0 and len(xcorr_series) > 0:
-                    # Sort by spectrum index
-                    xcorr_series.sort(key=lambda x: x[0])
-                    
-                    # Get XCorr values in order
-                    xcorr_values = [x[3] for x in xcorr_series]
-                    
-                    # Apply Savitzky-Golay smoothing if we have enough points
-                    if len(xcorr_values) >= 5:
-                        window_length = min(len(xcorr_values), 7)
-                        if window_length % 2 == 0:
-                            window_length -= 1  # Must be odd
-                        smoothed = savgol_filter(xcorr_values, window_length=window_length, polyorder=2)
-                    else:
-                        smoothed = xcorr_values
-                    
-                    # Store smoothed profile
-                    result[f'{target_type}_profile'] = [
-                        (xcorr_series[i][1], xcorr_series[i][2], smoothed[i]) 
-                        for i in range(len(xcorr_series))
-                    ]
+                # Only print batch progress if verbose >= 1
+                if verbose >= 1:
+                    print(f"  DIA: Processed {pep_idx + 1}/{len(peptides_in_window)} peptides, wrote batch to {parquet_output}")
+                chromatogram_data = []  # Clear batch
+                peptide_info_data = []  # Clear peptide info batch
         
-        return results
+        # Always get peptide_info_file path (needed for return)
+        peptide_info_file = parquet_output.replace('.parquet', '_peptides.parquet')
+        
+        # Show completion at verbose=0 (once per window)
+        print(f"  DIA: Completed scoring, chromatograms written to {parquet_output}")
+        
+        # Calculate e-values for each peptide
+        # E-value: how likely is the best XCorr given the distribution of all XCorr values for this peptide?
+        print("  DIA: Calculating e-values")
+        
+        for key, result in peptide_results.items():
+            all_xcorrs = result['all_xcorr_values']
+            best_xcorr = result['best_xcorr']
+            
+            # Also calculate e-value for smoothed
+            all_smoothed = result['all_smoothed_xcorr_values']
+            best_smoothed = result['best_smoothed_xcorr']
+            
+            # Calculate e-value: number of scores >= best_xcorr
+            num_above_raw = sum(1 for x in all_xcorrs if x >= best_xcorr)
+            num_above_smoothed = sum(1 for x in all_smoothed if x >= best_smoothed)
+            
+            result['e_value'] = num_above_raw
+            result['e_value_smoothed'] = num_above_smoothed
+            result['num_spectra_scored'] = len(all_xcorrs)
+        
+        return {
+            'results': peptide_results,
+            'parquet_file': parquet_output,
+            'peptide_info_file': peptide_info_file,
+            'num_spectra': len(spectra),
+            'num_peptides': len(peptides_in_window),
+            'isolation_window': isolation_window
+        }
 
 
 class PepXMLWriter:
@@ -1984,51 +2130,125 @@ class DIAResultsWriter:
     
     def _write_header(self):
         """Write DIA results header."""
-        header = "Peptide\tCharge\tProteinID\tMass\tIsolationWindow\t"
-        header += "TargetBestXCorr\tTargetBestRT\tTargetBestScan\t"
-        header += "DecoyBestXCorr\tDecoyBestRT\tDecoyBestScan\t"
-        header += "TargetProfile\tDecoyProfile\n"
+        header = "Peptide\tCharge\tProteinID\tMass\tIsTarget\tIsolationWindow\t"
+        header += "BestXCorrRaw\tBestXCorrSmoothed\tBestRT\tBestScan\t"
+        header += "EValueRaw\tEValueSmoothed\tNumSpectraScored\t"
+        header += "MeanXCorrRaw\tMedianXCorrRaw\tStdXCorrRaw\n"
         self.file_handle.write(header)
     
     def write_dia_results(self, results: Dict):
         """
-        Write DIA peptide-centric results.
+        Write DIA peptide-centric results with both raw and smoothed XCorr values.
         
         Args:
             results: Dictionary from search_dia_peptide_centric
+                     Keys: (peptide_sequence, charge, is_target)
+                     Values: dict with peptide info, scores, e-values (both raw and smoothed)
         """
-        for (peptide_sequence, charge), result in results.items():
+        for (peptide_sequence, charge, is_target), result in results.items():
             # Basic peptide info
-            target_peptide = result['target_peptide']
+            peptide = result['peptide']
             isolation_window = result['isolation_window']
             window_str = f"[{isolation_window[0]:.4f}-{isolation_window[1]:.4f}]"
             
-            # Best scores and RTs
-            target_best_xcorr = result['target_best_xcorr']
-            target_best_rt = result['target_best_rt']
-            target_best_scan = result['target_best_scan']
+            # Best scores - both raw and smoothed
+            best_xcorr_raw = result['best_xcorr']
+            e_value_raw = result['e_value']
             
-            decoy_best_xcorr = result['decoy_best_xcorr']
-            decoy_best_rt = result['decoy_best_rt']
-            decoy_best_scan = result['decoy_best_scan']
+            best_xcorr_smoothed = result['best_smoothed_xcorr']
+            best_rt_smoothed = result['best_smoothed_rt']
+            best_scan_smoothed = result['best_smoothed_scan']
+            e_value_smoothed = result['e_value_smoothed']
             
-            # Smoothed profiles
-            target_profile = result.get('target_profile', [])
-            decoy_profile = result.get('decoy_profile', [])
+            num_spectra = result['num_spectra_scored']
             
-            # Format profiles as semicolon-separated rt:scan:xcorr entries
-            target_profile_str = ";".join([f"{rt:.2f}:{scan}:{xcorr:.3f}" for rt, scan, xcorr in target_profile])
-            decoy_profile_str = ";".join([f"{rt:.2f}:{scan}:{xcorr:.3f}" for rt, scan, xcorr in decoy_profile])
+            # Calculate statistics from raw XCorr values
+            all_xcorrs_raw = result['all_xcorr_values']
+            mean_xcorr = sum(all_xcorrs_raw) / len(all_xcorrs_raw) if all_xcorrs_raw else 0.0
+            sorted_xcorrs = sorted(all_xcorrs_raw)
+            median_xcorr = sorted_xcorrs[len(sorted_xcorrs)//2] if sorted_xcorrs else 0.0
             
-            # Write line
-            line = f"{peptide_sequence}\t{charge}\t{target_peptide.protein_id}\t{target_peptide.mass:.6f}\t{window_str}\t"
-            line += f"{target_best_xcorr:.4f}\t{target_best_rt:.2f}\t{target_best_scan}\t"
-            line += f"{decoy_best_xcorr:.4f}\t{decoy_best_rt:.2f}\t{decoy_best_scan}\t"
-            line += f"{target_profile_str}\t{decoy_profile_str}\n"
+            # Standard deviation
+            if len(all_xcorrs_raw) > 1:
+                variance = sum((x - mean_xcorr)**2 for x in all_xcorrs_raw) / len(all_xcorrs_raw)
+                std_xcorr = variance ** 0.5
+            else:
+                std_xcorr = 0.0
+            
+            # Write line with both raw and smoothed metrics
+            # For RT and Scan, report the smoothed version (typically more reliable)
+            target_str = "Target" if is_target else "Decoy"
+            line = f"{peptide_sequence}\t{charge}\t{peptide.protein_id}\t{peptide.mass:.6f}\t{target_str}\t{window_str}\t"
+            line += f"{best_xcorr_raw:.4f}\t{best_xcorr_smoothed:.4f}\t{best_rt_smoothed:.2f}\t{best_scan_smoothed}\t"
+            line += f"{e_value_raw}\t{e_value_smoothed}\t{num_spectra}\t"
+            line += f"{mean_xcorr:.4f}\t{median_xcorr:.4f}\t{std_xcorr:.4f}\n"
             
             self.file_handle.write(line)
         
         self.file_handle.flush()
+
+
+# Worker function for parallel processing of isolation windows
+def process_isolation_window_worker(args):
+    """
+    Worker function to process one isolation window in parallel.
+    
+    This function is designed to be called by multiprocessing.Pool.
+    Each worker creates its own FastXCorr instance to avoid pickling issues.
+    
+    Args:
+        args: Tuple of (window_idx, total_windows, isolation_window, window_spectra,
+                       fasta_file, target_decoy_pairs, charge_states, rt_window_spectra,
+                       parquet_file, enzyme, decoy_cycle_length, verbose)
+    
+    Returns:
+        Dictionary with search results and metadata
+    """
+    (window_idx, total_windows, isolation_window, window_spectra,
+     fasta_file, target_decoy_pairs_data, charge_states, rt_window_spectra,
+     parquet_file, enzyme, decoy_cycle_length, verbose) = args
+    
+    # Create a fresh FastXCorr instance for this worker process
+    xcorr_engine = FastXCorr()
+    
+    # Reconstruct target_decoy_pairs from serialized data
+    # (PeptideCandidate objects need to be reconstructed)
+    target_decoy_pairs = []
+    for target_data, decoy_data in target_decoy_pairs_data:
+        target = PeptideCandidate(
+            sequence=target_data['sequence'],
+            protein_id=target_data['protein_id'],
+            mass=target_data['mass']
+        )
+        decoy = PeptideCandidate(
+            sequence=decoy_data['sequence'],
+            protein_id=decoy_data['protein_id'],
+            mass=decoy_data['mass']
+        )
+        target_decoy_pairs.append((target, decoy))
+    
+    # Only print worker start message if verbose >= 1
+    if verbose >= 1:
+        print(f"\n[Worker {window_idx+1}/{total_windows}] Processing isolation window: "
+              f"[{isolation_window[0]:.4f}-{isolation_window[1]:.4f}] m/z, "
+              f"{len(window_spectra)} spectra")
+    
+    # Perform DIA peptide-centric search
+    search_result = xcorr_engine.search_dia_peptide_centric(
+        window_spectra,
+        target_decoy_pairs,
+        charge_states,
+        rt_window_spectra=rt_window_spectra,
+        parquet_output=parquet_file,
+        verbose=verbose
+    )
+    
+    # Only print completion message if verbose >= 1
+    if verbose >= 1:
+        print(f"[Worker {window_idx+1}/{total_windows}] Completed: "
+              f"{len(search_result['results'])} peptide-charge combinations")
+    
+    return search_result
 
 
 def main():
@@ -2044,6 +2264,10 @@ def main():
                        help='DIA results output file. If not specified, uses mzML filename with .dia.tsv extension')
     parser.add_argument('--dia_rt_window', type=int, default=5,
                        help='Number of spectra +/- around best peak for profile extraction in DIA mode (default: 5)')
+    parser.add_argument('--threads', '-t', type=int, default=0,
+                       help='Number of threads for parallel processing in DIA mode. 0 = auto-detect (use all available cores - 1). Default: 0')
+    parser.add_argument('--verbose', '-v', action='count', default=0,
+                       help='Increase output verbosity. Default: show once-per-window messages. Use -v to show all progress including batch writes.')
     parser.add_argument('--top_hits', '-n', type=int, default=10, 
                        help='Number of top hits to report per spectrum (distributed across charge states)')
     parser.add_argument('--max_spectra', '-m', type=int, default=0, 
@@ -2052,8 +2276,8 @@ def main():
                        help='Comma-separated list of charge states to consider (default: 2,3)')
     parser.add_argument('--enzyme', '-e', type=str, default='trypsin',
                        help='Enzyme for protein digestion (default: trypsin). Options: trypsin, trypsin_no_proline, lysc, lysn, argc, aspn, cnbr, gluc, pepsina, chymotrypsin')
-    parser.add_argument('--missed_cleavages', type=int, default=2,
-                       help='Maximum number of missed cleavages (default: 2)')
+    parser.add_argument('--missed_cleavages', type=int, default=1,
+                       help='Maximum number of missed cleavages (default: 1)')
     parser.add_argument('--decoy_cycle_length', '-d', type=int, default=1,
                        help='Number of amino acids to cycle for decoy generation (default: 1)')
     parser.add_argument('--static_mods', '-s', type=str, default='C:57.021464',
@@ -2160,32 +2384,86 @@ def main():
         
         print(f"- DIA results will be written to: {args.dia_output}")
         
+        # Set up Parquet output directory
+        parquet_dir = os.path.splitext(args.mzml_file)[0] + "_dia_chromatograms"
+        os.makedirs(parquet_dir, exist_ok=True)
+        print(f"- Chromatograms will be written to: {parquet_dir}/")
+        
         # Group spectra by isolation window
         print("\nGrouping spectra by isolation window...")
         window_groups = xcorr_engine.group_spectra_by_isolation_window(spectra)
         print(f"Found {len(window_groups)} unique isolation windows")
         
-        # Process each isolation window
-        all_dia_results = {}
-        for window_idx, (isolation_window, window_spectra) in enumerate(window_groups.items()):
-            print(f"\nProcessing isolation window {window_idx+1}/{len(window_groups)}: "
-                  f"[{isolation_window[0]:.4f}-{isolation_window[1]:.4f}] m/z, "
-                  f"{len(window_spectra)} spectra")
-            
-            # Perform DIA peptide-centric search
-            dia_results = xcorr_engine.search_dia_peptide_centric(
-                window_spectra,
-                target_decoy_pairs,
-                charge_states,
-                rt_window_spectra=args.dia_rt_window
-            )
-            
-            # Merge results
-            all_dia_results.update(dia_results)
-            print(f"  Found {len(dia_results)} peptide-charge combinations in this window")
+        # Determine number of worker processes
+        if args.threads == 0:
+            n_workers = max(1, cpu_count() - 1)  # Leave one core for system
+        else:
+            n_workers = max(1, args.threads)
         
-        # Write DIA results
-        print(f"\nWriting DIA results to {args.dia_output}...")
+        print(f"- Using {n_workers} parallel workers for processing isolation windows")
+        
+        # Serialize target_decoy_pairs for passing to workers
+        # (PeptideCandidate objects need to be converted to dict form for pickling)
+        target_decoy_pairs_data = []
+        for target, decoy in target_decoy_pairs:
+            target_data = {
+                'sequence': target.sequence,
+                'protein_id': target.protein_id,
+                'mass': target.mass
+            }
+            decoy_data = {
+                'sequence': decoy.sequence,
+                'protein_id': decoy.protein_id,
+                'mass': decoy.mass
+            }
+            target_decoy_pairs_data.append((target_data, decoy_data))
+        
+        # Prepare work items for parallel processing
+        work_items = []
+        for window_idx, (isolation_window, window_spectra) in enumerate(window_groups.items()):
+            window_str = f"{isolation_window[0]:.1f}_{isolation_window[1]:.1f}"
+            parquet_file = os.path.join(parquet_dir, f"window_{window_str}.parquet")
+            
+            work_items.append((
+                window_idx,
+                len(window_groups),
+                isolation_window,
+                window_spectra,
+                args.fasta_file,
+                target_decoy_pairs_data,
+                charge_states,
+                args.dia_rt_window,
+                parquet_file,
+                args.enzyme,
+                args.decoy_cycle_length,
+                args.verbose
+            ))
+        
+        # Process isolation windows in parallel
+        print(f"\nProcessing {len(window_groups)} isolation windows in parallel...")
+        all_dia_results = {}
+        parquet_files = []
+        peptide_info_files = []
+        
+        if n_workers == 1:
+            # Sequential processing (for debugging or single-core machines)
+            print("Running in single-threaded mode...")
+            search_results = [process_isolation_window_worker(item) for item in work_items]
+        else:
+            # Parallel processing
+            print(f"Running in parallel mode with {n_workers} workers...")
+            with Pool(n_workers) as pool:
+                search_results = pool.map(process_isolation_window_worker, work_items)
+        
+        # Collect results from all workers
+        for search_result in search_results:
+            dia_results = search_result['results']
+            parquet_files.append(search_result['parquet_file'])
+            peptide_info_files.append(search_result['peptide_info_file'])
+            all_dia_results.update(dia_results)
+        
+        # Write DIA summary results
+        print(f"\nWriting DIA summary to {args.dia_output}...")
         with DIAResultsWriter(args.dia_output, args.mzml_file) as dia_writer:
             dia_writer.write_dia_results(all_dia_results)
         
@@ -2193,15 +2471,24 @@ def main():
         print("\nDIA peptide-centric search completed!")
         print(f"Total peptide-charge combinations: {len(all_dia_results)}")
         print(f"Results saved to: {args.dia_output}")
+        print(f"Chromatograms saved to: {len(parquet_files)} Parquet files in {parquet_dir}/")
+        print(f"Peptide metadata saved to: {len(peptide_info_files)} Parquet files in {parquet_dir}/")
         
-        # Calculate some statistics
-        target_better = sum(1 for r in all_dia_results.values() if r['target_best_xcorr'] > r['decoy_best_xcorr'])
-        decoy_better = sum(1 for r in all_dia_results.values() if r['decoy_best_xcorr'] > r['target_best_xcorr'])
-        print(f"  Target better than decoy: {target_better}")
-        print(f"  Decoy better than target: {decoy_better}")
-        if (target_better + decoy_better) > 0:
-            fdr_estimate = (decoy_better / (target_better + decoy_better)) * 100
-            print(f"  Estimated peptide-level FDR: {fdr_estimate:.2f}%")
+        # Calculate some statistics (using smoothed XCorr)
+        target_results = [r for r in all_dia_results.values() if r['is_target']]
+        decoy_results = [r for r in all_dia_results.values() if not r['is_target']]
+        
+        print(f"  Target peptides: {len(target_results)}")
+        print(f"  Decoy peptides: {len(decoy_results)}")
+        
+        if len(target_results) > 0:
+            avg_target_xcorr = sum(r['best_smoothed_xcorr'] for r in target_results) / len(target_results)
+            print(f"  Average target XCorr (smoothed): {avg_target_xcorr:.3f}")
+        
+        if len(decoy_results) > 0:
+            avg_decoy_xcorr = sum(r['best_smoothed_xcorr'] for r in decoy_results) / len(decoy_results)
+            print(f"  Average decoy XCorr (smoothed): {avg_decoy_xcorr:.3f}")
+        
         
     else:
         # Standard spectrum-centric search mode

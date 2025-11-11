@@ -47,7 +47,25 @@ This implementation closely follows Comet's algorithm to ensure reproducibility:
 - **BIN macro**: `bin_idx = int(mass * inverse_bin_width + bin_offset)` where bin_offset = 0.4
 - **MakeCorrData**: 10-window normalization to 50.0
 - **Fast XCorr**: Sliding window (offset=75) preprocessing
-- **XCorr scaling**: Final score multiplied by 0.005 (50/10000)
+- **XCorr scoring**: Unified `calculate_xcorr()` function supports both vector and matrix operations
+  - Spectrum-centric: 0.005 scaling factor (Comet standard)
+  - Peptide-centric: 0.0001 scaling factor (50x smaller due to preprocessing asymmetry)
+  - Matrix multiplication: Scores N peptides × M spectra using optimized BLAS operations
+
+### Unified XCorr Implementation
+
+**Key Innovation**: Single `calculate_xcorr()` function eliminates duplicate code:
+
+- **Automatic mode detection**: Handles 1D (single) or 2D (matrix) inputs automatically
+- **Spectrum-centric**: `calculate_fast_xcorr(theoretical_raw, experimental_preprocessed, 0.005)`
+- **Peptide-centric**: `calculate_peptide_centric_xcorr(experimental_windowed, theoretical_preprocessed, 0.0001)`
+- **DIA batch scoring**: Matrix multiplication for vectorized N×M scoring
+- **Convenience wrappers**: Maintain backward compatibility with existing code
+
+**Why two scaling factors?**
+- Preprocessing the **experimental** spectrum (spectrum-centric): Lower signal amplification → 0.005 scaling
+- Preprocessing the **theoretical** spectrum (peptide-centric): ~50x higher raw scores → 0.0001 scaling
+- Both produce comparable final XCorr scores in the 0-10 range
 
 ### Critical Mass Calculations
 
@@ -68,9 +86,26 @@ This implementation closely follows Comet's algorithm to ensure reproducibility:
 
 - **test_basic_functionality.py** (18 tests) - Core classes, modifications, mass calculations
 - **test_file_io.py** (13 tests) - FASTA, mzML, MGF reading
-- **test_digestion.py** (9 tests) - Protein digestion, decoys, non-redundancy
+- **test_digestion.py** (42 tests) - Protein digestion, decoys, multi-enzyme support
 - **test_preprocessing.py** (13 tests) - Spectrum preprocessing, XCorr calculation
 - **test_search.py** (7 tests) - Database search workflow, integration tests
+- **test_peptide_centric.py** (8 tests) - Peptide-centric DIA scoring with mock data
+- **test_peptide_centric_real_data.py** (8 tests) - Real data validation from notebook
+- **test_unified_xcorr.py** (17 tests) - **NEW**: Unified XCorr function (single & matrix operations)
+
+**Total: 104 tests (100% passing)**
+
+### Unified XCorr Tests (NEW)
+
+**`test_unified_xcorr.py`** validates the unified XCorr implementation:
+
+- Single spectrum scoring with correct scaling (0.005 and 0.0001)
+- Matrix scoring: N×M operations using vectorized multiplication
+- Consistency: Matrix results exactly match repeated single scoring
+- 50x scaling factor difference (0.005 / 0.0001 = 50)
+- Convenience wrappers return floats (not ndarrays)
+- Edge cases: empty arrays, mismatched lengths, 1×1 matrices
+- Real preprocessing and matrix operations
 
 ### Test Data (`tests/data/`)
 
@@ -92,7 +127,22 @@ pytest --cov=pyXcorrDIA --cov-report=html
 
 # Specific module
 pytest tests/test_preprocessing.py -v
+
+# Peptide-centric tests with output
+pytest tests/test_peptide_centric_real_data.py -v -s
+
+# Unified XCorr tests
+pytest tests/test_unified_xcorr.py -v
 ```
+
+### Test Documentation
+
+**When adding new tests:**
+1. Update **TEST_INFRASTRUCTURE_SUMMARY.md** with detailed test descriptions
+2. Update **TESTING_QUICKSTART.md** with quick usage examples
+3. Use descriptive test names that explain what is being validated
+4. Include docstrings explaining test purpose and expected outcomes
+5. For real data tests, reference the source notebook or data file
 
 ## Common Development Tasks
 

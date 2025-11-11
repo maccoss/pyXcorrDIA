@@ -2,7 +2,6 @@
 Test file I/O operations: reading FASTA, mzML, and MGF files.
 """
 import pytest
-from pyXcorrDIA import FastXCorr
 
 
 class TestFASTAReading:

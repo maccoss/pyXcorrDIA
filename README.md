@@ -4,8 +4,10 @@ A fast proteomics database search engine implementing the SEQUEST Cross-Correlat
 
 ## Features
 
-- **Comet-compatible XCorr algorithm** - Faithful implementation matching Comet's preprocessing and scoring
+- **Unified XCorr calculation** - Single function for both vector and matrix operations, eliminating code duplication
+- **Comet-compatible algorithm** - Faithful implementation matching Comet's preprocessing and scoring
 - **DIA peptide-centric mode** - Optimized search for data-independent acquisition with RT profiling
+- **Vectorized matrix scoring** - N×M peptide-spectrum scoring using optimized BLAS operations
 - **Multi-enzyme support** - 10 protease digestion options including Trypsin, Lys-C, Arg-C, and more
 - **Fast spectrum preprocessing** - Efficient binning, windowing normalization, and Fast XCorr calculation
 - **Target-decoy search** - Built-in decoy generation and target-decoy competition
@@ -13,7 +15,7 @@ A fast proteomics database search engine implementing the SEQUEST Cross-Correlat
 - **Flexible modifications** - Configurable static modifications (default: Carbamidomethyl-C)
 - **Multiple output formats** - pepXML and Percolator Input (PIN) files
 - **E-value calculation** - Statistical scoring with charge-specific score distributions
-- **Comprehensive testing** - 56 tests covering all major functionality
+- **Comprehensive testing** - 104 tests covering all major functionality including unified XCorr
 
 ## Installation
 

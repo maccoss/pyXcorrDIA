@@ -1,9 +1,7 @@
 """
 Test basic functionality of pyXcorrDIA classes and core methods.
 """
-import pytest
-import numpy as np
-from pyXcorrDIA import FastXCorr, MassSpectrum, PeptideCandidate
+from pyXcorrDIA import FastXCorr
 
 
 class TestFastXCorrInitialization:
