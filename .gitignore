@@ -12,3 +12,4 @@ __pycache__/pyXcorrDIA.cpython-312.pyc
 *.parquet
 *.dia.tsv
 __pycache__/pyXcorrDIA.cpython-312.pyc
+DIANN-Output/report-lib.predicted.speclib

@@ -22,6 +22,7 @@ import sys
 from datetime import datetime
 from scipy.signal import savgol_filter
 from multiprocessing import Pool, cpu_count
+import pandas as pd
 
 
 class MassSpectrum:
@@ -29,7 +30,8 @@ class MassSpectrum:
     
     def __init__(self, mz_array: np.ndarray, intensity_array: np.ndarray, 
                  scan_id: str = "", precursor_mz: float = 0.0, charge: int = 0,
-                 isolation_window_lower: float = 0.0, isolation_window_upper: float = 0.0):
+                 isolation_window_lower: float = 0.0, isolation_window_upper: float = 0.0,
+                 retention_time: float = 0.0):
         self.mz_array = mz_array
         self.intensity_array = intensity_array
         self.scan_id = scan_id
@@ -37,6 +39,7 @@ class MassSpectrum:
         self.charge = charge
         self.isolation_window_lower = isolation_window_lower
         self.isolation_window_upper = isolation_window_upper
+        self.retention_time = retention_time  # Retention time in minutes
         # Comet-style preprocessing results
         self.processed_spectrum: Optional[np.ndarray] = None  # After MakeCorrData windowing
         self.preprocessed_spectrum: Optional[np.ndarray] = None  # After fast XCorr preprocessing
@@ -252,7 +255,7 @@ class FastXCorr:
         # Open the mzML file with pymzml
         run = pymzml.run.Reader(mzml_file)
         
-        for spectrum in run:
+        for spectrum_idx, spectrum in enumerate(run):
             # Only process MS2 spectra
             if spectrum.ms_level != 2:
                 continue
@@ -311,10 +314,18 @@ class FastXCorr:
                     isolation_window_lower = precursor_mz - 1.5
                     isolation_window_upper = precursor_mz + 1.5
             
-            # Get scan ID
+            # Get scan ID and retention time
             scan_id = spectrum.ID
+            
+            # Try to get retention time, fallback to scan index if not available
+            try:
+                retention_time_minutes = spectrum.scan_time_in_minutes()
+            except (AttributeError, TypeError):
+                # If RT not available, use scan index as a proxy
+                retention_time_minutes = float(spectrum_idx)
+            
             if not scan_id:
-                scan_id = f"scan_{spectrum.scan_time_in_minutes()}"
+                scan_id = f"scan_{retention_time_minutes:.4f}"
             
             # Get m/z and intensity arrays
             if len(spectrum.peaks('centroided')) > 0:
@@ -329,7 +340,8 @@ class FastXCorr:
                     precursor_mz=precursor_mz,
                     charge=charge,
                     isolation_window_lower=isolation_window_lower,
-                    isolation_window_upper=isolation_window_upper
+                    isolation_window_upper=isolation_window_upper,
+                    retention_time=retention_time_minutes
                 )
                 spectra.append(mass_spectrum)
                 
@@ -1622,10 +1634,11 @@ class FastXCorr:
         
         Key improvements:
         1. Score ALL spectra against ALL peptides in the isolation window
-        2. Write XCorr chromatograms to Parquet file incrementally
+        2. Write XCorr chromatograms to Parquet file incrementally with unified schema
         3. Apply Savitzky-Golay smoothing and store both raw and smoothed XCorr
         4. Store all XCorr values for e-value calculation
         5. E-value: best peptide XCorr vs all its XCorr scores across spectra
+        6. Track target/decoy pairs for downstream competition analysis
         
         Args:
             spectra: List of spectra (should be from same isolation window)
@@ -1637,8 +1650,6 @@ class FastXCorr:
         Returns:
             Dictionary with results per peptide (and path to Parquet file)
         """
-        import pandas as pd
-        
         if not spectra:
             return {'results': {}, 'parquet_file': None}
         
@@ -1651,49 +1662,55 @@ class FastXCorr:
             parquet_output = f"dia_chromatograms_window_{window_str}.parquet"
         
         # Find all peptides in this isolation window
-        peptides_in_window = []  # List of (peptide, charge, is_target)
+        # Track target/decoy pairs for later linkage
+        peptides_in_window = []  # List of (peptide, charge, is_target, pair_id)
+        pair_id = 0
         
         for target_peptide, decoy_peptide in target_decoy_pairs:
             for charge in charge_states:
                 target_mz = (target_peptide.mass + charge * self.proton_mass) / charge
                 
                 if isolation_window[0] <= target_mz <= isolation_window[1]:
-                    peptides_in_window.append((target_peptide, charge, True))
-                    peptides_in_window.append((decoy_peptide, charge, False))
+                    # Both target and decoy share the same pair_id for linkage
+                    peptides_in_window.append((target_peptide, charge, True, pair_id))
+                    peptides_in_window.append((decoy_peptide, charge, False, pair_id))
+                    pair_id += 1
         
-        # Preprocess all theoretical spectra once (show at verbose=0, once per window)
+        # Preprocess all theoretical spectra once
         # Count targets and decoys
-        n_targets = sum(1 for _, _, is_target in peptides_in_window if is_target)
+        n_targets = sum(1 for _, _, is_target, _ in peptides_in_window if is_target)
         n_decoys = len(peptides_in_window) - n_targets
         window_str = f"{isolation_window[0]:.1f}-{isolation_window[1]:.1f}"
-        print(f"  DIA: Preprocessing {len(peptides_in_window)} theoretical spectra from {n_targets//len(charge_states)} targets and {n_decoys//len(charge_states)} decoys for isolation window {window_str}")
+        if verbose >= 1:
+            print(f"  DIA: Preprocessing {len(peptides_in_window)} theoretical spectra from {n_targets//len(charge_states)} targets and {n_decoys//len(charge_states)} decoys for isolation window {window_str}")
         peptide_theoretical_preprocessed = {}
         
-        for peptide, charge, is_target in peptides_in_window:
+        for peptide, charge, is_target, pair_id in peptides_in_window:
             theoretical = self.generate_theoretical_spectrum(peptide, charge)
             preprocessed = self.preprocess_theoretical_spectrum(theoretical)
             peptide_theoretical_preprocessed[(peptide, charge)] = preprocessed
         
-        # Preprocess all experimental spectra (show at verbose=0, once per window)
-        print(f"  DIA: Preprocessing {len(spectra)} experimental spectra for isolation window {window_str}")
+        # Preprocess all experimental spectra
+        if verbose >= 1:
+            print(f"  DIA: Preprocessing {len(spectra)} experimental spectra for isolation window {window_str}")
         experimental_preprocessed = []
-        spectrum_metadata = []  # (scan_id, rt, spectrum_idx)
+        spectrum_metadata = []  # (scan_id, rt_minutes, spectrum_idx)
         
         for spectrum_idx, spectrum in enumerate(spectra):
             windowed = self.preprocess_spectrum(spectrum)
             experimental_preprocessed.append(windowed)
             
-            # Extract RT - try to get from scan_id or use index
-            rt = float(spectrum_idx)  # Default fallback
-            spectrum_metadata.append((spectrum.scan_id, rt, spectrum_idx))
+            # Extract RT in minutes from spectrum object
+            rt_minutes = spectrum.retention_time if hasattr(spectrum, 'retention_time') else float(spectrum_idx)
+            spectrum_metadata.append((spectrum.scan_id, rt_minutes, spectrum_idx))
         
         # **VECTORIZED SCORING**: Score ALL peptides against ALL spectra using matrix multiplication
-        # (show at verbose=0, once per window)
-        print(f"  DIA: Scoring {len(peptides_in_window)} peptides vs {len(spectra)} spectra using vectorized matrix multiplication for isolation window {window_str}")
+        if verbose >= 1:
+            print(f"  DIA: Scoring {len(peptides_in_window)} peptides vs {len(spectra)} spectra using vectorized matrix multiplication for isolation window {window_str}")
         
         # Stack all theoretical spectra into a matrix: (n_peptides, n_bins)
         theoretical_matrix = np.vstack([peptide_theoretical_preprocessed[(p, c)] 
-                                        for p, c, t in peptides_in_window])
+                                        for p, c, t, pair_id in peptides_in_window])
         
         # Stack all experimental spectra into a matrix: (n_spectra, n_bins)
         experimental_matrix = np.vstack(experimental_preprocessed)
@@ -1707,44 +1724,34 @@ class FastXCorr:
         assert isinstance(xcorr_result, np.ndarray), "Matrix scoring should return ndarray"
         xcorr_matrix_raw: np.ndarray = xcorr_result
         
-        # Show matrix scoring complete at verbose=0 (once per window)
-        print("  DIA: Matrix scoring complete, processing results...")
+        # Show matrix scoring complete if verbose
+        if verbose >= 1:
+            print("  DIA: Matrix scoring complete, processing results...")
         
-        chromatogram_data = []  # Collect chromatogram rows
-        peptide_info_data = []  # Collect peptide metadata (one row per peptide)
+        chromatogram_data = []  # Unified chromatogram data with all information
         batch_size = 100  # Write every 100 peptides
         peptide_results = {}  # Track results for summary
         
-        for pep_idx, (peptide, charge, is_target) in enumerate(peptides_in_window):
+        for pep_idx, (peptide, charge, is_target, pair_id) in enumerate(peptides_in_window):
             # Create peptide ID for this peptide
             peptide_id = f"{peptide.sequence}_{charge}_{'T' if is_target else 'D'}"
             
-            # Store peptide metadata (once per peptide, not per spectrum)
-            peptide_info_data.append({
-                'peptide_id': peptide_id,
-                'peptide_sequence': peptide.sequence,
-                'protein_id': peptide.protein_id,
-                'charge': charge,
-                'is_target': is_target,
-                'peptide_mass': peptide.mass,
-                'isolation_window_lower': isolation_window[0],
-                'isolation_window_upper': isolation_window[1]
-            })
+            # Create target sequence (for linking target/decoy pairs)
+            # This allows downstream analysis to match target and decoy
+            if is_target:
+                target_sequence = peptide.sequence
+            else:
+                # For decoy, we need to find its corresponding target
+                # Since peptides come in pairs, target is always just before/after decoy
+                target_peptide_idx = (pep_idx - 1) if (pep_idx % 2 == 1) else (pep_idx + 1)
+                if target_peptide_idx < len(peptides_in_window):
+                    target_peptide, _, _, _ = peptides_in_window[target_peptide_idx]
+                    target_sequence = target_peptide.sequence
+                else:
+                    target_sequence = peptide.sequence  # Fallback
             
             # Extract XCorr scores for this peptide from the matrix (one row)
             xcorr_raw_series = xcorr_matrix_raw[pep_idx, :].tolist()
-            
-            # Store raw XCorr values in chromatogram data
-            for spec_idx, xcorr_raw in enumerate(xcorr_raw_series):
-                scan_id, rt, _ = spectrum_metadata[spec_idx]
-                chromatogram_data.append({
-                    'peptide_id': peptide_id,
-                    'spectrum_idx': spec_idx,
-                    'scan_id': scan_id,
-                    'rt': rt,
-                    'xcorr_raw': xcorr_raw,
-                    'xcorr_smoothed': None  # Will fill in after smoothing
-                })
             
             # Apply Savitzky-Golay smoothing to the raw XCorr chromatogram
             if len(xcorr_raw_series) >= 5:
@@ -1756,11 +1763,6 @@ class FastXCorr:
                 # Not enough points to smooth - use raw values
                 xcorr_smoothed_series = xcorr_raw_series
             
-            # Update chromatogram_data with smoothed values
-            start_idx = len(chromatogram_data) - len(xcorr_raw_series)
-            for i, smoothed_val in enumerate(xcorr_smoothed_series):
-                chromatogram_data[start_idx + i]['xcorr_smoothed'] = smoothed_val
-            
             # Find best scores (both raw and smoothed)
             best_raw_xcorr = max(xcorr_raw_series)
             best_raw_idx = xcorr_raw_series.index(best_raw_xcorr)
@@ -1770,6 +1772,48 @@ class FastXCorr:
             
             best_raw_scan_id, best_raw_rt, _ = spectrum_metadata[best_raw_idx]
             best_smoothed_scan_id, best_smoothed_rt, _ = spectrum_metadata[best_smoothed_idx]
+            
+            # Store XCorr values in unified schema (one row per peptide-spectrum combination)
+            for spec_idx, (xcorr_raw, xcorr_smoothed) in enumerate(zip(xcorr_raw_series, xcorr_smoothed_series)):
+                scan_id, rt_minutes, _ = spectrum_metadata[spec_idx]
+                chromatogram_data.append({
+                    # Peptide identification
+                    'peptide_id': peptide_id,
+                    'peptide_sequence': peptide.sequence,
+                    'target_sequence': target_sequence,  # Links target/decoy pairs
+                    'pair_id': pair_id,  # Explicit pair linkage
+                    'protein_id': peptide.protein_id,
+                    'charge': charge,
+                    'is_target': is_target,
+                    'peptide_mass': peptide.mass,
+                    
+                    # Isolation window
+                    'isolation_window_lower': isolation_window[0],
+                    'isolation_window_upper': isolation_window[1],
+                    
+                    # Spectrum identification
+                    'scan_id': scan_id,
+                    'spectrum_idx': spec_idx,
+                    'retention_time': rt_minutes,  # RT in minutes
+                    
+                    # XCorr scores
+                    'xcorr_raw': xcorr_raw,
+                    'xcorr_smoothed': xcorr_smoothed,
+                    
+                    # Best scores (denormalized for quick filtering)
+                    'is_best_raw': (spec_idx == best_raw_idx),
+                    'is_best_smoothed': (spec_idx == best_smoothed_idx),
+                    'best_raw_xcorr': best_raw_xcorr,
+                    'best_smoothed_xcorr': best_smoothed_xcorr,
+                    
+                    # Placeholders for future features
+                    'xcorr_snr': None,
+                    'xcorr_rank': None,
+                    'peak_apex_distance': None,
+                    'peak_width': None,
+                    'e_value_raw': None,
+                    'e_value_smoothed': None
+                })
             
             # Store result for this peptide
             key = (peptide.sequence, charge, is_target)
@@ -1790,46 +1834,32 @@ class FastXCorr:
                 'isolation_window': isolation_window
             }
             
-            # Write batch to Parquet incrementally
+            # Write batch to Parquet incrementally (unified schema)
             if (pep_idx + 1) % batch_size == 0 or (pep_idx + 1) == len(peptides_in_window):
-                # Create DataFrames
+                # Create DataFrame with unified schema
                 chrom_df = pd.DataFrame(chromatogram_data)
                 
-                # For first batch, also write peptide info to separate file
                 if pep_idx < batch_size:
-                    # First batch - create files
+                    # First batch - create file
                     chrom_df.to_parquet(parquet_output, engine='pyarrow', index=False)
-                    
-                    # Write peptide metadata to companion file
-                    peptide_info_file = parquet_output.replace('.parquet', '_peptides.parquet')
-                    pd.DataFrame(peptide_info_data).to_parquet(peptide_info_file, engine='pyarrow', index=False)
                 else:
                     # Subsequent batches - append
                     existing_chrom = pd.read_parquet(parquet_output)
                     combined_chrom = pd.concat([existing_chrom, chrom_df], ignore_index=True)
                     combined_chrom.to_parquet(parquet_output, engine='pyarrow', index=False)
-                    
-                    # Append peptide metadata
-                    peptide_info_file = parquet_output.replace('.parquet', '_peptides.parquet')
-                    existing_pep = pd.read_parquet(peptide_info_file)
-                    combined_pep = pd.concat([existing_pep, pd.DataFrame(peptide_info_data)], ignore_index=True)
-                    combined_pep.to_parquet(peptide_info_file, engine='pyarrow', index=False)
                 
                 # Only print batch progress if verbose >= 1
                 if verbose >= 1:
                     print(f"  DIA: Processed {pep_idx + 1}/{len(peptides_in_window)} peptides, wrote batch to {parquet_output}")
                 chromatogram_data = []  # Clear batch
-                peptide_info_data = []  # Clear peptide info batch
         
-        # Always get peptide_info_file path (needed for return)
-        peptide_info_file = parquet_output.replace('.parquet', '_peptides.parquet')
-        
-        # Show completion at verbose=0 (once per window)
-        print(f"  DIA: Completed scoring, chromatograms written to {parquet_output}")
+        # Show completion at verbose=0 (always show, once per window)
+        print(f"  DIA: Completed window {window_str}: {len(peptides_in_window)} peptides scored")
         
         # Calculate e-values for each peptide
         # E-value: how likely is the best XCorr given the distribution of all XCorr values for this peptide?
-        print("  DIA: Calculating e-values")
+        if verbose >= 1:
+            print(f"  DIA: Calculating e-values for isolation window {window_str}")
         
         for key, result in peptide_results.items():
             all_xcorrs = result['all_xcorr_values']
@@ -1850,7 +1880,6 @@ class FastXCorr:
         return {
             'results': peptide_results,
             'parquet_file': parquet_output,
-            'peptide_info_file': peptide_info_file,
             'num_spectra': len(spectra),
             'num_peptides': len(peptides_in_window),
             'isolation_window': isolation_window
@@ -2443,7 +2472,6 @@ def main():
         print(f"\nProcessing {len(window_groups)} isolation windows in parallel...")
         all_dia_results = {}
         parquet_files = []
-        peptide_info_files = []
         
         if n_workers == 1:
             # Sequential processing (for debugging or single-core machines)
@@ -2459,8 +2487,48 @@ def main():
         for search_result in search_results:
             dia_results = search_result['results']
             parquet_files.append(search_result['parquet_file'])
-            peptide_info_files.append(search_result['peptide_info_file'])
             all_dia_results.update(dia_results)
+        
+        # Merge all per-window parquet files into single unified file
+        print(f"\nMerging {len(parquet_files)} per-window parquet files into unified file...")
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        
+        all_chromatograms = pd.concat([
+            pd.read_parquet(f) for f in parquet_files if f is not None
+        ], ignore_index=True)
+        
+        # Sort by pair_id, target/decoy, charge, and RT for better compression and queries
+        all_chromatograms = all_chromatograms.sort_values(
+            ['pair_id', 'is_target', 'charge', 'retention_time']
+        )
+        
+        # Write unified parquet file with mzML basename + .dia-chrom.parquet
+        # Place it in the same directory as the input mzML file
+        mzml_dir = os.path.dirname(args.mzml_file) or '.'
+        mzml_basename = os.path.basename(args.mzml_file)
+        # Remove .mzML extension and add .dia-chrom.parquet
+        parquet_basename = os.path.splitext(mzml_basename)[0] + '.dia-chrom.parquet'
+        unified_parquet_file = os.path.join(mzml_dir, parquet_basename)
+        
+        table = pa.Table.from_pandas(all_chromatograms)
+        pq.write_table(
+            table,
+            unified_parquet_file,
+            compression='snappy',  # Fast compression, good for large files
+            use_dictionary=True,   # Efficient for repeated strings (scan_id, protein_id, etc.)
+            row_group_size=100000  # Optimize for typical query patterns
+        )
+        
+        print(f"Unified chromatogram file written to: {unified_parquet_file}")
+        print(f"  Total rows: {len(all_chromatograms):,}")
+        print(f"  File size: {os.path.getsize(unified_parquet_file) / 1024 / 1024:.2f} MB")
+        
+        # Optionally delete per-window files to save space
+        # Uncomment if you want to clean up:
+        # for f in parquet_files:
+        #     if f and os.path.exists(f):
+        #         os.remove(f)
         
         # Write DIA summary results
         print(f"\nWriting DIA summary to {args.dia_output}...")
@@ -2471,8 +2539,8 @@ def main():
         print("\nDIA peptide-centric search completed!")
         print(f"Total peptide-charge combinations: {len(all_dia_results)}")
         print(f"Results saved to: {args.dia_output}")
-        print(f"Chromatograms saved to: {len(parquet_files)} Parquet files in {parquet_dir}/")
-        print(f"Peptide metadata saved to: {len(peptide_info_files)} Parquet files in {parquet_dir}/")
+        print(f"Unified chromatogram file: {unified_parquet_file}")
+        print(f"Per-window parquet files: {len(parquet_files)} files in {parquet_dir}/")
         
         # Calculate some statistics (using smoothed XCorr)
         target_results = [r for r in all_dia_results.values() if r['is_target']]

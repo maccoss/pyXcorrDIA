@@ -19,7 +19,7 @@ from pyXcorrDIA import (
 class TestDIAParallelization:
     """Test DIA mode parallel processing."""
     
-    def test_worker_function_serialization(self, xcorr_engine):
+    def test_worker_function_serialization(self, xcorr_engine, tmp_path):
         """
         Test that the worker function properly handles serialized data.
         
@@ -53,6 +53,9 @@ class TestDIAParallelization:
             isolation_window_upper=405.0
         )
         
+        # Use temporary parquet file path
+        parquet_file = str(tmp_path / "window_400.0_405.0.parquet")
+        
         # Prepare worker arguments
         args = (
             0,  # window_idx
@@ -63,7 +66,7 @@ class TestDIAParallelization:
             target_decoy_pairs_data,  # serialized pairs
             [2],  # charge_states
             [spectrum],  # rt_window_spectra
-            None,  # parquet_file
+            parquet_file,  # parquet_file (use tmp_path)
             'trypsin',  # enzyme
             1,  # decoy_cycle_length
             0  # verbose (suppress output)
@@ -72,10 +75,9 @@ class TestDIAParallelization:
         # Call worker function
         result = process_isolation_window_worker(args)
         
-        # Verify result structure
+        # Verify result structure (no longer has peptide_info_file with unified schema)
         assert 'results' in result
         assert 'parquet_file' in result
-        assert 'peptide_info_file' in result
         assert isinstance(result['results'], dict)
     
     
@@ -127,7 +129,7 @@ class TestDIAParallelization:
             mock_fastxcorr.assert_called_once()
     
     
-    def test_parallel_vs_sequential_consistency(self, xcorr_engine):
+    def test_parallel_vs_sequential_consistency(self, xcorr_engine, tmp_path):
         """
         Test that parallel and sequential processing produce identical results.
         
@@ -176,14 +178,17 @@ class TestDIAParallelization:
             }
             target_decoy_pairs_data.append((target_data, decoy_data))
         
-        # Create work items for two isolation windows
+        # Create work items for two isolation windows with temporary parquet paths
+        parquet_file1 = str(tmp_path / "window_400.0_405.0.parquet")
+        parquet_file2 = str(tmp_path / "window_325.0_330.0.parquet")
+        
         work_items = [
             (0, 2, (400.0, 405.0), [spectrum1], None,
              target_decoy_pairs_data, [2], [spectrum1],
-             None, 'trypsin', 1, 0),
+             parquet_file1, 'trypsin', 1, 0),
             (1, 2, (325.0, 330.0), [spectrum2], None,
              target_decoy_pairs_data, [2], [spectrum2],
-             None, 'trypsin', 1, 0)
+             parquet_file2, 'trypsin', 1, 0)
         ]
         
         # Process sequentially
@@ -204,7 +209,7 @@ class TestDIAParallelization:
             assert seq_result['results'].keys() == par_result['results'].keys()
     
     
-    def test_worker_handles_multiple_spectra(self):
+    def test_worker_handles_multiple_spectra(self, tmp_path):
         """
         Test that worker correctly processes windows with multiple spectra.
         
@@ -227,10 +232,13 @@ class TestDIAParallelization:
             )
             spectra.append(spectrum)
         
+        # Use temporary parquet file path
+        parquet_file = str(tmp_path / "window_400.0_405.0.parquet")
+        
         args = (
             0, 1, (400.0, 405.0), spectra, None,
             [(target_data, decoy_data)], [2], spectra,
-            None, 'trypsin', 1, 0
+            parquet_file, 'trypsin', 1, 0
         )
         
         # Process window
@@ -241,7 +249,7 @@ class TestDIAParallelization:
         assert isinstance(result['results'], dict)
     
     
-    def test_worker_handles_multiple_charge_states(self):
+    def test_worker_handles_multiple_charge_states(self, tmp_path):
         """
         Test that worker processes multiple charge states correctly.
         
@@ -258,12 +266,15 @@ class TestDIAParallelization:
             isolation_window_upper=405.0
         )
         
+        # Use temporary parquet file path
+        parquet_file = str(tmp_path / "window_400.0_405.0.parquet")
+        
         # Test with multiple charge states
         args = (
             0, 1, (400.0, 405.0), [spectrum], None,
             [(target_data, decoy_data)],
             [2, 3, 4],  # Multiple charge states
-            [spectrum], None, 'trypsin', 1, 0
+            [spectrum], parquet_file, 'trypsin', 1, 0
         )
         
         result = process_isolation_window_worker(args)
@@ -272,7 +283,7 @@ class TestDIAParallelization:
         assert 'results' in result
     
     
-    def test_worker_verbose_output_suppression(self, capsys):
+    def test_worker_verbose_output_suppression(self, capsys, tmp_path):
         """
         Test that verbose=0 suppresses worker output.
         
@@ -292,11 +303,14 @@ class TestDIAParallelization:
             isolation_window_upper=405.0
         )
         
+        # Use temporary parquet file path
+        parquet_file = str(tmp_path / "window_400.0_405.0.parquet")
+        
         # verbose=0 should suppress output
         args = (
             0, 1, (400.0, 405.0), [spectrum], None,
             [(target_data, decoy_data)], [2], [spectrum],
-            None, 'trypsin', 1, 0  # verbose=0
+            parquet_file, 'trypsin', 1, 0  # verbose=0
         )
         
         process_isolation_window_worker(args)
@@ -306,14 +320,16 @@ class TestDIAParallelization:
         assert "[Worker" not in captured.out
     
     
-    def test_worker_result_structure(self):
+    def test_worker_result_structure(self, tmp_path):
         """
         Test that worker returns correctly structured results.
         
         Results must include:
         - results: dict of peptide results
-        - parquet_file: path to chromatogram file (or None)
-        - peptide_info_file: path to peptide info file (or None)
+        - parquet_file: path to unified chromatogram file (or None)
+        - num_spectra: number of spectra processed
+        - num_peptides: number of peptides scored
+        - isolation_window: tuple of (lower, upper) bounds
         """
         # Create peptide with precursor m/z in isolation window 400-405
         # For charge 2: mass ~800 Da → m/z ~400 Da
@@ -328,23 +344,30 @@ class TestDIAParallelization:
             isolation_window_upper=405.0
         )
         
+        # Use temporary parquet file path
+        parquet_file = str(tmp_path / "window_400.0_405.0.parquet")
+        
         args = (
             0, 1, (400.0, 405.0), [spectrum], None,
             [(target_data, decoy_data)], [2], [spectrum],
-            None, 'trypsin', 1, 0
+            parquet_file, 'trypsin', 1, 0
         )
         
         result = process_isolation_window_worker(args)
         
-        # Verify required keys
+        # Verify required keys in unified schema
         assert 'results' in result
         assert 'parquet_file' in result
-        assert 'peptide_info_file' in result
+        assert 'num_spectra' in result
+        assert 'num_peptides' in result
+        assert 'isolation_window' in result
         
         # Verify types
         assert isinstance(result['results'], dict)
         assert result['parquet_file'] is None or isinstance(result['parquet_file'], str)
-        assert result['peptide_info_file'] is None or isinstance(result['peptide_info_file'], str)
+        assert isinstance(result['num_spectra'], int)
+        assert isinstance(result['num_peptides'], int)
+        assert isinstance(result['isolation_window'], tuple)
 
 
 class TestDIAMatrixScoring:
