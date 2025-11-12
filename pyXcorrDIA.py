@@ -1626,7 +1626,6 @@ class FastXCorr:
                                    spectra: List[MassSpectrum],
                                    target_decoy_pairs: List[Tuple[PeptideCandidate, PeptideCandidate]],
                                    charge_states: List[int] = [2, 3],
-                                   rt_window_spectra: int = 5,
                                    parquet_output: str = None,
                                    verbose: int = 0) -> Dict:
         """
@@ -1635,7 +1634,7 @@ class FastXCorr:
         Key improvements:
         1. Score ALL spectra against ALL peptides in the isolation window
         2. Write XCorr chromatograms to Parquet file incrementally with unified schema
-        3. Apply Savitzky-Golay smoothing and store both raw and smoothed XCorr
+        3. Apply Savitzky-Golay smoothing (auto window size, max 7 points) to XCorr chromatograms
         4. Store all XCorr values for e-value calculation
         5. E-value: best peptide XCorr vs all its XCorr scores across spectra
         6. Track target/decoy pairs for downstream competition analysis
@@ -1644,7 +1643,6 @@ class FastXCorr:
             spectra: List of spectra (should be from same isolation window)
             target_decoy_pairs: List of (target, decoy) peptide pairs
             charge_states: Charge states to search
-            rt_window_spectra: Number of spectra +/- around peak for profile extraction
             parquet_output: Path to write Parquet file (if None, uses temp file)
             
         Returns:
@@ -2227,14 +2225,14 @@ def process_isolation_window_worker(args):
     
     Args:
         args: Tuple of (window_idx, total_windows, isolation_window, window_spectra,
-                       fasta_file, target_decoy_pairs, charge_states, rt_window_spectra,
+                       fasta_file, target_decoy_pairs, charge_states,
                        parquet_file, enzyme, decoy_cycle_length, verbose)
     
     Returns:
         Dictionary with search results and metadata
     """
     (window_idx, total_windows, isolation_window, window_spectra,
-     fasta_file, target_decoy_pairs_data, charge_states, rt_window_spectra,
+     fasta_file, target_decoy_pairs_data, charge_states,
      parquet_file, enzyme, decoy_cycle_length, verbose) = args
     
     # Create a fresh FastXCorr instance for this worker process
@@ -2267,7 +2265,6 @@ def process_isolation_window_worker(args):
         window_spectra,
         target_decoy_pairs,
         charge_states,
-        rt_window_spectra=rt_window_spectra,
         parquet_output=parquet_file,
         verbose=verbose
     )
@@ -2291,8 +2288,6 @@ def main():
                        help='Enable DIA peptide-centric search mode (experimental)')
     parser.add_argument('--dia_output', default='', 
                        help='DIA results output file. If not specified, uses mzML filename with .dia.tsv extension')
-    parser.add_argument('--dia_rt_window', type=int, default=5,
-                       help='Number of spectra +/- around best peak for profile extraction in DIA mode (default: 5)')
     parser.add_argument('--threads', '-t', type=int, default=0,
                        help='Number of threads for parallel processing in DIA mode. 0 = auto-detect (use all available cores - 1). Default: 0')
     parser.add_argument('--verbose', '-v', action='count', default=0,
@@ -2404,7 +2399,8 @@ def main():
     # Check if DIA mode is enabled
     if args.dia_mode:
         print("\n*** DIA PEPTIDE-CENTRIC SEARCH MODE ***")
-        print(f"- RT window for profile extraction: +/- {args.dia_rt_window} spectra")
+        print("Strategy: Score ALL peptides in isolation window against ALL spectra in that window")
+        print("Output: Raw and smoothed XCorr chromatograms with e-values for each peptide")
         
         # Determine DIA output filename
         if not args.dia_output:
@@ -2461,7 +2457,6 @@ def main():
                 args.fasta_file,
                 target_decoy_pairs_data,
                 charge_states,
-                args.dia_rt_window,
                 parquet_file,
                 args.enzyme,
                 args.decoy_cycle_length,

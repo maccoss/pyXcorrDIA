@@ -65,7 +65,6 @@ class TestDIAParallelization:
             None,  # fasta_file (not needed for this test)
             target_decoy_pairs_data,  # serialized pairs
             [2],  # charge_states
-            [spectrum],  # rt_window_spectra
             parquet_file,  # parquet_file (use tmp_path)
             'trypsin',  # enzyme
             1,  # decoy_cycle_length
