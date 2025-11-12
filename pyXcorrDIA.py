@@ -2407,12 +2407,19 @@ def main():
             base_name = os.path.splitext(args.mzml_file)[0]
             args.dia_output = base_name + '.dia.tsv'
         
-        print(f"- DIA results will be written to: {args.dia_output}")
+        # Determine unified parquet output filename
+        mzml_dir = os.path.dirname(args.mzml_file) or '.'
+        mzml_basename = os.path.basename(args.mzml_file)
+        parquet_basename = os.path.splitext(mzml_basename)[0] + '.dia-chrom.parquet'
+        unified_parquet_file = os.path.join(mzml_dir, parquet_basename)
         
-        # Set up Parquet output directory
+        print(f"- Summary results (TSV): {args.dia_output}")
+        print(f"- Unified chromatograms (Parquet): {unified_parquet_file}")
+        
+        # Set up temporary Parquet output directory for per-window files
         parquet_dir = os.path.splitext(args.mzml_file)[0] + "_dia_chromatograms"
         os.makedirs(parquet_dir, exist_ok=True)
-        print(f"- Chromatograms will be written to: {parquet_dir}/")
+        print(f"- Temp per-window files: {parquet_dir}/ (will be merged and can be deleted)")
         
         # Group spectra by isolation window
         print("\nGrouping spectra by isolation window...")
@@ -2498,14 +2505,7 @@ def main():
             ['pair_id', 'is_target', 'charge', 'retention_time']
         )
         
-        # Write unified parquet file with mzML basename + .dia-chrom.parquet
-        # Place it in the same directory as the input mzML file
-        mzml_dir = os.path.dirname(args.mzml_file) or '.'
-        mzml_basename = os.path.basename(args.mzml_file)
-        # Remove .mzML extension and add .dia-chrom.parquet
-        parquet_basename = os.path.splitext(mzml_basename)[0] + '.dia-chrom.parquet'
-        unified_parquet_file = os.path.join(mzml_dir, parquet_basename)
-        
+        # Write unified parquet file (filename was computed earlier)
         table = pa.Table.from_pandas(all_chromatograms)
         pq.write_table(
             table,
@@ -2520,10 +2520,11 @@ def main():
         print(f"  File size: {os.path.getsize(unified_parquet_file) / 1024 / 1024:.2f} MB")
         
         # Optionally delete per-window files to save space
-        # Uncomment if you want to clean up:
+        # Uncomment to automatically clean up temp files:
         # for f in parquet_files:
         #     if f and os.path.exists(f):
         #         os.remove(f)
+        # os.rmdir(parquet_dir)
         
         # Write DIA summary results
         print(f"\nWriting DIA summary to {args.dia_output}...")
@@ -2531,13 +2532,14 @@ def main():
             dia_writer.write_dia_results(all_dia_results)
         
         # Print summary
-        print("\nDIA peptide-centric search completed!")
-        print(f"Total peptide-charge combinations: {len(all_dia_results)}")
-        print(f"Results saved to: {args.dia_output}")
-        print(f"Unified chromatogram file: {unified_parquet_file}")
-        print(f"Per-window parquet files: {len(parquet_files)} files in {parquet_dir}/")
-        
-        # Calculate some statistics (using smoothed XCorr)
+        print("\n=== DIA PEPTIDE-CENTRIC SEARCH COMPLETED ===")
+        print(f"Summary (TSV): {args.dia_output}")
+        print(f"Chromatograms (Parquet): {unified_parquet_file}")
+        print(f"  - Total rows: {len(all_chromatograms):,}")
+        print(f"  - File size: {os.path.getsize(unified_parquet_file) / 1024 / 1024:.2f} MB")
+        print(f"\nTemp files: {parquet_dir}/ ({len(parquet_files)} per-window files)")
+        print("  - Can be safely deleted after verification")
+        print("\nPeptide statistics:")
         target_results = [r for r in all_dia_results.values() if r['is_target']]
         decoy_results = [r for r in all_dia_results.values() if not r['is_target']]
         
