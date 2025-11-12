@@ -7,7 +7,6 @@ Ast*.mzML
 /__pycache__
 comet.params
 *.pyc
-*.mzML
 __pycache__/pyXcorrDIA.cpython-312.pyc
 *.parquet
 *.dia.tsv

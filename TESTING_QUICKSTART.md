@@ -78,6 +78,11 @@ tests/
 ├── __init__.py                      # Package initialization
 ├── conftest.py                      # Shared fixtures and configuration
 ├── README.md                        # Detailed testing documentation
+├── data/                            # Test data files
+│   ├── YQSHTK.fasta                # Small synthetic peptide FASTA
+│   ├── YQSHTK.mzML                 # mzML spectra (charge +1)
+│   ├── ot_centroid_8340.mgf        # MGF spectrum (charge +3)
+│   └── uniprot_human_jan2025_yeastENO1_contam_ADpeps.fasta  # Human proteome
 ├── test_basic_functionality.py      # 18 tests - Core classes & functions
 ├── test_file_io.py                  # 13 tests - FASTA/mzML/MGF reading
 ├── test_digestion.py                # 42 tests - Protein digestion, decoys & enzymes
@@ -85,9 +90,9 @@ tests/
 ├── test_search.py                   #  7 tests - Database search workflow
 ├── test_peptide_centric.py          #  8 tests - Peptide-centric scoring (mock data)
 ├── test_peptide_centric_real_data.py #  8 tests - Real data validation
-└── test_unified_xcorr.py            # 17 tests - Unified XCorr implementation (NEW)
+└── test_unified_xcorr.py            # 17 tests - Unified XCorr implementation
 
-Total: 104 tests (100% passing)
+Total: 113 tests (100% passing)
 ```
 
 ## What's Being Tested
@@ -138,11 +143,13 @@ Total: 104 tests (100% passing)
 
 ### ✓ Database Search (7 tests)
 
-- End-to-end search workflow
+- End-to-end search workflow with human proteome
 - Peptide m/z indexing for fast lookup
 - Isolation window filtering
 - E-value calculation
-- Complete integration tests
+- Charge-state specific validation
+- Reference peptide: HGKPTDSTPATWK (charge +3, XCorr ~2.7248)
+- Multi-charge testing (charge +2 and +3)
 
 ### ✓ Peptide-Centric Scoring (8 tests - Mock Data)
 
@@ -165,9 +172,10 @@ Total: 104 tests (100% passing)
 
 ## Current Status
 
-**All tests passing: 87/87 (100%)**
+All tests passing: 113/113 (100%)
 
 Previously known issues have been resolved:
+
 - ✓ Target-decoy mass handling - Fixed
 - ✓ Integration test empty results - Fixed
 - ✓ Peptide-centric scoring validation - Comprehensive tests added
@@ -175,10 +183,13 @@ Previously known issues have been resolved:
 ## Test Data Files Used
 
 The tests use these files from the test data directory:
-- ✓ `tests/data/YQSHTK.fasta` - Small FASTA for basic tests
-- ✓ `tests/data/YQSHTK.mzML` - mzML spectra file
-- ✓ `tests/data/ot_centroid_8340.mgf` - MGF spectra file
-- ✓ `uniprot_human_jan2025_yeastENO1_contam_ADpeps.fasta` - Large database (project root)
+
+- ✓ `tests/data/YQSHTK.fasta` - Small synthetic peptide FASTA (6 amino acids)
+- ✓ `tests/data/YQSHTK.mzML` - mzML spectra file (charge +1 peptides)
+- ✓ `tests/data/ot_centroid_8340.mgf` - MGF spectrum file (scan 8340, charge +3)
+- ✓ `tests/data/uniprot_human_jan2025_yeastENO1_contam_ADpeps.fasta` - Human proteome database (20,659 proteins)
+
+**Note:** The human proteome FASTA is used for realistic search testing with the reference peptide HGKPTDSTPATWK from protein sp|O60832|DKC1_HUMAN.
 
 ## Tips for Development
 

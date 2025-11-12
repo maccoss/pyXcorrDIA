@@ -72,7 +72,9 @@ class TestProteinDigestion:
         for protein_id, sequence in proteins.items():
             peptides = xcorr_engine.digest_protein(sequence, protein_id,
                                                   enzyme='trypsin',
-                                                  missed_cleavages=2)
+                                                  missed_cleavages=2,
+                                                  min_length=6,  # YQSHTK is 6 amino acids
+                                                  max_length=50)
             all_peptides.extend(peptides)
         
         assert len(all_peptides) > 0

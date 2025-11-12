@@ -96,13 +96,31 @@ python pyXcorrDIA.py database.fasta spectra.mzML --enzyme argc
 python pyXcorrDIA.py database.fasta spectra.mzML --enzyme gluc
 ```
 
+**Control peptide length range:**
+```bash
+# Use defaults (7-30 amino acids)
+python pyXcorrDIA.py database.fasta spectra.mzML
+
+# Custom range for shorter peptides
+python pyXcorrDIA.py database.fasta spectra.mzML \
+    --min_peptide_length 6 \
+    --max_peptide_length 50
+
+# Stringent range for longer, more confident peptides
+python pyXcorrDIA.py database.fasta spectra.mzML \
+    --min_peptide_length 8 \
+    --max_peptide_length 20
+```
+
 ### Test Data
 
 Try the included test data:
 
 ```bash
-python pyXcorrDIA.py YQSHTK.fasta YQSHTK.mzML --charge_states 1
+python pyXcorrDIA.py YQSHTK.fasta YQSHTK.mzML --charge_states 1 --min_peptide_length 6
 ```
+
+**Note:** YQSHTK is only 6 amino acids, so you need `--min_peptide_length 6` to include it (default is 7).
 
 ## DIA Peptide-Centric Search Mode
 
@@ -178,14 +196,17 @@ The `.dia.tsv` file contains tab-delimited results with these columns:
 | `-p, --pin_output` | Percolator PIN file path | `{mzml}.pin` |
 | `--dia_mode` | Enable DIA peptide-centric search | Off |
 | `--dia_output` | DIA results output file | `{mzml}.dia.tsv` |
-| `--dia_rt_window` | Spectra +/- around peak for profile | 5 |
+| `-t, --threads` | Number of threads (0 = auto) | 0 |
+| `-v, --verbose` | Increase output verbosity | 0 |
 | `-n, --top_hits` | Top PSMs to report per spectrum | 10 |
 | `-m, --max_spectra` | Max spectra to process (0 = all) | 0 |
 | `-c, --charge_states` | Charge states to search (comma-separated) | `2,3` |
 | `-e, --enzyme` | Enzyme for protein digestion | `trypsin` |
-| `--missed_cleavages` | Number of missed cleavages allowed | 2 |
-| `-s, --static_mods` | Static mods as `AA:mass` pairs | `C:57.021464` |
+| `--missed_cleavages` | Number of missed cleavages allowed | 1 |
+| `--min_peptide_length` | Minimum peptide length (amino acids) | 7 |
+| `--max_peptide_length` | Maximum peptide length (amino acids) | 30 |
 | `-d, --decoy_cycle_length` | Amino acids to cycle for decoys | 1 |
+| `-s, --static_mods` | Static mods as `AA:mass` pairs | `C:57.021464` |
 | `-bw, --bin_width` | Mass bin width (Th) | 1.0005079 |
 | `-bo, --bin_offset` | Bin offset for binning calculation | 0.4 |
 

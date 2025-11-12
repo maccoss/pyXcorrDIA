@@ -37,11 +37,13 @@ A comprehensive pytest-based test infrastructure has been created for pyXcorrDIA
    - Full preprocessing with real data
 
 5. **`tests/test_search.py`** (7 tests) ✓
-   - End-to-end database search
+   - End-to-end database search with human proteome
    - Peptide m/z indexing
    - Isolation window filtering
    - E-value calculation
-   - Complete integration workflow
+   - Charge-state specific validation
+   - Reference peptide: HGKPTDSTPATWK (charge +3, XCorr ~2.7248)
+   - Multi-charge testing (charge +2 and +3)
 
 6. **`tests/test_peptide_centric.py`** (8 tests) ✓
    - Peptide-centric XCorr scoring with 0.0001 scaling
@@ -173,15 +175,27 @@ The test suite now includes comprehensive validation of peptide-centric DIA scor
 - **`run_tests_quick.py`** - Quick test runner script
 
 #### Test Fixtures Available
+
 - `xcorr_engine` - Default FastXCorr instance
 - `xcorr_engine_with_mods` - With Carbamidomethyl-C
 - `xcorr_engine_no_mods` - No modifications
 - `simple_spectrum` - Synthetic test spectrum
 - `sample_peptide` - Sample peptide "YQSHTK"
-- `yqshtk_fasta` - Path to YQSHTK FASTA
-- `yqshtk_mzml` - Path to YQSHTK mzML
-- `ot_centroid_mgf` - Path to MGF file
-- `large_fasta` - Path to large FASTA database
+- `yqshtk_fasta` - Path to YQSHTK FASTA (small synthetic, 6 amino acids)
+- `yqshtk_mzml` - Path to YQSHTK mzML (charge +1 peptides)
+- `ot_centroid_mgf` - Path to MGF file (scan 8340, charge +3)
+- `large_fasta` - Path to human proteome FASTA (20,659 proteins)
+
+#### Test Data Files
+
+All test data files are located in `tests/data/`:
+
+- `YQSHTK.fasta` - Small synthetic peptide FASTA for basic digestion tests
+- `YQSHTK.mzML` - mzML spectra with charge +1 peptides
+- `ot_centroid_8340.mgf` - MGF spectrum file (scan 8340, charge +3, HGKPTDSTPATWK)
+- `uniprot_human_jan2025_yeastENO1_contam_ADpeps.fasta` - Human proteome database
+
+**Reference peptide for search validation:** HGKPTDSTPATWK from protein sp|O60832|DKC1_HUMAN
 
 ### Running Tests
 

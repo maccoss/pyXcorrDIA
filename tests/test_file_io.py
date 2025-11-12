@@ -7,8 +7,8 @@ import pytest
 class TestFASTAReading:
     """Test FASTA file reading functionality."""
     
-    def test_read_yqshtk_fasta(self, xcorr_engine, yqshtk_fasta):
-        """Test reading YQSHTK FASTA file."""
+    def test_read_small_fasta(self, xcorr_engine, yqshtk_fasta):
+        """Test reading small FASTA file (YQSHTK test case)."""
         proteins = xcorr_engine.read_fasta(yqshtk_fasta)
         
         assert len(proteins) > 0
@@ -24,23 +24,33 @@ class TestFASTAReading:
             assert all(aa in valid_aa for aa in sequence)
     
     def test_read_large_fasta(self, xcorr_engine, large_fasta):
-        """Test reading larger FASTA database."""
+        """Test reading human proteome FASTA database."""
         proteins = xcorr_engine.read_fasta(large_fasta)
         
         assert len(proteins) > 0
-        print(f"Loaded {len(proteins)} proteins from large FASTA")
+        print(f"Loaded {len(proteins)} proteins from human proteome FASTA")
         
         # Verify structure
         for protein_id, sequence in proteins.items():
             assert len(sequence) > 0
             assert isinstance(sequence, str)
+        
+        # Verify target peptide HGKPTDSTPATWK can be found in at least one protein
+        target_peptide = "HGKPTDSTPATWK"
+        found = False
+        for protein_id, sequence in proteins.items():
+            if target_peptide in sequence:
+                found = True
+                print(f"Found {target_peptide} in {protein_id}")
+                break
+        assert found, f"Target peptide {target_peptide} not found in any protein"
 
 
 class TestMzMLReading:
     """Test mzML file reading functionality."""
     
-    def test_read_yqshtk_mzml(self, xcorr_engine, yqshtk_mzml):
-        """Test reading YQSHTK mzML file."""
+    def test_read_mzml_file(self, xcorr_engine, yqshtk_mzml):
+        """Test reading mzML file."""
         spectra = xcorr_engine.read_mzml(yqshtk_mzml, max_spectra=0)
         
         assert len(spectra) > 0
@@ -61,8 +71,8 @@ class TestMzMLReading:
         
         assert len(spectra) <= max_spectra
         
-    def test_spectrum_metadata(self, xcorr_engine, yqshtk_mzml):
-        """Test that spectrum metadata is correctly read."""
+    def test_mzml_spectrum_metadata(self, xcorr_engine, yqshtk_mzml):
+        """Test that spectrum metadata is correctly read from mzML."""
         spectra = xcorr_engine.read_mzml(yqshtk_mzml, max_spectra=1)
         
         if len(spectra) > 0:

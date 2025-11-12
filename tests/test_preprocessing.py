@@ -155,8 +155,8 @@ class TestXCorrCalculation:
 class TestFullPreprocessingPipeline:
     """Test the complete preprocessing pipeline with real data."""
     
-    def test_yqshtk_spectrum_preprocessing(self, xcorr_engine, yqshtk_mzml):
-        """Test preprocessing of YQSHTK spectrum."""
+    def test_mzml_spectrum_preprocessing(self, xcorr_engine, yqshtk_mzml):
+        """Test preprocessing of mzML spectrum."""
         spectra = xcorr_engine.read_mzml(yqshtk_mzml, max_spectra=1)
         
         if len(spectra) > 0:
@@ -175,7 +175,7 @@ class TestFullPreprocessingPipeline:
             print(f"  Preprocessed range: [{np.min(preprocessed):.2f}, {np.max(preprocessed):.2f}]")
     
     def test_mgf_spectrum_preprocessing(self, xcorr_engine, ot_centroid_mgf):
-        """Test preprocessing of MGF spectrum."""
+        """Test preprocessing of MGF spectrum (scan 8340 with HGKPTDSTPATWK)."""
         spectra = xcorr_engine.read_mgf(ot_centroid_mgf, max_spectra=1)
         
         if len(spectra) > 0:

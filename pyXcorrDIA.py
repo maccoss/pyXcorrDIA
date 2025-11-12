@@ -868,7 +868,8 @@ class FastXCorr:
         return target_decoy_pairs
     
     def digest_protein(self, sequence: str, protein_id: str, 
-                      enzyme: str = 'trypsin', missed_cleavages: int = 1) -> List[PeptideCandidate]:
+                      enzyme: str = 'trypsin', missed_cleavages: int = 1,
+                      min_length: int = 7, max_length: int = 30) -> List[PeptideCandidate]:
         """
         Digest protein sequence into peptides using specified enzyme.
         
@@ -877,6 +878,8 @@ class FastXCorr:
             protein_id: Protein identifier
             enzyme: Enzyme name (see self.enzymes for options)
             missed_cleavages: Maximum number of missed cleavages
+            min_length: Minimum peptide length in amino acids
+            max_length: Maximum peptide length in amino acids
             
         Returns:
             List of peptide candidates
@@ -910,8 +913,8 @@ class FastXCorr:
             for j in range(i, min(i + missed_cleavages + 1, len(fragments))):
                 peptide_seq = ''.join(fragments[i:j+1])
                 
-                # Filter by length (typically 6-50 amino acids)
-                if 6 <= len(peptide_seq) <= 50:
+                # Filter by length
+                if min_length <= len(peptide_seq) <= max_length:
                     mass = self.calculate_peptide_mass(peptide_seq)
                     peptides.append(PeptideCandidate(peptide_seq, protein_id, mass))
         
@@ -2302,6 +2305,10 @@ def main():
                        help='Enzyme for protein digestion (default: trypsin). Options: trypsin, trypsin_no_proline, lysc, lysn, argc, aspn, cnbr, gluc, pepsina, chymotrypsin')
     parser.add_argument('--missed_cleavages', type=int, default=1,
                        help='Maximum number of missed cleavages (default: 1)')
+    parser.add_argument('--min_peptide_length', type=int, default=7,
+                       help='Minimum peptide length in amino acids (default: 7)')
+    parser.add_argument('--max_peptide_length', type=int, default=30,
+                       help='Maximum peptide length in amino acids (default: 30)')
     parser.add_argument('--decoy_cycle_length', '-d', type=int, default=1,
                        help='Number of amino acids to cycle for decoy generation (default: 1)')
     parser.add_argument('--static_mods', '-s', type=str, default='C:57.021464',
@@ -2358,6 +2365,7 @@ def main():
             print(f"    {aa}: +{mass:.6f} Th")
     else:
         print("- Static modifications: None")
+    print(f"- Peptide length range: {args.min_peptide_length}-{args.max_peptide_length} amino acids")
     
     # Determine output filename
     if not args.output:
@@ -2376,7 +2384,11 @@ def main():
     print("Digesting proteins...")
     all_target_peptides = []
     for protein_id, sequence in proteins.items():
-        peptides = xcorr_engine.digest_protein(sequence, protein_id, enzyme=args.enzyme, missed_cleavages=args.missed_cleavages)
+        peptides = xcorr_engine.digest_protein(sequence, protein_id, 
+                                               enzyme=args.enzyme, 
+                                               missed_cleavages=args.missed_cleavages,
+                                               min_length=args.min_peptide_length,
+                                               max_length=args.max_peptide_length)
         all_target_peptides.extend(peptides)
     print(f"Generated {len(all_target_peptides)} target peptide candidates")
     

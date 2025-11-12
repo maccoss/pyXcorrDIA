@@ -7,22 +7,27 @@ import pytest
 class TestDatabaseSearch:
     """Test complete database search workflow."""
     
-    def test_yqshtk_search(self, xcorr_engine_with_mods, yqshtk_fasta, yqshtk_mzml):
-        """Test complete search on YQSHTK data."""
+    def test_human_proteome_search(self, xcorr_engine_with_mods, large_fasta, ot_centroid_mgf):
+        """Test complete search on human proteome data with HGKPTDSTPATWK peptide."""
         # Read FASTA
-        proteins = xcorr_engine_with_mods.read_fasta(yqshtk_fasta)
+        proteins = xcorr_engine_with_mods.read_fasta(large_fasta)
         assert len(proteins) > 0
         
-        # Digest proteins
+        # Digest proteins (using default 7-30 amino acid range)
         all_peptides = []
         for protein_id, sequence in proteins.items():
             peptides = xcorr_engine_with_mods.digest_protein(
-                sequence, protein_id, enzyme='trypsin', missed_cleavages=2
+                sequence, protein_id, enzyme='trypsin', missed_cleavages=2,
+                min_length=7, max_length=30
             )
             all_peptides.extend(peptides)
         
         assert len(all_peptides) > 0
         print(f"Generated {len(all_peptides)} peptides")
+        
+        # Verify target peptide HGKPTDSTPATWK is present
+        target_sequences = [p.sequence for p in all_peptides]
+        assert "HGKPTDSTPATWK" in target_sequences, "Target peptide HGKPTDSTPATWK not found in digestion"
         
         # Make non-redundant
         non_redundant = xcorr_engine_with_mods.make_peptides_non_redundant(all_peptides)
@@ -35,16 +40,16 @@ class TestDatabaseSearch:
         assert len(target_decoy_pairs) > 0
         print(f"Target-decoy pairs: {len(target_decoy_pairs)}")
         
-        # Read spectra
-        spectra = xcorr_engine_with_mods.read_mzml(yqshtk_mzml, max_spectra=5)
+        # Read spectra from MGF
+        spectra = xcorr_engine_with_mods.read_mgf(ot_centroid_mgf)
         assert len(spectra) > 0
         print(f"Read {len(spectra)} spectra")
         
-        # Search first spectrum
+        # Search first spectrum (scan 8340 with HGKPTDSTPATWK)
         if len(spectra) > 0:
             spectrum = spectra[0]
-            # YQSHTK test data has singly charged precursors
-            charge_states = [1]
+            # Test typical charge states for tryptic peptides
+            charge_states = [2, 3]
             
             results = xcorr_engine_with_mods.search_spectrum_target_decoy(
                 spectrum, target_decoy_pairs, charge_states
@@ -59,8 +64,41 @@ class TestDatabaseSearch:
                 assert isinstance(xcorr, float)
                 assert isinstance(e_value, (float, int))
                 assert charge in charge_states
-                
-            print(f"Top result: {results[0][0].sequence} (XCorr={results[0][1]:.4f})")
+            
+            # Separate results by charge state
+            results_by_charge = {2: [], 3: []}
+            for peptide, xcorr, e_value, charge in results:
+                if charge in results_by_charge:
+                    results_by_charge[charge].append((peptide.sequence, xcorr, e_value))
+            
+            # Expected top 3 results for charge +2 (these are the reference values)
+            print("\nTop 3 results for charge +2:")
+            expected_charge2 = [
+                ("SLTSSGGGKR", 1.7272, 8.40e-01),
+                ("ESSATSSQR", 1.6688, 1.28e+00),
+                ("NSVSSSSQR", 1.5252, 3.56e+00),
+            ]
+            for i, (seq, xcorr, eval) in enumerate(results_by_charge[2][:3]):
+                print(f"  {i+1}. {seq} (XCorr={xcorr:.4f}, e-value={eval:.2e})")
+                # Check against expected (allow small tolerance for XCorr)
+                exp_seq, exp_xcorr, exp_eval = expected_charge2[i]
+                assert seq == exp_seq, f"Charge +2 rank {i+1}: expected {exp_seq}, got {seq}"
+                assert abs(xcorr - exp_xcorr) < 0.01, f"Charge +2 {seq}: expected XCorr {exp_xcorr:.4f}, got {xcorr:.4f}"
+            
+            # Expected top result for charge +3 (HGKPTDSTPATWK should be top hit)
+            print("\nTop 3 results for charge +3:")
+            expected_charge3 = [
+                ("HGKPTDSTPATWK", 2.7248, 2.62e-02),
+            ]
+            for i, (seq, xcorr, eval) in enumerate(results_by_charge[3][:3]):
+                print(f"  {i+1}. {seq} (XCorr={xcorr:.4f}, e-value={eval:.2e})")
+            
+            # Verify HGKPTDSTPATWK is the top charge +3 result
+            assert len(results_by_charge[3]) > 0, "No charge +3 results found"
+            top_charge3 = results_by_charge[3][0]
+            exp_seq, exp_xcorr, exp_eval = expected_charge3[0]
+            assert top_charge3[0] == exp_seq, f"Charge +3 top hit: expected {exp_seq}, got {top_charge3[0]}"
+            assert abs(top_charge3[1] - exp_xcorr) < 0.01, f"Charge +3 {exp_seq}: expected XCorr {exp_xcorr:.4f}, got {top_charge3[1]:.4f}"
     
     def test_search_with_modifications(self, yqshtk_fasta, yqshtk_mzml):
         """Test search with different static modifications."""
@@ -168,24 +206,29 @@ class TestIntegrationWorkflow:
     """Test complete integration workflow matching command-line behavior."""
     
     @pytest.mark.slow
-    def test_complete_workflow_yqshtk(self, xcorr_engine_with_mods, yqshtk_fasta, yqshtk_mzml):
-        """Test complete workflow on YQSHTK test case."""
+    def test_complete_workflow_human_proteome(self, xcorr_engine_with_mods, large_fasta, ot_centroid_mgf):
+        """Test complete workflow on human proteome with HGKPTDSTPATWK."""
         print("\n=== Running Complete Workflow Test ===")
         
         # Step 1: Read FASTA
         print("Reading FASTA...")
-        proteins = xcorr_engine_with_mods.read_fasta(yqshtk_fasta)
+        proteins = xcorr_engine_with_mods.read_fasta(large_fasta)
         print(f"  Loaded {len(proteins)} proteins")
         
-        # Step 2: Digest proteins
+        # Step 2: Digest proteins (using default 7-30 range)
         print("Digesting proteins...")
         all_target_peptides = []
         for protein_id, sequence in proteins.items():
             peptides = xcorr_engine_with_mods.digest_protein(
-                sequence, protein_id, enzyme='trypsin', missed_cleavages=2
+                sequence, protein_id, enzyme='trypsin', missed_cleavages=2,
+                min_length=7, max_length=30
             )
             all_target_peptides.extend(peptides)
         print(f"  Generated {len(all_target_peptides)} target peptides")
+        
+        # Verify target peptide is present
+        target_sequences = [p.sequence for p in all_target_peptides]
+        assert "HGKPTDSTPATWK" in target_sequences
         
         # Step 3: Make non-redundant
         print("Making peptide list non-redundant...")
@@ -203,13 +246,13 @@ class TestIntegrationWorkflow:
         
         # Step 5: Read spectra
         print("Reading spectra...")
-        spectra = xcorr_engine_with_mods.read_mzml(yqshtk_mzml, max_spectra=10)
+        spectra = xcorr_engine_with_mods.read_mgf(ot_centroid_mgf)
         print(f"  Read {len(spectra)} spectra")
         
         # Step 6: Search spectra
         print("Searching spectra...")
-        # YQSHTK test data has singly charged precursors
-        charge_states = [1]
+        # Test typical charge states for tryptic peptides
+        charge_states = [2, 3]
         total_identifications = 0
         
         for i, spectrum in enumerate(spectra[:3]):  # Test first 3 spectra

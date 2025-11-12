@@ -46,10 +46,9 @@ def ot_centroid_mgf(test_data_dir):
 
 
 @pytest.fixture(scope="session")
-def large_fasta():
-    """Path to large FASTA database file (kept in project root)."""
-    # This file is kept in project root as it's also used for actual searches
-    fasta_path = Path(__file__).parent.parent / "uniprot_human_jan2025_yeastENO1_contam_ADpeps.fasta"
+def large_fasta(test_data_dir):
+    """Path to human proteome FASTA database file."""
+    fasta_path = test_data_dir / "uniprot_human_jan2025_yeastENO1_contam_ADpeps.fasta"
     if not fasta_path.exists():
         pytest.skip(f"Test data file not found: {fasta_path}")
     return str(fasta_path)

@@ -23,6 +23,7 @@ pyXcorrDIA is a fast proteomics database search engine that implements the SEQUE
 
 3. **Peptide Generation**
    - Protein digestion (trypsin with configurable missed cleavages)
+   - Peptide length filtering (default: 7-30 amino acids, configurable)
    - Static modifications support (default: Carbamidomethyl-C +57.021464)
    - Decoy generation (reversal method, keeping C-terminal K/R)
    - Non-redundant peptide list creation
@@ -179,7 +180,9 @@ peptides = []
 for protein_id, sequence in proteins.items():
     peptides.extend(engine.digest_protein(sequence, protein_id, 
                                          enzyme='trypsin', 
-                                         missed_cleavages=2))
+                                         missed_cleavages=2,
+                                         min_length=7,
+                                         max_length=30))
 
 # 3. Make non-redundant and generate decoys
 non_redundant = engine.make_peptides_non_redundant(peptides)
