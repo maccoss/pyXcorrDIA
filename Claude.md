@@ -30,7 +30,12 @@ pyXcorrDIA is a fast proteomics database search engine that implements the SEQUE
 
 4. **Scoring & Statistics**
    - XCorr score calculation (dot product of preprocessed spectra)
-   - E-value calculation with charge-specific score distributions
+   - E-value calculation using Comet's LinearRegression approach
+     - Histogram binning (0.1 XCorr units)
+     - Cumulative distribution → log transform → linear regression
+     - Valid range: [1e-10, 1.0] (capped at 1.0 for poor fits)
+   - Charge-specific e-value calculation for spectrum-centric search
+   - Z-score (standard score) calculation: (best_score - mean) / std_dev
    - Target-decoy competition for peptide identification
 
 ### File I/O Support
@@ -92,11 +97,24 @@ This implementation closely follows Comet's algorithm to ensure reproducibility:
 - **test_search.py** (7 tests) - Database search workflow, integration tests
 - **test_peptide_centric.py** (8 tests) - Peptide-centric DIA scoring with mock data
 - **test_peptide_centric_real_data.py** (8 tests) - Real data validation from notebook
-- **test_unified_xcorr.py** (17 tests) - **NEW**: Unified XCorr function (single & matrix operations)
+- **test_unified_xcorr.py** (17 tests) - Unified XCorr function (single & matrix operations)
+- **test_dia_parallelization.py** (9 tests) - DIA parallel processing validation
+- **test_evalue.py** (11 tests) - **NEW**: E-value calculation and Z-score validation
 
-**Total: 104 tests (100% passing)**
+**Total: 124 tests (100% passing)**
 
-### Unified XCorr Tests (NEW)
+### E-value & Z-score Tests (NEW)
+
+**`test_evalue.py`** validates statistical significance calculations:
+
+- E-value range bounds [1e-10, 1.0]
+- Proper handling of insufficient data and uniform scores
+- E-value capping at 1.0 for poor regression fits
+- Charge-specific e-value calculation
+- Z-score calculation: (best_score - mean) / std_dev
+- Z-score behavior with outliers and no variation
+
+### Unified XCorr Tests
 
 **`test_unified_xcorr.py`** validates the unified XCorr implementation:
 

@@ -13,7 +13,8 @@ class TestProteinDigestion:
         
         peptides = xcorr_engine.digest_protein(sequence, protein_id, 
                                               enzyme='trypsin', 
-                                              missed_cleavages=0)
+                                              missed_cleavages=0,
+                                              min_length=6, max_length=30)
         
         assert len(peptides) > 0
         

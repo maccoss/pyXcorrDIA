@@ -1425,8 +1425,11 @@ class FastXCorr:
             log_expect = slope * top_score + intercept
             expect_value = 10.0 ** log_expect
             
-            if expect_value > 999.0:
-                expect_value = 999.0
+            # Cap e-value at reasonable bounds
+            # E-values should be probabilities in range [0, 1], but allow slightly above 1
+            # due to estimation errors, and cap at 1.0
+            if expect_value > 1.0:
+                expect_value = 1.0
             
             return max(expect_value, 1e-10)
         
@@ -1651,6 +1654,9 @@ class FastXCorr:
         Returns:
             Dictionary with results per peptide (and path to Parquet file)
         """
+        import time
+        window_start_time = time.time()
+        
         if not spectra:
             return {'results': {}, 'parquet_file': None}
         
@@ -1737,20 +1743,6 @@ class FastXCorr:
             # Create peptide ID for this peptide
             peptide_id = f"{peptide.sequence}_{charge}_{'T' if is_target else 'D'}"
             
-            # Create target sequence (for linking target/decoy pairs)
-            # This allows downstream analysis to match target and decoy
-            if is_target:
-                target_sequence = peptide.sequence
-            else:
-                # For decoy, we need to find its corresponding target
-                # Since peptides come in pairs, target is always just before/after decoy
-                target_peptide_idx = (pep_idx - 1) if (pep_idx % 2 == 1) else (pep_idx + 1)
-                if target_peptide_idx < len(peptides_in_window):
-                    target_peptide, _, _, _ = peptides_in_window[target_peptide_idx]
-                    target_sequence = target_peptide.sequence
-                else:
-                    target_sequence = peptide.sequence  # Fallback
-            
             # Extract XCorr scores for this peptide from the matrix (one row)
             xcorr_raw_series = xcorr_matrix_raw[pep_idx, :].tolist()
             
@@ -1774,49 +1766,26 @@ class FastXCorr:
             best_raw_scan_id, best_raw_rt, _ = spectrum_metadata[best_raw_idx]
             best_smoothed_scan_id, best_smoothed_rt, _ = spectrum_metadata[best_smoothed_idx]
             
-            # Store XCorr values in unified schema (one row per peptide-spectrum combination)
+            # Store XCorr chromatogram data (minimal schema - just the time series)
             for spec_idx, (xcorr_raw, xcorr_smoothed) in enumerate(zip(xcorr_raw_series, xcorr_smoothed_series)):
                 scan_id, rt_minutes, _ = spectrum_metadata[spec_idx]
                 chromatogram_data.append({
-                    # Peptide identification
+                    # Peptide identification (minimal - just enough to link back)
                     'peptide_id': peptide_id,
                     'peptide_sequence': peptide.sequence,
-                    'target_sequence': target_sequence,  # Links target/decoy pairs
-                    'pair_id': pair_id,  # Explicit pair linkage
-                    'protein_id': peptide.protein_id,
                     'charge': charge,
                     'is_target': is_target,
-                    'peptide_mass': peptide.mass,
-                    
-                    # Isolation window
-                    'isolation_window_lower': isolation_window[0],
-                    'isolation_window_upper': isolation_window[1],
                     
                     # Spectrum identification
                     'scan_id': scan_id,
-                    'spectrum_idx': spec_idx,
                     'retention_time': rt_minutes,  # RT in minutes
                     
-                    # XCorr scores
+                    # XCorr time series data
                     'xcorr_raw': xcorr_raw,
                     'xcorr_smoothed': xcorr_smoothed,
-                    
-                    # Best scores (denormalized for quick filtering)
-                    'is_best_raw': (spec_idx == best_raw_idx),
-                    'is_best_smoothed': (spec_idx == best_smoothed_idx),
-                    'best_raw_xcorr': best_raw_xcorr,
-                    'best_smoothed_xcorr': best_smoothed_xcorr,
-                    
-                    # Placeholders for future features
-                    'xcorr_snr': None,
-                    'xcorr_rank': None,
-                    'peak_apex_distance': None,
-                    'peak_width': None,
-                    'e_value_raw': None,
-                    'e_value_smoothed': None
                 })
             
-            # Store result for this peptide
+            # Store result for this peptide (summary statistics)
             key = (peptide.sequence, charge, is_target)
             peptide_results[key] = {
                 'peptide': peptide,
@@ -1855,27 +1824,28 @@ class FastXCorr:
                 chromatogram_data = []  # Clear batch
         
         # Show completion at verbose=0 (always show, once per window)
-        print(f"  DIA: Completed window {window_str}: {len(peptides_in_window)} peptides scored")
+        window_elapsed = time.time() - window_start_time
+        print(f"  DIA: Completed window {window_str}: {len(peptides_in_window)} peptides scored in {window_elapsed/60:.2f} min")
         
-        # Calculate e-values for each peptide
-        # E-value: how likely is the best XCorr given the distribution of all XCorr values for this peptide?
+        # Calculate e-values for each peptide using the same Comet algorithm as spectrum-centric
+        # For peptide-centric: frequency distribution of spectrum scores that match a given peptide
+        # For spectrum-centric: frequency distribution of peptide scores that match a given spectrum
+        # Same statistical method, just inverted perspective
         if verbose >= 1:
             print(f"  DIA: Calculating e-values for isolation window {window_str}")
         
+        # Create a temporary FastXCorr instance to use calculate_e_value method
+        temp_engine = FastXCorr()
+        
         for key, result in peptide_results.items():
-            all_xcorrs = result['all_xcorr_values']
-            best_xcorr = result['best_xcorr']
+            all_xcorrs = result['all_xcorr_values']  # Distribution of spectrum scores for this peptide
+            best_xcorr = result['best_xcorr']  # Best score from this distribution
             
-            # Also calculate e-value for smoothed
-            all_smoothed = result['all_smoothed_xcorr_values']
-            best_smoothed = result['best_smoothed_xcorr']
+            # Use the same Comet E-value calculation as spectrum-centric search
+            # This gives proper statistical significance based on score distribution
+            e_value = temp_engine.calculate_e_value(all_xcorrs, best_xcorr)
             
-            # Calculate e-value: number of scores >= best_xcorr
-            num_above_raw = sum(1 for x in all_xcorrs if x >= best_xcorr)
-            num_above_smoothed = sum(1 for x in all_smoothed if x >= best_smoothed)
-            
-            result['e_value'] = num_above_raw
-            result['e_value_smoothed'] = num_above_smoothed
+            result['e_value'] = e_value
             result['num_spectra_scored'] = len(all_xcorrs)
         
         return {
@@ -2162,18 +2132,18 @@ class DIAResultsWriter:
         """Write DIA results header."""
         header = "Peptide\tCharge\tProteinID\tMass\tIsTarget\tIsolationWindow\t"
         header += "BestXCorrRaw\tBestXCorrSmoothed\tBestRT\tBestScan\t"
-        header += "EValueRaw\tEValueSmoothed\tNumSpectraScored\t"
-        header += "MeanXCorrRaw\tMedianXCorrRaw\tStdXCorrRaw\n"
+        header += "EValue\tNumSpectraScored\t"
+        header += "XCorrZScore\n"
         self.file_handle.write(header)
     
     def write_dia_results(self, results: Dict):
         """
-        Write DIA peptide-centric results with both raw and smoothed XCorr values.
+        Write DIA peptide-centric results.
         
         Args:
             results: Dictionary from search_dia_peptide_centric
                      Keys: (peptide_sequence, charge, is_target)
-                     Values: dict with peptide info, scores, e-values (both raw and smoothed)
+                     Values: dict with peptide info, scores, and e-value
         """
         for (peptide_sequence, charge, is_target), result in results.items():
             # Basic peptide info
@@ -2181,22 +2151,21 @@ class DIAResultsWriter:
             isolation_window = result['isolation_window']
             window_str = f"[{isolation_window[0]:.4f}-{isolation_window[1]:.4f}]"
             
-            # Best scores - both raw and smoothed
+            # Best scores - both raw and smoothed XCorr
             best_xcorr_raw = result['best_xcorr']
-            e_value_raw = result['e_value']
-            
             best_xcorr_smoothed = result['best_smoothed_xcorr']
             best_rt_smoothed = result['best_smoothed_rt']
             best_scan_smoothed = result['best_smoothed_scan']
-            e_value_smoothed = result['e_value_smoothed']
             
+            # E-value (one value per peptide, based on raw XCorr distribution)
+            e_value = result['e_value']
             num_spectra = result['num_spectra_scored']
             
-            # Calculate statistics from raw XCorr values
+            # Calculate Z-score (standard score) from raw XCorr values
+            # Z-score = (best_score - mean) / std_dev
+            # This measures how many standard deviations the best score is above the mean
             all_xcorrs_raw = result['all_xcorr_values']
             mean_xcorr = sum(all_xcorrs_raw) / len(all_xcorrs_raw) if all_xcorrs_raw else 0.0
-            sorted_xcorrs = sorted(all_xcorrs_raw)
-            median_xcorr = sorted_xcorrs[len(sorted_xcorrs)//2] if sorted_xcorrs else 0.0
             
             # Standard deviation
             if len(all_xcorrs_raw) > 1:
@@ -2205,13 +2174,19 @@ class DIAResultsWriter:
             else:
                 std_xcorr = 0.0
             
-            # Write line with both raw and smoothed metrics
+            # Calculate Z-score
+            if std_xcorr > 0:
+                z_score = (best_xcorr_raw - mean_xcorr) / std_xcorr
+            else:
+                z_score = 0.0  # No variation in scores
+            
+            # Write line with peptide summary statistics
             # For RT and Scan, report the smoothed version (typically more reliable)
             target_str = "Target" if is_target else "Decoy"
             line = f"{peptide_sequence}\t{charge}\t{peptide.protein_id}\t{peptide.mass:.6f}\t{target_str}\t{window_str}\t"
             line += f"{best_xcorr_raw:.4f}\t{best_xcorr_smoothed:.4f}\t{best_rt_smoothed:.2f}\t{best_scan_smoothed}\t"
-            line += f"{e_value_raw}\t{e_value_smoothed}\t{num_spectra}\t"
-            line += f"{mean_xcorr:.4f}\t{median_xcorr:.4f}\t{std_xcorr:.4f}\n"
+            line += f"{e_value:.6e}\t{num_spectra}\t"  # Use scientific notation for e-values
+            line += f"{z_score:.4f}\n"
             
             self.file_handle.write(line)
         
@@ -2344,6 +2319,10 @@ def main():
         print(f"Error: Unknown enzyme '{args.enzyme}'")
         print("Available enzymes: trypsin, trypsin_no_proline, lysc, lysn, argc, aspn, cnbr, gluc, pepsina, chymotrypsin")
         sys.exit(1)
+    
+    # Start total analysis timer
+    import time
+    total_start_time = time.time()
     
     print(f"Using charge states: {charge_states}")
     print("pyXcorrDIA: Using Comet XCorr with target-decoy competition")
@@ -2512,9 +2491,9 @@ def main():
             pd.read_parquet(f) for f in parquet_files if f is not None
         ], ignore_index=True)
         
-        # Sort by pair_id, target/decoy, charge, and RT for better compression and queries
+        # Sort by peptide_id, target/decoy, charge, and RT for better compression and queries
         all_chromatograms = all_chromatograms.sort_values(
-            ['pair_id', 'is_target', 'charge', 'retention_time']
+            ['peptide_id', 'is_target', 'charge', 'retention_time']
         )
         
         # Write unified parquet file (filename was computed earlier)
@@ -2558,13 +2537,17 @@ def main():
         print(f"  Target peptides: {len(target_results)}")
         print(f"  Decoy peptides: {len(decoy_results)}")
         
-        if len(target_results) > 0:
-            avg_target_xcorr = sum(r['best_smoothed_xcorr'] for r in target_results) / len(target_results)
-            print(f"  Average target XCorr (smoothed): {avg_target_xcorr:.3f}")
-        
-        if len(decoy_results) > 0:
-            avg_decoy_xcorr = sum(r['best_smoothed_xcorr'] for r in decoy_results) / len(decoy_results)
-            print(f"  Average decoy XCorr (smoothed): {avg_decoy_xcorr:.3f}")
+        # Print total analysis time
+        total_elapsed = time.time() - total_start_time
+        hours = int(total_elapsed // 3600)
+        minutes = int((total_elapsed % 3600) // 60)
+        seconds = total_elapsed % 60
+        if hours > 0:
+            print(f"\nTotal analysis time: {hours}h {minutes}m {seconds:.1f}s")
+        elif minutes > 0:
+            print(f"\nTotal analysis time: {minutes}m {seconds:.1f}s")
+        else:
+            print(f"\nTotal analysis time: {seconds:.1f}s")
         
         
     else:

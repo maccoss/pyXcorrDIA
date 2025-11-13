@@ -107,7 +107,7 @@ class TestDIAParallelization:
         
         args = (
             0, 1, (400.0, 405.0), [spectrum], None,
-            [(target_data, decoy_data)], [2], [spectrum],
+            [(target_data, decoy_data)], [2],
             None, 'trypsin', 1, 0
         )
         
@@ -183,10 +183,10 @@ class TestDIAParallelization:
         
         work_items = [
             (0, 2, (400.0, 405.0), [spectrum1], None,
-             target_decoy_pairs_data, [2], [spectrum1],
+             target_decoy_pairs_data, [2],
              parquet_file1, 'trypsin', 1, 0),
             (1, 2, (325.0, 330.0), [spectrum2], None,
-             target_decoy_pairs_data, [2], [spectrum2],
+             target_decoy_pairs_data, [2],
              parquet_file2, 'trypsin', 1, 0)
         ]
         
@@ -236,7 +236,7 @@ class TestDIAParallelization:
         
         args = (
             0, 1, (400.0, 405.0), spectra, None,
-            [(target_data, decoy_data)], [2], spectra,
+            [(target_data, decoy_data)], [2],
             parquet_file, 'trypsin', 1, 0
         )
         
@@ -273,7 +273,7 @@ class TestDIAParallelization:
             0, 1, (400.0, 405.0), [spectrum], None,
             [(target_data, decoy_data)],
             [2, 3, 4],  # Multiple charge states
-            [spectrum], parquet_file, 'trypsin', 1, 0
+            parquet_file, 'trypsin', 1, 0
         )
         
         result = process_isolation_window_worker(args)
@@ -308,7 +308,7 @@ class TestDIAParallelization:
         # verbose=0 should suppress output
         args = (
             0, 1, (400.0, 405.0), [spectrum], None,
-            [(target_data, decoy_data)], [2], [spectrum],
+            [(target_data, decoy_data)], [2],
             parquet_file, 'trypsin', 1, 0  # verbose=0
         )
         
@@ -348,7 +348,7 @@ class TestDIAParallelization:
         
         args = (
             0, 1, (400.0, 405.0), [spectrum], None,
-            [(target_data, decoy_data)], [2], [spectrum],
+            [(target_data, decoy_data)], [2],
             parquet_file, 'trypsin', 1, 0
         )
         

@@ -2,7 +2,7 @@
 
 ## ✓ Test Infrastructure is Ready!
 
-A complete pytest test suite with **113 tests** has been created for pyXcorrDIA, including comprehensive validation of the unified XCorr implementation, peptide-centric DIA scoring with real data, and DIA parallelization.
+A complete pytest test suite with **124 tests** has been created for pyXcorrDIA, including comprehensive validation of the unified XCorr implementation, peptide-centric DIA scoring with real data, DIA parallelization, and E-value calculation.
 
 ## Quick Commands
 
@@ -22,7 +22,7 @@ python run_tests_quick.py
 ### 3. Run All Tests
 
 ```bash
-# Run all 113 tests
+# Run all 124 tests
 pytest
 
 # With verbose output
@@ -58,6 +58,12 @@ pytest tests/test_peptide_centric_real_data.py -v -s
 
 # Test unified XCorr function (single and matrix operations)
 pytest tests/test_unified_xcorr.py -v
+
+# Test E-value calculation and Z-scores
+pytest tests/test_evalue.py -v
+
+# Test DIA parallelization
+pytest tests/test_dia_parallelization.py -v
 ```
 
 ### 5. Run with Coverage Report
@@ -90,14 +96,29 @@ tests/
 ├── test_search.py                   #  7 tests - Database search workflow
 ├── test_peptide_centric.py          #  8 tests - Peptide-centric scoring (mock data)
 ├── test_peptide_centric_real_data.py #  8 tests - Real data validation
-└── test_unified_xcorr.py            # 17 tests - Unified XCorr implementation
+├── test_unified_xcorr.py            # 17 tests - Unified XCorr implementation
+├── test_dia_parallelization.py      #  9 tests - DIA parallel processing
+└── test_evalue.py                   # 11 tests - E-value calculation & Z-scores
 
-Total: 113 tests (100% passing)
+Total: 124 tests (100% passing)
 ```
 
 ## What's Being Tested
 
-### ✓ Unified XCorr Implementation (17 tests) **NEW**
+### ✓ E-value Calculation (11 tests) **NEW**
+
+- E-value range validation (must be in [1e-10, 1.0])
+- Handling insufficient data (returns 1.0)
+- Uniform scores (no clear winner returns 1.0)
+- E-value never exceeds 1.0 (capped for poor fits)
+- E-value decreases with better score separation
+- Realistic XCorr score distributions
+- Charge-specific e-value calculation
+- Z-score calculation for signal-to-noise ratio
+- Z-score with outliers
+- Z-score when no variation (returns 0.0)
+
+### ✓ Unified XCorr Implementation (17 tests)
 
 - Single `calculate_xcorr()` function for both vector and matrix operations
 - Single spectrum scoring with correct scaling (0.005 and 0.0001)

@@ -14,8 +14,9 @@ A fast proteomics database search engine implementing the SEQUEST Cross-Correlat
 - **Multiple file formats** - Supports mzML (via pymzml) and MGF (via pyteomics) input
 - **Flexible modifications** - Configurable static modifications (default: Carbamidomethyl-C)
 - **Multiple output formats** - pepXML and Percolator Input (PIN) files
-- **E-value calculation** - Statistical scoring with charge-specific score distributions
-- **Comprehensive testing** - 104 tests covering all major functionality including unified XCorr
+- **E-value calculation** - Comet's LinearRegression approach with proper statistical significance
+- **Z-score reporting** - Signal-to-noise ratio for chromatographic peaks in DIA mode
+- **Comprehensive testing** - 124 tests covering all major functionality including unified XCorr and e-values
 
 ## Installation
 
@@ -248,7 +249,16 @@ pyXcorrDIA implements the Fast XCorr algorithm as described in Eng et al. (2008)
 4. **Fast XCorr Preprocessing** - Sliding window background subtraction (offset=75)
 5. **Theoretical Spectrum Generation** - Fragment ions for peptide candidates
 6. **XCorr Scoring** - Dot product of preprocessed spectra
-7. **E-value Calculation** - Charge-specific score distributions
+7. **E-value Calculation** - Comet's LinearRegression approach
+   - Histogram binning (0.1 XCorr units)
+   - Cumulative distribution from right to left
+   - Log transformation and linear regression
+   - E-value range: [1e-10, 1.0] (capped at 1.0 for poor fits)
+   - Spectrum-centric: charge-specific score distributions
+   - Peptide-centric: distribution of spectrum scores per peptide
+8. **Z-score Calculation (DIA mode)** - Signal-to-noise ratio
+   - Z-score = (best_score - mean_score) / std_dev
+   - Measures how many standard deviations the peak is above background
 
 ### Decoy Generation
 

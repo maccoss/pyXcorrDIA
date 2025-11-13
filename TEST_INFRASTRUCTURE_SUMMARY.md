@@ -81,9 +81,22 @@ A comprehensive pytest-based test infrastructure has been created for pyXcorrDIA
    - Edge cases: empty arrays, mismatched lengths, 1×1 matrices
    - Real data preprocessing and matrix scoring
 
+10. **`tests/test_evalue.py`** (11 tests) ✓ **NEW**
+   - E-value calculation using Comet's LinearRegression approach
+   - E-value range validation (must be in [1e-10, 1.0])
+   - Handling insufficient data (< 10 scores returns 1.0)
+   - Uniform scores with no clear winner (returns 1.0)
+   - E-value never exceeds 1.0 (capped for poor regression fits)
+   - E-value decreases with better score separation
+   - Realistic XCorr score distributions
+   - Charge-specific e-value calculation
+   - Z-score (standard score) calculation for signal-to-noise ratio
+   - Z-score with outliers
+   - Z-score returns 0.0 when no variation in scores
+
 ### Test Results
 
-**Overall: 113/113 tests passing (100%)**
+**Overall: 124/124 tests passing (100%)**
 
 ```text
 18 passed - test_basic_functionality.py ✓
@@ -92,9 +105,10 @@ A comprehensive pytest-based test infrastructure has been created for pyXcorrDIA
 42 passed - test_digestion.py ✓
  7 passed - test_search.py ✓
  8 passed - test_peptide_centric.py ✓
- 9 passed - test_dia_parallelization.py ✓ (NEW)
+ 9 passed - test_dia_parallelization.py ✓
  8 passed - test_peptide_centric_real_data.py ✓
 17 passed - test_unified_xcorr.py ✓
+11 passed - test_evalue.py ✓ (NEW)
 ```
 
 ### Test Suite Highlights
