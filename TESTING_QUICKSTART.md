@@ -2,7 +2,7 @@
 
 ## ✓ Test Infrastructure is Ready!
 
-A complete pytest test suite with **124 tests** has been created for pyXcorrDIA, including comprehensive validation of the unified XCorr implementation, peptide-centric DIA scoring with real data, DIA parallelization, and E-value calculation.
+A complete pytest test suite with **163 tests** has been created for pyXcorrDIA, including comprehensive validation of the unified XCorr implementation, peptide-centric DIA scoring with real data, DIA parallelization, E-value calculation, spectral library search, and target/decoy competition with incremental writing.
 
 ## Quick Commands
 
@@ -22,7 +22,7 @@ python run_tests_quick.py
 ### 3. Run All Tests
 
 ```bash
-# Run all 124 tests
+# Run all 163 tests
 pytest
 
 # With verbose output
@@ -62,8 +62,14 @@ pytest tests/test_unified_xcorr.py -v
 # Test E-value calculation and Z-scores
 pytest tests/test_evalue.py -v
 
-# Test DIA parallelization
-pytest tests/test_dia_parallelization.py -v
+# Test integration and DIA parallelization
+pytest tests/test_integration.py -v
+
+# Test spectral library support
+pytest tests/test_library_support.py -v
+
+# Test target/decoy competition and incremental writing
+pytest tests/test_target_decoy_competition.py -v
 ```
 
 ### 5. Run with Coverage Report
@@ -81,31 +87,64 @@ xdg-open htmlcov/index.html  # Linux
 
 ```text
 tests/
-├── __init__.py                      # Package initialization
-├── conftest.py                      # Shared fixtures and configuration
-├── README.md                        # Detailed testing documentation
-├── data/                            # Test data files
-│   ├── YQSHTK.fasta                # Small synthetic peptide FASTA
-│   ├── YQSHTK.mzML                 # mzML spectra (charge +1)
-│   ├── ot_centroid_8340.mgf        # MGF spectrum (charge +3)
+├── __init__.py                         # Package initialization
+├── conftest.py                         # Shared fixtures and configuration
+├── README.md                           # Detailed testing documentation
+├── data/                               # Test data files
+│   ├── YQSHTK.fasta                   # Small synthetic peptide FASTA
+│   ├── YQSHTK.mzML                    # mzML spectra (charge +1)
+│   ├── ot_centroid_8340.mgf           # MGF spectrum (charge +3)
 │   └── uniprot_human_jan2025_yeastENO1_contam_ADpeps.fasta  # Human proteome
-├── test_basic_functionality.py      # 18 tests - Core classes & functions
-├── test_file_io.py                  # 13 tests - FASTA/mzML/MGF reading
-├── test_digestion.py                # 42 tests - Protein digestion, decoys & enzymes
-├── test_preprocessing.py            # 13 tests - Spectrum preprocessing & XCorr
-├── test_search.py                   #  7 tests - Database search workflow
-├── test_peptide_centric.py          #  8 tests - Peptide-centric scoring (mock data)
-├── test_peptide_centric_real_data.py #  8 tests - Real data validation
-├── test_unified_xcorr.py            # 17 tests - Unified XCorr implementation
-├── test_dia_parallelization.py      #  9 tests - DIA parallel processing
-└── test_evalue.py                   # 11 tests - E-value calculation & Z-scores
+├── test_basic_functionality.py         # 18 tests - Core classes & functions
+├── test_file_io.py                     # 13 tests - FASTA/mzML/MGF reading
+├── test_digestion.py                   # 42 tests - Protein digestion, decoys & enzymes
+├── test_preprocessing.py               # 13 tests - Spectrum preprocessing & XCorr
+├── test_search.py                      #  7 tests - Database search workflow
+├── test_peptide_centric.py             #  8 tests - Peptide-centric scoring (mock data)
+├── test_peptide_centric_real_data.py   #  8 tests - Real data validation
+├── test_integration.py                 # 19 tests - Integration and parallelization
+├── test_unified_xcorr.py               #  6 tests - Unified XCorr implementation
+├── test_evalue.py                      # 11 tests - E-value calculation
+├── test_library_support.py             # 11 tests - Spectral library search
+└── test_target_decoy_competition.py    #  7 tests - Target/decoy & incremental writing
 
-Total: 124 tests (100% passing)
+Total: 163 tests (100% passing)
 ```
 
 ## What's Being Tested
 
-### ✓ E-value Calculation (11 tests) **NEW**
+### ✓ Target/Decoy Competition & Incremental Writing (7 tests) **NEW**
+
+**Competition Logic:**
+- Library mode: LibCosine as primary score, XCorr at peak spectrum only
+- Non-library mode: XCorr as primary score with full e-value calculation
+- Tie-breaking favors decoy (conservative for FDR)
+- Winner-only reporting (no PairID needed)
+
+**Output Format Validation:**
+- Library mode: 13 columns (no e-value, no XCorrZScore, no PairID)
+  - `Peptide, Charge, ProteinID, Mass, IsTarget, IsolationWindow, NumSpectraScored, LibCosine, LibCosineZScore, XCorr, RT, ScanID, PrecursorCosine`
+- Non-library mode: 12 columns (no library scores, no PairID)
+  - `Peptide, Charge, ProteinID, Mass, IsTarget, IsolationWindow, BestXCorr, BestRT, BestScan, EValue, NumSpectraScored, XCorrZScore`
+- Confirmed removal of: PairID, BestXCorrRaw, BestXCorrSmoothed
+
+**Implementation Details:**
+- Incremental TSV writing with `multiprocessing.Lock()` for thread safety
+- Real-time progress reporting: "Progress: X/Y windows completed"
+- Memory efficient: writes results immediately as windows complete
+- Simplified column names: `LibCosine`, `XCorr`, `RT`, `ScanID` (no "Best" prefixes)
+
+### ✓ Spectral Library Support (11 tests)
+
+- DIA-NN library loading and indexing
+- UniMod modification parsing
+- Decoy fragment generation with intensity remapping
+- Fragment matching with ppm tolerance
+- Cosine angle scoring with SMZ preprocessing
+- MS1 isotope pattern prediction and scoring
+- Integration with DIA search pipeline
+
+### ✓ E-value Calculation (11 tests)
 
 - E-value range validation (must be in [1e-10, 1.0])
 - Handling insufficient data (returns 1.0)
@@ -118,7 +157,7 @@ Total: 124 tests (100% passing)
 - Z-score with outliers
 - Z-score when no variation (returns 0.0)
 
-### ✓ Unified XCorr Implementation (17 tests)
+### ✓ Unified XCorr Implementation (6 tests)
 
 - Single `calculate_xcorr()` function for both vector and matrix operations
 - Single spectrum scoring with correct scaling (0.005 and 0.0001)
@@ -253,7 +292,9 @@ pytest -m "not slow"
 
 ## Example Test Usage
 
-The tests show how to use pyXcorrDIA:
+The tests show how to use pyXcorrDIA as a library:
+
+### Basic Usage Example
 
 ```python
 from pyXcorrDIA import FastXCorr
@@ -267,8 +308,14 @@ spectra = engine.read_mzml('data.mzML')
 
 # Digest proteins
 peptides = []
-for protein_id, sequence in proteins.items():
-    peptides.extend(engine.digest_protein(sequence, protein_id))
+for protein in proteins:
+    peptides.extend(engine.digest_protein(
+        protein.sequence, 
+        protein.id,
+        enzyme='trypsin',
+        min_length=7,
+        max_length=30
+    ))
 
 # Create decoys
 non_redundant = engine.make_peptides_non_redundant(peptides)
@@ -276,10 +323,129 @@ pairs = engine.generate_target_decoy_pairs(non_redundant)
 
 # Search
 for spectrum in spectra:
-    results = engine.search_spectrum_target_decoy(
-        spectrum, pairs, charge_states=[2, 3]
+    results = engine.search_spectrum_centric(
+        spectrum, 
+        peptides,
+        charge_states=[2, 3],
+        bin_width=0.02,
+        bin_offset=0.0
     )
     # Process results...
+```
+
+### E-value Calculation Example
+
+```python
+from pyXcorrDIA import FastXCorr
+
+engine = FastXCorr()
+
+# Calculate e-value from score distribution
+scores = [0.5, 0.7, 0.9, 1.1, 1.3, 1.5, 1.7, 1.9, 2.1, 2.3, 2.5]
+top_score = 2.5
+
+e_value = engine.calculate_e_value(scores, top_score)
+print(f"E-value: {e_value:.6e}")  # Will be in range [1e-10, 1.0]
+```
+
+### Z-score Calculation Example
+
+```python
+import numpy as np
+
+# Score distribution for a peptide across chromatogram
+scores = [0.3, 0.4, 0.5, 0.4, 0.6, 1.2, 2.5, 1.8, 0.7, 0.5, 0.4]
+best_score = max(scores)
+
+# Calculate Z-score
+mean_score = np.mean(scores)
+std_score = np.std(scores)
+z_score = (best_score - mean_score) / std_score if std_score > 0 else 0.0
+
+print(f"Z-score: {z_score:.2f}")  # Shows how many std devs above mean
+```
+
+### DIA Peptide-Centric Search Example
+
+```python
+from pyXcorrDIA import FastXCorr
+
+engine = FastXCorr()
+
+# Read DIA data
+spectra = engine.read_mzml('dia_data.mzML')
+proteins = engine.read_fasta('database.fasta')
+
+# Prepare peptides
+peptides = []
+for protein in proteins:
+    peptides.extend(engine.digest_protein(
+        protein.sequence,
+        protein.id,
+        enzyme='trypsin'
+    ))
+
+# Create target-decoy pairs
+pairs = engine.generate_target_decoy_pairs(
+    engine.make_peptides_non_redundant(peptides)
+)
+
+# Group spectra by isolation window
+from collections import defaultdict
+window_groups = defaultdict(list)
+for spectrum in spectra:
+    window = (spectrum.isolation_window_lower, spectrum.isolation_window_upper)
+    window_groups[window].append(spectrum)
+
+# Search each isolation window
+for window, window_spectra in window_groups.items():
+    results = engine.search_dia_peptide_centric(
+        window_spectra,
+        pairs,
+        charge_states=[2, 3],
+        isolation_window=window,
+        bin_width=0.02,
+        bin_offset=0.0
+    )
+    
+    # Results include:
+    # - Best XCorr scores (raw and smoothed)
+    # - E-values for statistical significance
+    # - Retention time of best match
+    # - Full chromatogram profiles
+```
+
+### Unified XCorr Function Example
+
+```python
+import numpy as np
+from pyXcorrDIA import FastXCorr
+
+engine = FastXCorr()
+
+# Single spectrum scoring (spectrum-centric)
+theoretical = np.array([0.0, 1.0, 0.0, 0.5, 0.0])  # Raw theoretical
+experimental = np.array([0.0, 0.8, 0.1, 0.4, 0.0])  # Preprocessed experimental
+xcorr = engine.calculate_xcorr(theoretical, experimental, scaling_factor=0.005)
+
+# Matrix scoring (peptide-centric DIA)
+theoretical_matrix = np.array([
+    [0.0, 1.0, 0.0, 0.5, 0.0],
+    [0.5, 0.0, 1.0, 0.0, 0.3]
+])  # 2 peptides
+experimental_matrix = np.array([
+    [0.0, 0.8, 0.1, 0.4, 0.0],
+    [0.1, 0.0, 0.9, 0.0, 0.2],
+    [0.0, 0.7, 0.0, 0.5, 0.1]
+])  # 3 spectra
+
+# Score all 2×3 = 6 combinations at once
+xcorr_matrix = engine.calculate_xcorr(
+    theoretical_matrix, 
+    experimental_matrix, 
+    scaling_factor=0.0001
+)
+# Returns 2×3 matrix of scores
 ```
 
 ## Configuration Files Created

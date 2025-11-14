@@ -81,7 +81,7 @@ A comprehensive pytest-based test infrastructure has been created for pyXcorrDIA
    - Edge cases: empty arrays, mismatched lengths, 1×1 matrices
    - Real data preprocessing and matrix scoring
 
-10. **`tests/test_evalue.py`** (11 tests) ✓ **NEW**
+10. **`tests/test_evalue.py`** (11 tests) ✓
    - E-value calculation using Comet's LinearRegression approach
    - E-value range validation (must be in [1e-10, 1.0])
    - Handling insufficient data (< 10 scores returns 1.0)
@@ -94,9 +94,29 @@ A comprehensive pytest-based test infrastructure has been created for pyXcorrDIA
    - Z-score with outliers
    - Z-score returns 0.0 when no variation in scores
 
+11. **`tests/test_library_support.py`** (existing tests) ✓
+   - DIA-NN library loading and indexing
+   - UniMod modification parsing
+   - Decoy fragment generation with intensity remapping
+   - Fragment matching with ppm tolerance
+   - Cosine angle scoring with SMZ preprocessing
+   - MS1 isotope pattern prediction and scoring
+   - Integration with DIA search pipeline
+
+12. **`tests/test_target_decoy_competition.py`** (7 tests) ✓ **NEW**
+   - Unified target/decoy competition for both library and non-library modes
+   - LibCosine as primary score in library mode
+   - XCorr as primary score in non-library mode
+   - Winner-only reporting (no PairID, reports single peptide per pair)
+   - Metrics at primary score peak location
+   - Tie-breaking favors decoy (conservative for FDR)
+   - Simplified TSV output format validation
+   - Library mode: no e-value (XCorr only at LibCosine peak)
+   - Non-library mode: XCorr-based with e-value calculation
+
 ### Test Results
 
-**Overall: 124/124 tests passing (100%)**
+**Overall: 163 tests collected** (previously 156)
 
 ```text
 18 passed - test_basic_functionality.py ✓
@@ -105,15 +125,50 @@ A comprehensive pytest-based test infrastructure has been created for pyXcorrDIA
 42 passed - test_digestion.py ✓
  7 passed - test_search.py ✓
  8 passed - test_peptide_centric.py ✓
- 9 passed - test_dia_parallelization.py ✓
  8 passed - test_peptide_centric_real_data.py ✓
-17 passed - test_unified_xcorr.py ✓
-11 passed - test_evalue.py ✓ (NEW)
+19 passed - test_integration.py ✓
+ 6 passed - test_unified_xcorr.py ✓
+11 passed - test_evalue.py ✓
+11 passed - test_library_support.py ✓
+ 7 passed - test_target_decoy_competition.py ✓
 ```
+
+**All tests passing: 163/163 ✓**
 
 ### Test Suite Highlights
 
-#### DIA Parallelization Tests (NEW)
+#### E-value Calculation Tests (NEW)
+
+The new `test_evalue.py` module provides comprehensive validation of statistical significance calculations:
+
+**E-value Calculation (Comet's LinearRegression approach):**
+- **Range validation:** Ensures all e-values are in [1e-10, 1.0]
+- **Histogram binning:** Tests 0.1 XCorr unit bins as per Comet
+- **Regression fitting:** Validates cumulative distribution → log transform → linear regression
+- **Edge cases:** Insufficient data (< 10 scores), uniform distributions, poor fits
+- **Capping behavior:** E-values > 1.0 from bad fits are capped at 1.0
+- **Score separation:** E-value decreases as top score increases above distribution
+- **Realistic distributions:** Tests with actual XCorr score ranges (0.5-3.0)
+
+**Charge-Specific E-value Tests:**
+- **Multiple charge states:** Validates separate distributions for +2, +3, etc.
+- **Missing charge fallback:** Uses combined distribution when specific charge missing
+- **Spectrum-centric mode:** Each spectrum gets charge-specific e-value
+
+**Z-score Tests:**
+- **Basic calculation:** Z = (best_score - mean) / std_dev
+- **Signal-to-noise ratio:** Measures how many std devs best score is above mean
+- **Outlier detection:** High Z-scores indicate clear signals
+- **No variation handling:** Returns 0.0 when std_dev = 0 (avoids divide by zero)
+- **DIA chromatogram use:** Perfect metric for peak quality in time series
+
+**Why This Matters:**
+- Proper e-values enable FDR control and statistical confidence
+- Z-scores provide intuitive signal quality metric for DIA
+- Validated against Comet's proven algorithm
+- Handles edge cases that occur in real data
+
+#### DIA Parallelization Tests
 The new `test_dia_parallelization.py` module validates the multiprocessing functionality in DIA mode:
 - **Worker serialization**: Tests that PeptideCandidate objects are correctly serialized/deserialized across process boundaries
 - **Process isolation**: Verifies each worker creates its own FastXCorr instance to avoid conflicts
@@ -171,6 +226,41 @@ The test suite now includes comprehensive validation of peptide-centric DIA scor
 - 0.0001 scaling brings scores into proper 0-10 range
 - E-values calculated from chromatogram, not peptide database
 - Negative scores occur due to anti-correlation (background subtraction)
+
+#### Target/Decoy Competition Tests
+
+The test suite includes comprehensive validation of unified target/decoy competition (`test_target_decoy_competition.py`):
+
+**Competition Logic Tests:**
+- **Library Mode Competition** - Validates that LibCosine is the primary score, and XCorr is calculated only at the LibCosine peak spectrum
+- **Non-Library Mode Competition** - Validates that XCorr is the primary score with full e-value calculation from chromatogram distribution
+- **Tie-Breaking** - Confirms that ties favor decoy selection (conservative for FDR control)
+
+**Output Format Validation Tests:**
+- **Library Mode Output** - Validates 13-column format with no PairID, no e-value, no XCorrZScore
+  - Columns: `Peptide, Charge, ProteinID, Mass, IsTarget, IsolationWindow, NumSpectraScored, LibCosine, LibCosineZScore, XCorr, RT, ScanID, PrecursorCosine`
+- **Non-Library Mode Output** - Validates 12-column format with no library-specific scores
+  - Columns: `Peptide, Charge, ProteinID, Mass, IsTarget, IsolationWindow, BestXCorr, BestRT, BestScan, EValue, NumSpectraScored, XCorrZScore`
+- **No PairID Column** - Confirms winner-only reporting with no pair linkage needed
+
+**Pair Processing Tests:**
+- **Pair Processing Order** - Validates that even indices are targets, odd indices are decoys, and only one winner is reported per pair
+
+**Key Implementation Details Validated:**
+- Winner-only reporting reduces output by ~50% (one peptide per target/decoy pair)
+- Library mode: XCorr calculated only at the spectrum with best LibCosine (not meaningful for e-value)
+- Non-library mode: XCorr calculated across full chromatogram (meaningful e-value from distribution)
+- Incremental TSV writing: Results written immediately as isolation windows complete (memory efficient)
+- Thread-safe file access: `multiprocessing.Lock()` prevents corruption in parallel mode
+- Real-time progress reporting: "Progress: X/Y windows completed"
+- Simplified column names: `LibCosine` (not BestLibCosine), `XCorr` (not BestXCorrRaw), `RT`/`ScanID` (not BestRT/BestScan)
+
+**Removed Legacy Artifacts:**
+- PairID column (no longer needed with winner-only reporting)
+- BestXCorrRaw/BestXCorrSmoothed columns (Savitzky-Golay smoothing removed)
+- Redundant "Best" prefixes (cleaner naming)
+- XCorrZScore in library mode (only one XCorr value per peptide)
+- E-value in library mode (not meaningful with single XCorr measurement)
 
 ### Known Issues
 
@@ -339,16 +429,105 @@ for spectrum in spectra:
     )
 ```
 
+### Using pyXcorrDIA as a Library
+
+The test suite demonstrates best practices for using pyXcorrDIA:
+
+#### Basic Spectrum-Centric Search
+
+```python
+from pyXcorrDIA import FastXCorr
+
+# Initialize with modifications
+engine = FastXCorr(static_modifications={'C': 57.021464})
+
+# Read database
+proteins = engine.read_fasta('database.fasta')
+
+# Digest proteins with length filtering
+peptides = []
+for protein in proteins:
+    peptides.extend(engine.digest_protein(
+        protein.sequence,
+        protein.id,
+        enzyme='trypsin',
+        missed_cleavages=0,
+        min_length=7,
+        max_length=30
+    ))
+
+# Generate target-decoy pairs
+non_redundant = engine.make_peptides_non_redundant(peptides)
+pairs = engine.generate_target_decoy_pairs(non_redundant)
+
+# Read spectra
+spectra = engine.read_mzml('data.mzML')
+
+# Search each spectrum
+for spectrum in spectra:
+    results = engine.search_spectrum_centric(
+        spectrum,
+        peptides,
+        charge_states=[2, 3],
+        bin_width=0.02,
+        bin_offset=0.0
+    )
+    # Results include XCorr scores and e-values
+```
+
+#### E-value Calculation
+
+```python
+# Calculate e-value from score distribution
+scores = [0.5, 0.7, 0.9, 1.1, 1.3, 1.5, 1.7, 1.9, 2.1]
+top_score = 2.1
+
+e_value = engine.calculate_e_value(scores, top_score)
+# Returns probability in range [1e-10, 1.0]
+```
+
+#### DIA Peptide-Centric Search
+
+```python
+# Group spectra by isolation window
+from collections import defaultdict
+window_groups = defaultdict(list)
+for spectrum in spectra:
+    window = (spectrum.isolation_window_lower, spectrum.isolation_window_upper)
+    window_groups[window].append(spectrum)
+
+# Search each window
+for window, window_spectra in window_groups.items():
+    results = engine.search_dia_peptide_centric(
+        window_spectra,
+        pairs,
+        charge_states=[2, 3],
+        isolation_window=window,
+        bin_width=0.02,
+        bin_offset=0.0
+    )
+    # Results include chromatogram profiles, e-values, and Z-scores
+```
+
 ### Validation
 
 The test suite validates that pyXcorrDIA:
-1. Correctly implements Comet's binning algorithm
-2. Properly applies MakeCorrData windowing
-3. Accurately calculates XCorr scores
+1. Correctly implements Comet's binning algorithm (BIN macro)
+2. Properly applies MakeCorrData windowing normalization
+3. Accurately calculates XCorr scores with correct scaling
 4. Handles static modifications correctly
-5. Generates valid decoy sequences
-6. Reads MS data files correctly
-7. Produces consistent results
+5. Generates valid decoy sequences with enzyme-aware rules
+6. Reads MS data files correctly (mzML, MGF, FASTA)
+7. Produces consistent results (parallel = sequential)
+8. Calculates proper e-values using Comet's LinearRegression
+9. Computes Z-scores for signal-to-noise assessment
+10. Handles edge cases (insufficient data, uniform scores, etc.)
+
+### Files Created
+
+```
+tests/
+````
 
 ### Files Created
 
@@ -357,13 +536,17 @@ tests/
 ├── __init__.py
 ├── conftest.py
 ├── README.md
-├── test_basic_functionality.py      # 18 tests - Core functionality
-├── test_file_io.py                  # 13 tests - File reading
-├── test_digestion.py                # 42 tests - Protein digestion & enzymes
-├── test_preprocessing.py            # 13 tests - Spectrum preprocessing
-├── test_search.py                   #  7 tests - Database search
-├── test_peptide_centric.py          #  8 tests - Peptide-centric scoring (mock data)
-└── test_peptide_centric_real_data.py #  8 tests - Peptide-centric validation (real data)
+├── test_basic_functionality.py         # 18 tests - Core functionality
+├── test_file_io.py                     # 13 tests - File reading
+├── test_digestion.py                   # 42 tests - Protein digestion & enzymes
+├── test_preprocessing.py               # 13 tests - Spectrum preprocessing
+├── test_search.py                      #  7 tests - Database search
+├── test_peptide_centric.py             #  8 tests - Peptide-centric scoring (mock data)
+├── test_peptide_centric_real_data.py   #  8 tests - Peptide-centric validation (real data)
+├── test_integration.py                 # 19 tests - Integration and parallelization
+├── test_unified_xcorr.py               #  6 tests - Unified XCorr implementation
+├── test_evalue.py                      # 11 tests - E-value calculation
+└── test_target_decoy_competition.py    #  7 tests - Target/decoy competition & output
 
 pytest.ini
 run_tests_quick.py
@@ -375,12 +558,15 @@ Claude.md                               # Guidelines for test development
 ## Conclusion
 
 A robust pytest infrastructure has been successfully created for pyXcorrDIA with:
-- 87 comprehensive tests across 7 test modules
-- 100% passing rate (87/87 tests)
+- 163 comprehensive tests across 12 test modules
+- 100% passing rate (163/163 tests)
 - Modular organization by functionality
 - Comprehensive fixtures and configuration
 - Detailed documentation
 - Real data validation with DIA analysis notebook
 - Peptide-centric scoring fully validated
+- Unified target/decoy competition with winner-only reporting
+- Incremental TSV writing with thread-safe file access
+- Simplified output format for both library and non-library modes
 
-The test suite provides confidence in the correctness of the implementation and serves as executable documentation for the codebase. Special attention has been given to validating the peptide-centric DIA scoring algorithm with both synthetic and real data from actual DIA searches.
+The test suite provides confidence in the correctness of the implementation and serves as executable documentation for the codebase. Special attention has been given to validating the peptide-centric DIA scoring algorithm, target/decoy competition logic, and incremental results writing with both synthetic and real data from actual DIA searches.

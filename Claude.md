@@ -86,6 +86,161 @@ This implementation closely follows Comet's algorithm to ensure reproducibility:
 - **Important**: YQSHTK test data has 1+ charge, not 2+ or 3+
 - Search typically tests multiple charge states (user-configurable)
 
+### Spectrum Library Support (DIA-NN Integration)
+
+**Feature** (November 2025): Comprehensive support for DIA-NN predicted spectral libraries with advanced scoring.
+
+**Core Components:**
+
+1. **SpectrumLibrary Class** (lines 69-346)
+   - Reads DIA-NN parquet format libraries (`report-lib.parquet`)
+   - Indexes peptides by (sequence, charge) for fast lookup
+   - Parses UniMod modifications (e.g., C(UniMod:4) → +57.021464 Da)
+   - Generates decoy fragment spectra with intensity remapping
+   - Note: Requires `.parquet` format, not binary `.speclib` format
+
+2. **Fragment-Level Library Scoring**
+   - **SMZ Preprocessing**: `preprocessed_intensity = sqrt(intensity) * mz²`
+   - **Cosine Angle Score**: `dot(exp, lib) / (norm(exp) * norm(lib))`
+   - **PPM Tolerance Matching**: Default 10 ppm for fragments
+   - **Decoy Generation Strategy**: Reverse sequence (keep C-term K/R), remap fragment intensities
+     - Example: PEPTIDER → EDITPEPR
+     - Target y2 intensity → Decoy y2 (same position from C-terminus)
+     - Recalculate m/z for new amino acid composition
+
+3. **MS1 Precursor Isotope Scoring**
+   - **Isotope Pattern Prediction**: Averagine-based model for M-1, M+0, M+1, M+2, M+3
+     - M-1 intensity = 0.0 (theoretical)
+     - M+0, M+1, M+2, M+3 calculated using binomial distribution
+     - Neutron mass difference: 1.002868 Da / charge
+   - **MS1 Spectrum Indexing**: Read and sort by retention time for binary search
+   - **Envelope Extraction**: Match 5 isotope peaks with ppm tolerance (default: 10 ppm)
+   - **Cosine Scoring**: Compare experimental vs theoretical isotope pattern
+   - **Smart MS1 Selection**: Uses RT of best library fragment score to find closest MS1
+
+### Target-Decoy Competition (Unified Implementation)
+
+**Feature** (January 2025): Unified competition logic for both library and non-library DIA search modes.
+
+**Design Philosophy:**
+- Single code path eliminates duplication and ensures consistency
+- Mode-specific primary score selection (LibCosine vs XCorr)
+- Winner-only reporting simplifies downstream FDR calculation
+- Incremental writing improves memory efficiency
+
+**Competition Algorithm (lines 2270-2363):**
+
+```python
+def select_competition_winner(target_data, decoy_data, primary_score_key, library_mode=False):
+    """
+    Select winner between target and decoy based on primary score.
+    
+    Args:
+        target_data: Dictionary with target scores and metrics
+        decoy_data: Dictionary with decoy scores and metrics
+        primary_score_key: 'lib_cosine' (library) or 'xcorr' (non-library)
+        library_mode: If True, XCorr calculated only at primary score peak
+    
+    Returns:
+        winner_data: Dictionary with winner's scores and metrics
+        is_target: 1 if target won, 0 if decoy won
+    """
+```
+
+**Primary Score Selection:**
+- **Library mode** (`--speclib` provided):
+  - Primary score: `LibCosine` (cosine similarity to library spectrum)
+  - XCorr calculated only at the single spectrum with best LibCosine
+  - E-value set to 0.0 (not meaningful with single XCorr measurement)
+  - Rationale: LibCosine already captures spectral similarity, XCorr is confirmatory
+  
+- **Non-library mode** (no `--speclib`):
+  - Primary score: `XCorr` (cross-correlation score)
+  - XCorr calculated across full chromatogram (all spectra in window)
+  - E-value meaningful (calculated from XCorr distribution)
+  - Rationale: XCorr is primary metric, e-value provides statistical significance
+
+**Winner Selection Rules:**
+1. Compare primary scores (LibCosine or XCorr) between target and decoy
+2. Higher primary score wins
+3. **Tie-breaking**: Decoy wins (conservative for FDR estimation)
+4. Winner's metrics reported at primary score peak location
+
+**Output Format:**
+
+*Library Mode* (13 columns):
+```
+Peptide, Charge, ProteinID, Mass, IsTarget, IsolationWindow, NumSpectraScored,
+LibCosine, LibCosineZScore, XCorr, RT, ScanID, PrecursorCosine
+```
+
+*Non-Library Mode* (12 columns):
+```
+Peptide, Charge, ProteinID, Mass, IsTarget, IsolationWindow, BestXCorr,
+BestRT, BestScan, EValue, NumSpectraScored, XCorrZScore
+```
+
+**Key Simplifications:**
+- **No PairID**: Winner-only reporting eliminates need for pair tracking
+- **No Smoothing Artifacts**: Removed BestXCorrRaw, BestXCorrSmoothed columns
+- **Clean Column Names**: `LibCosine`, `XCorr`, `RT`, `ScanID` (no "Best" prefixes)
+- **Conditional Columns**: E-value and XCorrZScore only in non-library mode
+
+**Incremental TSV Writing (lines 3456-3520):**
+
+```python
+class DIAResultsWriter:
+    def __init__(self, filepath, library_mode=False):
+        self.write_lock = None  # Set by caller for parallel mode
+        
+    def open_for_append(self):
+        self.file_handle = open(self.filepath, 'a')
+        
+    def write_dia_results_synchronized(self, results):
+        if self.write_lock:
+            with self.write_lock:
+                self._write_results(results)
+        else:
+            self._write_results(results)
+```
+
+**Benefits:**
+- **Memory Efficient**: Write immediately, don't accumulate all results
+- **Real-Time Progress**: "Progress: X/Y windows completed" updates
+- **Thread-Safe**: `multiprocessing.Manager().Lock()` prevents corruption
+- **Streaming**: Uses `pool.imap_unordered()` instead of `pool.map()`
+
+**Command-Line Usage:**
+
+```bash
+# Library mode search
+python pyXcorrDIA.py --dia_mode \
+    --speclib DIANN-Output/report-lib.parquet \
+    --lib_fragment_tol 10.0 \
+    --lib_fragment_tol_unit ppm \
+    --lib_precursor_tol 10.0 \
+    --lib_precursor_tol_unit ppm \
+    database.fasta \
+    data.mzML
+```
+
+**Key Features:**
+- Parallel processing support (library loaded per-worker)
+- Backward compatible (runs without library, outputs "NA")
+- Z-score calculation for library scores: `(best_score - mean) / std_dev`
+- Integrates seamlessly with existing XCorr scoring
+
+**Workflow:**
+1. Load library from parquet file (per parallel worker)
+2. Read MS1 spectra and index by RT (once at startup)
+3. For each isolation window:
+   - Score all library fragments against all MS2 spectra
+   - Generate and score decoy fragments
+   - Find best scoring spectrum
+   - Extract isotope envelope from closest MS1 scan
+   - Calculate precursor isotope cosine scores
+4. Output chromatograms and summary statistics
+
 ## Testing Infrastructure
 
 ### Test Organization (`tests/`)
@@ -97,11 +252,27 @@ This implementation closely follows Comet's algorithm to ensure reproducibility:
 - **test_search.py** (7 tests) - Database search workflow, integration tests
 - **test_peptide_centric.py** (8 tests) - Peptide-centric DIA scoring with mock data
 - **test_peptide_centric_real_data.py** (8 tests) - Real data validation from notebook
-- **test_unified_xcorr.py** (17 tests) - Unified XCorr function (single & matrix operations)
-- **test_dia_parallelization.py** (9 tests) - DIA parallel processing validation
-- **test_evalue.py** (11 tests) - **NEW**: E-value calculation and Z-score validation
+- **test_integration.py** (19 tests) - Integration tests and DIA parallelization
+- **test_unified_xcorr.py** (6 tests) - Unified XCorr function (single & matrix operations)
+- **test_evalue.py** (11 tests) - E-value calculation and Z-score validation
+- **test_library_support.py** (11 tests) - Spectrum library integration
+  - Library loading and indexing
+  - UniMod modification parsing
+  - Decoy fragment generation with intensity remapping
+  - Fragment matching with ppm tolerance
+  - Cosine angle scoring with SMZ preprocessing
+  - MS1 isotope pattern prediction and scoring
+  - MS1 spectrum management and envelope extraction
+- **test_target_decoy_competition.py** (7 tests) - **NEW**: Target/decoy competition & incremental writing
+  - Unified competition logic for library and non-library modes
+  - LibCosine as primary score in library mode
+  - XCorr as primary score in non-library mode
+  - Winner-only reporting (no PairID column)
+  - Simplified TSV output format validation
+  - Incremental writing with thread-safe file access
+  - Conditional e-value calculation (non-library mode only)
 
-**Total: 124 tests (100% passing)**
+**Total: 163 tests (100% passing)**
 
 ### E-value & Z-score Tests (NEW)
 

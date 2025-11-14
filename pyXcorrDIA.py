@@ -20,7 +20,6 @@ import os
 import bisect
 import sys
 from datetime import datetime
-from scipy.signal import savgol_filter
 from multiprocessing import Pool, cpu_count
 import pandas as pd
 
@@ -47,12 +46,315 @@ class MassSpectrum:
 
 class PeptideCandidate:
     """Represents a peptide candidate with its theoretical spectrum."""
-    
+
     def __init__(self, sequence: str, protein_id: str, mass: float):
         self.sequence = sequence
         self.protein_id = protein_id
         self.mass = mass
         self.theoretical_spectrum = None
+
+
+class MS1Spectrum:
+    """Represents an MS1 spectrum for precursor isotope scoring."""
+
+    def __init__(self, mz_array: np.ndarray, intensity_array: np.ndarray,
+                 scan_id: str = "", retention_time: float = 0.0):
+        self.mz_array = mz_array
+        self.intensity_array = intensity_array
+        self.scan_id = scan_id
+        self.retention_time = retention_time  # Retention time in minutes
+
+
+class SpectrumLibrary:
+    """
+    Represents a spectral library for library-based scoring in DIA searches.
+
+    Supports DIA-NN predicted spectral libraries in parquet format.
+    Provides fragment-level library scoring (cosine angle with SMZ preprocessing)
+    and MS1 precursor isotope pattern scoring.
+    """
+
+    # UniMod to mass mapping for common modifications
+    # https://www.unimod.org/modifications_list.php
+    UNIMOD_MASSES = {
+        '1': 42.010565,    # Acetyl (N-term or K)
+        '4': 57.021464,    # Carbamidomethyl (C)
+        '5': 0.984016,     # Carbamyl (N-term, K)
+        '7': 0.984016,     # Deamidated (N, Q)
+        '21': 79.966331,   # Phospho (S, T, Y)
+        '35': 15.994915,   # Oxidation (M)
+        '36': 25.980265,   # Dimethyl (K, N-term)
+        '42': 0.984016,    # Acetyl (N-term)
+        '43': 14.015650,   # Trimethyl (K)
+        '121': 114.042927, # GlyGly (K) - ubiquitination
+        '259': 14.015650,  # Label:13C(6)15N(2) (K)
+        '267': 10.008269,  # Label:13C(6)15N(4) (R)
+    }
+
+    def __init__(self, library_path: str = None, verbose: bool = True):
+        """
+        Initialize spectrum library.
+
+        Args:
+            library_path: Path to DIA-NN parquet library file
+            verbose: Print library loading message (default: True)
+        """
+        self.library_path = library_path
+        self.library_df = None
+        self.peptide_index = {}  # (stripped_sequence, charge) -> precursor_data
+        self.decoy_fragments = {}  # (stripped_sequence, charge, is_decoy=True) -> decoy fragment data
+        self.verbose = verbose
+
+        if library_path:
+            self.load_library(library_path)
+
+    def load_library(self, library_path: str):
+        """
+        Load DIA-NN parquet library file.
+
+        Expected columns:
+        - Precursor.Id, Modified.Sequence, Stripped.Sequence
+        - Precursor.Charge, Precursor.Mz
+        - Product.Mz, Relative.Intensity
+        - Fragment.Type, Fragment.Charge, Fragment.Series.Number
+        - RT (predicted retention time)
+        - Protein.Ids, Decoy
+        """
+        import pandas as pd
+        try:
+            self.library_df = pd.read_parquet(library_path)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load library from {library_path}. "
+                f"Error: {e}\n\n"
+                f"Note: This tool requires DIA-NN parquet format libraries (*.parquet), "
+                f"not the binary .speclib format. Use 'report-lib.parquet' instead of "
+                f"'report-lib.predicted.speclib'."
+            )
+
+        # Build index: (stripped_sequence, charge) -> precursor data
+        # Group by precursor to collect all fragments
+        grouped = self.library_df.groupby(['Stripped.Sequence', 'Precursor.Charge'])
+
+        for (sequence, charge), group in grouped:
+            # Skip library decoys - we'll generate our own via fragment remapping
+            if group['Decoy'].iloc[0] == 1:
+                continue
+
+            # Extract fragment data
+            fragments = []
+            for _, row in group.iterrows():
+                fragments.append({
+                    'mz': row['Product.Mz'],
+                    'intensity': row['Relative.Intensity'],
+                    'type': row['Fragment.Type'],  # 'y' or 'b'
+                    'charge': row['Fragment.Charge'],
+                    'series_number': row['Fragment.Series.Number'],
+                })
+
+            # Store precursor data
+            self.peptide_index[(sequence, charge)] = {
+                'sequence': sequence,
+                'charge': charge,
+                'precursor_mz': group['Precursor.Mz'].iloc[0],
+                'rt': group['RT'].iloc[0],
+                'modified_sequence': group['Modified.Sequence'].iloc[0],
+                'protein_ids': group['Protein.Ids'].iloc[0],
+                'fragments': fragments,
+            }
+
+        if self.verbose:
+            print(f"Loaded library with {len(self.peptide_index)} precursors from {library_path}")
+
+    def get_precursor(self, sequence: str, charge: int) -> Optional[Dict]:
+        """
+        Get precursor data from library.
+
+        Returns:
+            Dictionary with precursor_mz, rt, fragments list, or None if not found
+        """
+        return self.peptide_index.get((sequence, charge))
+
+    def has_peptide(self, sequence: str, charge: int) -> bool:
+        """Check if peptide exists in library."""
+        return (sequence, charge) in self.peptide_index
+
+    def get_all_peptides(self) -> List[Tuple[str, int]]:
+        """Get list of all (sequence, charge) tuples in library."""
+        return list(self.peptide_index.keys())
+
+    @staticmethod
+    def parse_unimod_sequence(modified_sequence: str) -> Tuple[str, Dict[int, float]]:
+        """
+        Parse DIA-NN modified sequence with UniMod annotations.
+
+        Args:
+            modified_sequence: e.g., "AAAPAPVSEAVC(UniMod:4)R"
+
+        Returns:
+            (stripped_sequence, modifications_dict)
+            modifications_dict: {position: mass_shift}
+        """
+        import re
+
+        stripped = ""
+        modifications = {}
+        position = 0
+
+        # Pattern to match amino acid followed by optional (UniMod:N)
+        pattern = r'([A-Z])(?:\(UniMod:(\d+)\))?'
+
+        for match in re.finditer(pattern, modified_sequence):
+            aa = match.group(1)
+            unimod_id = match.group(2)
+
+            stripped += aa
+
+            if unimod_id and unimod_id in SpectrumLibrary.UNIMOD_MASSES:
+                modifications[position] = SpectrumLibrary.UNIMOD_MASSES[unimod_id]
+
+            position += 1
+
+        return stripped, modifications
+
+    def generate_decoy_fragments(self, sequence: str, charge: int, xcorr_engine) -> Optional[Dict]:
+        """
+        Generate decoy fragment spectrum by remapping target fragment intensities.
+
+        Strategy:
+        - Reverse the peptide sequence (keeping C-terminal K/R if present)
+        - For each target fragment at position N from terminus, assign its intensity
+          to the corresponding position N in the decoy sequence
+        - Recalculate fragment m/z values for the decoy sequence
+
+        Args:
+            sequence: Target peptide sequence (stripped)
+            charge: Precursor charge
+            xcorr_engine: FastXCorr instance for mass calculations
+
+        Returns:
+            Dictionary with decoy fragment data, or None if not in library
+        """
+        # Check if already generated
+        decoy_key = (sequence, charge, True)
+        if decoy_key in self.decoy_fragments:
+            return self.decoy_fragments[decoy_key]
+
+        # Get target data
+        target_data = self.get_precursor(sequence, charge)
+        if not target_data:
+            return None
+
+        # Generate decoy sequence (reverse, keeping C-term K/R)
+        decoy_sequence = self._reverse_sequence(sequence)
+
+        # Build intensity map: (frag_type, series_number, frag_charge) -> intensity
+        # This maps target fragment positions to their intensities
+        intensity_map = {}
+        for frag in target_data['fragments']:
+            key = (frag['type'], frag['series_number'], frag['charge'])
+            intensity_map[key] = frag['intensity']
+
+        # Generate decoy fragments by mapping intensities to new positions
+        decoy_fragments = []
+        sequence_length = len(decoy_sequence)
+
+        # For each possible fragment in the decoy
+        for frag_type in ['y', 'b']:
+            for series_num in range(1, sequence_length):
+                for frag_charge in [1, 2]:  # DIA-NN typically uses 1+ and 2+
+                    # Check if this position had intensity in the target
+                    key = (frag_type, series_num, frag_charge)
+                    if key in intensity_map:
+                        # Calculate m/z for this decoy fragment
+                        frag_mz = self._calculate_fragment_mz(
+                            decoy_sequence, frag_type, series_num, frag_charge, xcorr_engine
+                        )
+
+                        if frag_mz > 0:  # Valid fragment
+                            decoy_fragments.append({
+                                'mz': frag_mz,
+                                'intensity': intensity_map[key],
+                                'type': frag_type,
+                                'charge': frag_charge,
+                                'series_number': series_num,
+                            })
+
+        # Calculate decoy precursor m/z
+        decoy_mass = sum(xcorr_engine.aa_masses.get(aa, 0) for aa in decoy_sequence)
+        decoy_mass += xcorr_engine.h2o_mass  # Add H2O for neutral mass
+        decoy_precursor_mz = (decoy_mass + charge * xcorr_engine.proton_mass) / charge
+
+        # Store decoy data
+        decoy_data = {
+            'sequence': decoy_sequence,
+            'charge': charge,
+            'precursor_mz': decoy_precursor_mz,
+            'rt': target_data['rt'],  # Same RT as target
+            'fragments': decoy_fragments,
+            'is_decoy': True,
+        }
+
+        self.decoy_fragments[decoy_key] = decoy_data
+        return decoy_data
+
+    @staticmethod
+    def _reverse_sequence(sequence: str) -> str:
+        """
+        Reverse peptide sequence, keeping C-terminal K/R.
+
+        Args:
+            sequence: e.g., "PEPTIDER"
+
+        Returns:
+            Reversed sequence, e.g., "EDITPEPR"
+        """
+        if len(sequence) <= 1:
+            return sequence
+
+        # Check if C-terminal is K or R
+        if sequence[-1] in ['K', 'R']:
+            # Reverse all except last residue, keep K/R at end
+            return sequence[-2::-1] + sequence[-1]
+        else:
+            # Full reversal
+            return sequence[::-1]
+
+    @staticmethod
+    def _calculate_fragment_mz(sequence: str, frag_type: str, series_number: int,
+                               frag_charge: int, xcorr_engine) -> float:
+        """
+        Calculate fragment ion m/z.
+
+        Args:
+            sequence: Peptide sequence
+            frag_type: 'y' or 'b'
+            series_number: Fragment series number (1-indexed)
+            frag_charge: Fragment charge state
+            xcorr_engine: FastXCorr instance for masses
+
+        Returns:
+            Fragment m/z value, or 0 if invalid
+        """
+        if series_number < 1 or series_number >= len(sequence):
+            return 0
+
+        if frag_type == 'y':
+            # y-ions: C-terminal fragments (count from C-terminus)
+            fragment_seq = sequence[-series_number:]
+            mass = sum(xcorr_engine.aa_masses.get(aa, 0) for aa in fragment_seq)
+            mass += xcorr_engine.h2o_mass + xcorr_engine.proton_mass  # y-ion includes OH + H
+        elif frag_type == 'b':
+            # b-ions: N-terminal fragments (count from N-terminus)
+            fragment_seq = sequence[:series_number]
+            mass = sum(xcorr_engine.aa_masses.get(aa, 0) for aa in fragment_seq)
+            mass += xcorr_engine.proton_mass  # b-ion is just protonated
+        else:
+            return 0
+
+        # Add additional protons for charge and divide
+        mz = (mass + (frag_charge - 1) * xcorr_engine.proton_mass) / frag_charge
+        return mz
 
 
 class FastXCorr:
@@ -350,7 +652,91 @@ class FastXCorr:
                     break
         
         return spectra
-    
+
+    def read_ms1_spectra(self, mzml_file: str) -> List[MS1Spectrum]:
+        """
+        Read MS1 spectra from mzML file and index by retention time.
+
+        Args:
+            mzml_file: Path to mzML file
+
+        Returns:
+            List of MS1Spectrum objects, sorted by retention time
+        """
+        ms1_spectra = []
+
+        # Open the mzML file with pymzml
+        run = pymzml.run.Reader(mzml_file)
+
+        for spectrum_idx, spectrum in enumerate(run):
+            # Only process MS1 spectra
+            if spectrum.ms_level != 1:
+                continue
+
+            # Get scan ID
+            scan_id = spectrum.ID
+            if not scan_id:
+                scan_id = f"ms1_scan_{spectrum_idx}"
+
+            # Try to get retention time
+            try:
+                retention_time_minutes = spectrum.scan_time_in_minutes()
+            except (AttributeError, TypeError):
+                retention_time_minutes = float(spectrum_idx)
+
+            # Get m/z and intensity arrays
+            if len(spectrum.peaks('centroided')) > 0:
+                peaks = spectrum.peaks('centroided')
+                mz_array = np.array([peak[0] for peak in peaks])
+                intensity_array = np.array([peak[1] for peak in peaks])
+
+                ms1_spectrum = MS1Spectrum(
+                    mz_array=mz_array,
+                    intensity_array=intensity_array,
+                    scan_id=scan_id,
+                    retention_time=retention_time_minutes
+                )
+                ms1_spectra.append(ms1_spectrum)
+
+        # Sort by retention time for efficient lookup
+        ms1_spectra.sort(key=lambda x: x.retention_time)
+
+        return ms1_spectra
+
+    @staticmethod
+    def find_closest_ms1(ms1_spectra: List[MS1Spectrum], target_rt: float) -> Optional[MS1Spectrum]:
+        """
+        Find the MS1 spectrum closest to the target retention time.
+
+        Args:
+            ms1_spectra: List of MS1Spectrum objects (sorted by RT)
+            target_rt: Target retention time in minutes
+
+        Returns:
+            Closest MS1Spectrum, or None if list is empty
+        """
+        if not ms1_spectra:
+            return None
+
+        # Binary search for closest RT
+        rts = [ms1.retention_time for ms1 in ms1_spectra]
+        idx = bisect.bisect_left(rts, target_rt)
+
+        # Check boundaries
+        if idx == 0:
+            return ms1_spectra[0]
+        elif idx == len(ms1_spectra):
+            return ms1_spectra[-1]
+
+        # Compare adjacent entries
+        before = ms1_spectra[idx - 1]
+        after = ms1_spectra[idx]
+
+        if abs(before.retention_time - target_rt) <= abs(after.retention_time - target_rt):
+            return before
+        else:
+            return after
+
     def read_mgf(self, mgf_file: str, max_spectra: int = 0) -> List[MassSpectrum]:
         """Read mass spectra from MGF file using pyteomics."""
         spectra = []
@@ -1628,11 +2014,15 @@ class FastXCorr:
                                       scaling_factor=0.0001)
         return float(result)  # Guaranteed to be float for 1D inputs
     
-    def search_dia_peptide_centric(self, 
+    def search_dia_peptide_centric(self,
                                    spectra: List[MassSpectrum],
                                    target_decoy_pairs: List[Tuple[PeptideCandidate, PeptideCandidate]],
                                    charge_states: List[int] = [2, 3],
                                    parquet_output: str = None,
+                                   library: 'SpectrumLibrary' = None,
+                                   ms1_spectra: List[MS1Spectrum] = None,
+                                   lib_fragment_tol_ppm: float = 10.0,
+                                   lib_precursor_tol_ppm: float = 10.0,
                                    verbose: int = 0) -> Dict:
         """
         Perform comprehensive peptide-centric DIA search.
@@ -1640,16 +2030,18 @@ class FastXCorr:
         Key improvements:
         1. Score ALL spectra against ALL peptides in the isolation window
         2. Write XCorr chromatograms to Parquet file incrementally with unified schema
-        3. Apply Savitzky-Golay smoothing (auto window size, max 7 points) to XCorr chromatograms
-        4. Store all XCorr values for e-value calculation
-        5. E-value: best peptide XCorr vs all its XCorr scores across spectra
-        6. Track target/decoy pairs for downstream competition analysis
+        3. Store all XCorr values for e-value calculation
+        4. E-value: best peptide XCorr vs all its XCorr scores across spectra
+        5. If library provided: LibCosine-centric scoring with target/decoy competition (report winner only)
+        6. If no library: Track target/decoy pairs for downstream competition analysis
         
         Args:
             spectra: List of spectra (should be from same isolation window)
             target_decoy_pairs: List of (target, decoy) peptide pairs
             charge_states: Charge states to search
             parquet_output: Path to write Parquet file (if None, uses temp file)
+            library: Optional SpectrumLibrary for LibCosine scoring
+            ms1_spectra: Optional MS1 spectra for precursor isotope scoring
             
         Returns:
             Dictionary with results per peptide (and path to Parquet file)
@@ -1734,120 +2126,346 @@ class FastXCorr:
         # Show matrix scoring complete if verbose
         if verbose >= 1:
             print("  DIA: Matrix scoring complete, processing results...")
-        
+
+        # **LIBRARY SCORING**: Score library fragments if library is provided
+        lib_cosine_matrix_target = None
+        lib_cosine_matrix_decoy = None
+
+        if library is not None:
+            if verbose >= 1:
+                print(f"  DIA: Calculating library scores for {len(peptides_in_window)} peptides vs {len(spectra)} spectra")
+
+            # Initialize matrices for library scores
+            lib_cosine_matrix_target = np.zeros((len(peptides_in_window), len(spectra)))
+            lib_cosine_matrix_decoy = np.zeros((len(peptides_in_window), len(spectra)))
+
+            # Preprocess all experimental spectra once for library scoring
+            # Store as sorted arrays for fast binary search matching
+            experimental_preprocessed_lib = []
+            for spectrum in spectra:
+                # Sort by m/z for fast searching
+                sorted_indices = np.argsort(spectrum.mz_array)
+                sorted_mz = spectrum.mz_array[sorted_indices]
+                sorted_intensity = spectrum.intensity_array[sorted_indices]
+                
+                # Apply SMZ preprocessing: sqrt(intensity) * mz^2
+                preprocessed_intensity = np.sqrt(sorted_intensity) * (sorted_mz ** 2)
+                
+                experimental_preprocessed_lib.append({
+                    'mz': sorted_mz,
+                    'intensity_preprocessed': preprocessed_intensity
+                })
+
+            # Score each peptide's library fragments
+            for pep_idx, (peptide, charge, is_target, pair_id) in enumerate(peptides_in_window):
+                # Get target library data
+                target_lib_data = library.get_precursor(peptide.sequence, charge)
+
+                if target_lib_data:
+                    fragments = target_lib_data['fragments']
+                    
+                    # Extract fragment m/z and intensities
+                    lib_mz = np.array([frag['mz'] for frag in fragments])
+                    lib_intensity = np.array([frag['intensity'] for frag in fragments])
+                    
+                    # Preprocess library: sqrt(intensity) * mz^2
+                    lib_preprocessed = np.sqrt(lib_intensity) * (lib_mz ** 2)
+                    
+                    # Normalize library vector once
+                    lib_norm = np.linalg.norm(lib_preprocessed)
+                    if lib_norm > 0:
+                        lib_preprocessed_normalized = lib_preprocessed / lib_norm
+                        
+                        # Score against all spectra
+                        for spec_idx, exp_data in enumerate(experimental_preprocessed_lib):
+                            # Extract matching peaks using binary search with tolerance
+                            matched_exp = []
+                            matched_lib = []
+                            
+                            for lib_idx, lib_mz_val in enumerate(lib_mz):
+                                # Calculate tolerance window
+                                tol_da = lib_mz_val * lib_fragment_tol_ppm / 1e6
+                                mz_min = lib_mz_val - tol_da
+                                mz_max = lib_mz_val + tol_da
+                                
+                                # Binary search for matching peaks
+                                left_idx = np.searchsorted(exp_data['mz'], mz_min, side='left')
+                                right_idx = np.searchsorted(exp_data['mz'], mz_max, side='right')
+                                
+                                # Find best matching peak in tolerance window
+                                if left_idx < right_idx:
+                                    window_mz = exp_data['mz'][left_idx:right_idx]
+                                    window_intensity = exp_data['intensity_preprocessed'][left_idx:right_idx]
+                                    
+                                    # Use closest m/z match
+                                    best_idx = np.argmin(np.abs(window_mz - lib_mz_val))
+                                    matched_exp.append(window_intensity[best_idx])
+                                    matched_lib.append(lib_preprocessed_normalized[lib_idx])
+                            
+                            # Calculate cosine similarity
+                            if len(matched_exp) > 0:
+                                matched_exp = np.array(matched_exp)
+                                matched_lib = np.array(matched_lib)
+                                
+                                exp_norm = np.linalg.norm(matched_exp)
+                                if exp_norm > 0:
+                                    matched_exp_normalized = matched_exp / exp_norm
+                                    lib_cosine_matrix_target[pep_idx, spec_idx] = np.dot(matched_exp_normalized, matched_lib)
+
+                    # Generate and score decoy fragments
+                    decoy_lib_data = library.generate_decoy_fragments(peptide.sequence, charge, self)
+
+                    if decoy_lib_data:
+                        fragments_decoy = decoy_lib_data['fragments']
+                        
+                        # Extract fragment m/z and intensities
+                        lib_mz_decoy = np.array([frag['mz'] for frag in fragments_decoy])
+                        lib_intensity_decoy = np.array([frag['intensity'] for frag in fragments_decoy])
+                        
+                        # Preprocess library: sqrt(intensity) * mz^2
+                        lib_preprocessed_decoy = np.sqrt(lib_intensity_decoy) * (lib_mz_decoy ** 2)
+                        
+                        # Normalize library vector once
+                        lib_norm_decoy = np.linalg.norm(lib_preprocessed_decoy)
+                        if lib_norm_decoy > 0:
+                            lib_preprocessed_decoy_normalized = lib_preprocessed_decoy / lib_norm_decoy
+                            
+                            # Score against all spectra
+                            for spec_idx, exp_data in enumerate(experimental_preprocessed_lib):
+                                # Extract matching peaks
+                                matched_exp = []
+                                matched_lib = []
+                                
+                                for lib_idx, lib_mz_val in enumerate(lib_mz_decoy):
+                                    tol_da = lib_mz_val * lib_fragment_tol_ppm / 1e6
+                                    mz_min = lib_mz_val - tol_da
+                                    mz_max = lib_mz_val + tol_da
+                                    
+                                    left_idx = np.searchsorted(exp_data['mz'], mz_min, side='left')
+                                    right_idx = np.searchsorted(exp_data['mz'], mz_max, side='right')
+                                    
+                                    if left_idx < right_idx:
+                                        window_mz = exp_data['mz'][left_idx:right_idx]
+                                        window_intensity = exp_data['intensity_preprocessed'][left_idx:right_idx]
+                                        
+                                        best_idx = np.argmin(np.abs(window_mz - lib_mz_val))
+                                        matched_exp.append(window_intensity[best_idx])
+                                        matched_lib.append(lib_preprocessed_decoy_normalized[lib_idx])
+                                
+                                if len(matched_exp) > 0:
+                                    matched_exp = np.array(matched_exp)
+                                    matched_lib = np.array(matched_lib)
+                                    
+                                    exp_norm = np.linalg.norm(matched_exp)
+                                    if exp_norm > 0:
+                                        matched_exp_normalized = matched_exp / exp_norm
+                                        lib_cosine_matrix_decoy[pep_idx, spec_idx] = np.dot(matched_exp_normalized, matched_lib)
+
+            if verbose >= 1:
+                print("  DIA: Library scoring complete")
+
         chromatogram_data = []  # Unified chromatogram data with all information
         batch_size = 100  # Write every 100 peptides
         peptide_results = {}  # Track results for summary
         
-        for pep_idx, (peptide, charge, is_target, pair_id) in enumerate(peptides_in_window):
-            # Create peptide ID for this peptide
-            peptide_id = f"{peptide.sequence}_{charge}_{'T' if is_target else 'D'}"
+        # UNIFIED TARGET/DECOY COMPETITION:
+        # - With library: primary score is LibCosine
+        # - Without library: primary score is XCorr
+        # Both modes report only the winner
+        
+        primary_score_name = "LibCosine" if library is not None else "XCorr"
+        if verbose >= 1:
+            print(f"  DIA: Performing target/decoy competition using {primary_score_name} as primary score")
+        
+        # Process pairs (every two peptides form a target/decoy pair)
+        for pair_idx in range(0, len(peptides_in_window), 2):
+            if pair_idx + 1 >= len(peptides_in_window):
+                break  # Should not happen with proper pairing
             
-            # Extract XCorr scores for this peptide from the matrix (one row)
-            xcorr_raw_series = xcorr_matrix_raw[pep_idx, :].tolist()
+            # Get target and decoy from pair
+            target_peptide, target_charge, target_is_target, target_pair_id = peptides_in_window[pair_idx]
+            decoy_peptide, decoy_charge, decoy_is_target, decoy_pair_id = peptides_in_window[pair_idx + 1]
             
-            # Apply Savitzky-Golay smoothing to the raw XCorr chromatogram
-            if len(xcorr_raw_series) >= 5:
-                window_length = min(len(xcorr_raw_series), 7)
-                if window_length % 2 == 0:
-                    window_length -= 1  # Must be odd
-                xcorr_smoothed_series = savgol_filter(xcorr_raw_series, window_length=window_length, polyorder=2)
+            # Verify this is a proper target/decoy pair
+            if not target_is_target or decoy_is_target or target_pair_id != decoy_pair_id:
+                print(f"Warning: Improper pairing at index {pair_idx}")
+                continue
+            
+            # Get XCorr series for both
+            target_xcorr = xcorr_matrix_raw[pair_idx, :].tolist()
+            decoy_xcorr = xcorr_matrix_raw[pair_idx + 1, :].tolist()
+            
+            # Determine primary scores for competition
+            if library is not None:
+                # Library mode: use LibCosine as primary score
+                target_lib = lib_cosine_matrix_target[pair_idx, :].tolist()
+                decoy_lib = lib_cosine_matrix_decoy[pair_idx, :].tolist()
+                
+                target_primary_score = max(target_lib)
+                decoy_primary_score = max(decoy_lib)
+                target_primary_idx = target_lib.index(target_primary_score)
+                decoy_primary_idx = decoy_lib.index(decoy_primary_score)
             else:
-                # Not enough points to smooth - use raw values
-                xcorr_smoothed_series = xcorr_raw_series
+                # No library: use XCorr as primary score
+                target_primary_score = max(target_xcorr)
+                decoy_primary_score = max(decoy_xcorr)
+                target_primary_idx = target_xcorr.index(target_primary_score)
+                decoy_primary_idx = decoy_xcorr.index(decoy_primary_score)
+                target_lib = None
+                decoy_lib = None
             
-            # Find best scores (both raw and smoothed)
-            best_raw_xcorr = max(xcorr_raw_series)
-            best_raw_idx = xcorr_raw_series.index(best_raw_xcorr)
+            # **PERFORM TARGET/DECOY COMPETITION ON PRIMARY SCORE**
+            # Winner is the one with higher primary score
+            if target_primary_score > decoy_primary_score:
+                # TARGET WINS
+                winner_is_target = True
+                winner_peptide = target_peptide
+                winner_sequence = target_peptide.sequence
+                winner_xcorr_series = target_xcorr
+                winner_primary_idx = target_primary_idx
+                winner_primary_score = target_primary_score
+                winner_lib_series = target_lib  # None if no library
+            elif decoy_primary_score > target_primary_score:
+                # DECOY WINS
+                winner_is_target = False
+                winner_peptide = decoy_peptide
+                winner_sequence = decoy_peptide.sequence  # Decoy sequence
+                winner_xcorr_series = decoy_xcorr
+                winner_primary_idx = decoy_primary_idx
+                winner_primary_score = decoy_primary_score
+                winner_lib_series = decoy_lib  # None if no library
+            else:
+                # TIE - default to decoy wins (conservative for FDR)
+                winner_is_target = False
+                winner_peptide = decoy_peptide
+                winner_sequence = decoy_peptide.sequence
+                winner_xcorr_series = decoy_xcorr
+                winner_primary_idx = decoy_primary_idx
+                winner_primary_score = decoy_primary_score
+                winner_lib_series = decoy_lib
             
-            best_smoothed_xcorr = max(xcorr_smoothed_series)
-            best_smoothed_idx = list(xcorr_smoothed_series).index(best_smoothed_xcorr)
+            # **EXTRACT METRICS AT PRIMARY SCORE PEAK LOCATION**
+            peak_scan_id, peak_rt, peak_spec_idx = spectrum_metadata[winner_primary_idx]
+            peak_xcorr = winner_xcorr_series[winner_primary_idx]
             
-            best_raw_scan_id, best_raw_rt, _ = spectrum_metadata[best_raw_idx]
-            best_smoothed_scan_id, best_smoothed_rt, _ = spectrum_metadata[best_smoothed_idx]
+            # Calculate e-value only for non-library mode
+            # Library mode: XCorr is only calculated at LibCosine peak, e-value not meaningful
+            # Non-library mode: XCorr is primary score, e-value is meaningful
+            if library is None:
+                temp_engine = FastXCorr()
+                peak_e_value = temp_engine.calculate_e_value(winner_xcorr_series, peak_xcorr)
+            else:
+                peak_e_value = 0.0  # Not applicable in library mode
             
-            # Store XCorr chromatogram data (minimal schema - just the time series)
-            for spec_idx, (xcorr_raw, xcorr_smoothed) in enumerate(zip(xcorr_raw_series, xcorr_smoothed_series)):
+            # Calculate precursor isotope score at primary score peak (if library and MS1 available)
+            precursor_cosine = 0.0
+            if library is not None and ms1_spectra is not None:
+                closest_ms1 = FastXCorr.find_closest_ms1(ms1_spectra, peak_rt)
+                if closest_ms1 is not None:
+                    # Use target sequence for isotope pattern (same mass for target/decoy)
+                    lib_data = library.get_precursor(target_peptide.sequence, target_charge)
+                    if lib_data:
+                        experimental_isotopes = FastXCorr.extract_isotope_envelope(
+                            closest_ms1,
+                            lib_data['precursor_mz'],
+                            target_charge,
+                            lib_precursor_tol_ppm
+                        )
+                        theoretical_isotopes = FastXCorr.predict_isotope_pattern(
+                            target_peptide.sequence, target_charge, self.aa_masses
+                        )
+                        precursor_cosine = FastXCorr.calculate_cosine_angle(
+                            experimental_isotopes, theoretical_isotopes
+                        )
+            
+            # Calculate Z-scores
+            xcorr_zscore = 0.0
+            if len(winner_xcorr_series) > 1:
+                xcorr_mean = np.mean(winner_xcorr_series)
+                xcorr_std = np.std(winner_xcorr_series, ddof=1)
+                if xcorr_std > 0:
+                    xcorr_zscore = (peak_xcorr - xcorr_mean) / xcorr_std
+            
+            lib_zscore = 0.0
+            if winner_lib_series is not None and len(winner_lib_series) > 1:
+                lib_mean = np.mean(winner_lib_series)
+                lib_std = np.std(winner_lib_series, ddof=1)
+                if lib_std > 0:
+                    lib_zscore = (winner_primary_score - lib_mean) / lib_std
+            
+            # Store chromatogram data for winner only
+            winner_peptide_id = f"{winner_sequence}_{target_charge}_{'T' if winner_is_target else 'D'}"
+            for spec_idx in range(len(winner_xcorr_series)):
                 scan_id, rt_minutes, _ = spectrum_metadata[spec_idx]
-                chromatogram_data.append({
-                    # Peptide identification (minimal - just enough to link back)
-                    'peptide_id': peptide_id,
-                    'peptide_sequence': peptide.sequence,
-                    'charge': charge,
-                    'is_target': is_target,
-                    
-                    # Spectrum identification
+                chrom_entry = {
+                    'peptide_id': winner_peptide_id,
+                    'peptide_sequence': winner_sequence,
+                    'charge': target_charge,
+                    'is_target': winner_is_target,
                     'scan_id': scan_id,
-                    'retention_time': rt_minutes,  # RT in minutes
-                    
-                    # XCorr time series data
-                    'xcorr_raw': xcorr_raw,
-                    'xcorr_smoothed': xcorr_smoothed,
-                })
+                    'retention_time': rt_minutes,
+                    'xcorr_raw': winner_xcorr_series[spec_idx],
+                    'xcorr_smoothed': winner_xcorr_series[spec_idx],  # No smoothing
+                }
+                # Add library scores if available
+                if winner_lib_series is not None:
+                    chrom_entry['lib_cosine_target'] = winner_lib_series[spec_idx]
+                    chrom_entry['lib_cosine_decoy'] = 0.0  # Not used in winner-only mode
+                chromatogram_data.append(chrom_entry)
             
-            # Store result for this peptide (summary statistics)
-            key = (peptide.sequence, charge, is_target)
-            peptide_results[key] = {
-                'peptide': peptide,
-                'charge': charge,
-                'is_target': is_target,
-                'best_xcorr': best_raw_xcorr,
-                'best_rt': best_raw_rt,
-                'best_scan': best_raw_scan_id,
-                'best_spectrum_idx': best_raw_idx,
-                'best_smoothed_xcorr': best_smoothed_xcorr,
-                'best_smoothed_rt': best_smoothed_rt,
-                'best_smoothed_scan': best_smoothed_scan_id,
-                'best_smoothed_spectrum_idx': best_smoothed_idx,
-                'all_xcorr_values': xcorr_raw_series,  # Raw values for e-value
-                'all_smoothed_xcorr_values': list(xcorr_smoothed_series),  # Smoothed values
-                'isolation_window': isolation_window
+            # Store result for winner only
+            key = (winner_sequence, target_charge, winner_is_target)
+            result_dict = {
+                'peptide': winner_peptide,
+                'charge': target_charge,
+                'is_target': winner_is_target,
+                'pair_id': target_pair_id,
+                'best_xcorr': peak_xcorr,  # XCorr at primary score peak
+                'best_rt': peak_rt,  # RT at primary score peak
+                'best_scan': peak_scan_id,  # Scan at primary score peak
+                'best_spectrum_idx': peak_spec_idx,
+                'best_smoothed_xcorr': peak_xcorr,  # Same (no smoothing)
+                'best_smoothed_rt': peak_rt,
+                'best_smoothed_scan': peak_scan_id,
+                'best_smoothed_spectrum_idx': peak_spec_idx,
+                'all_xcorr_values': winner_xcorr_series,
+                'all_smoothed_xcorr_values': winner_xcorr_series,  # Same (no smoothing)
+                'isolation_window': isolation_window,
+                'e_value': peak_e_value,
+                'num_spectra_scored': len(winner_xcorr_series),
+                'xcorr_zscore': xcorr_zscore,
             }
             
-            # Write batch to Parquet incrementally (unified schema)
-            if (pep_idx + 1) % batch_size == 0 or (pep_idx + 1) == len(peptides_in_window):
-                # Create DataFrame with unified schema
+            # Add library-specific fields if library present
+            if library is not None:
+                result_dict['best_lib_cosine_target'] = winner_primary_score
+                result_dict['best_lib_cosine_target_rt'] = peak_rt
+                result_dict['best_lib_cosine_target_scan'] = peak_scan_id
+                result_dict['all_lib_cosine_target_values'] = winner_lib_series
+                result_dict['lib_cosine_target_zscore'] = lib_zscore
+                result_dict['precursor_cosine_target'] = precursor_cosine
+            
+            peptide_results[key] = result_dict
+            
+            # Write batch to Parquet incrementally
+            if (pair_idx + 2) % (batch_size * 2) == 0 or (pair_idx + 2) >= len(peptides_in_window):
                 chrom_df = pd.DataFrame(chromatogram_data)
-                
-                if pep_idx < batch_size:
-                    # First batch - create file
+                if pair_idx < batch_size * 2:
                     chrom_df.to_parquet(parquet_output, engine='pyarrow', index=False)
                 else:
-                    # Subsequent batches - append
                     existing_chrom = pd.read_parquet(parquet_output)
                     combined_chrom = pd.concat([existing_chrom, chrom_df], ignore_index=True)
                     combined_chrom.to_parquet(parquet_output, engine='pyarrow', index=False)
                 
-                # Only print batch progress if verbose >= 1
                 if verbose >= 1:
-                    print(f"  DIA: Processed {pep_idx + 1}/{len(peptides_in_window)} peptides, wrote batch to {parquet_output}")
-                chromatogram_data = []  # Clear batch
+                    print(f"  DIA: Processed {(pair_idx + 2)//2}/{len(peptides_in_window)//2} pairs, wrote batch")
+                chromatogram_data = []
         
         # Show completion at verbose=0 (always show, once per window)
         window_elapsed = time.time() - window_start_time
-        print(f"  DIA: Completed window {window_str}: {len(peptides_in_window)} peptides scored in {window_elapsed/60:.2f} min")
-        
-        # Calculate e-values for each peptide using the same Comet algorithm as spectrum-centric
-        # For peptide-centric: frequency distribution of spectrum scores that match a given peptide
-        # For spectrum-centric: frequency distribution of peptide scores that match a given spectrum
-        # Same statistical method, just inverted perspective
-        if verbose >= 1:
-            print(f"  DIA: Calculating e-values for isolation window {window_str}")
-        
-        # Create a temporary FastXCorr instance to use calculate_e_value method
-        temp_engine = FastXCorr()
-        
-        for key, result in peptide_results.items():
-            all_xcorrs = result['all_xcorr_values']  # Distribution of spectrum scores for this peptide
-            best_xcorr = result['best_xcorr']  # Best score from this distribution
-            
-            # Use the same Comet E-value calculation as spectrum-centric search
-            # This gives proper statistical significance based on score distribution
-            e_value = temp_engine.calculate_e_value(all_xcorrs, best_xcorr)
-            
-            result['e_value'] = e_value
-            result['num_spectra_scored'] = len(all_xcorrs)
-        
+        pairs_or_peptides = len(peptides_in_window) // 2 if library is not None else len(peptides_in_window)
+        print(f"  DIA: Completed window {window_str}: {pairs_or_peptides} {'pairs' if library is not None else 'peptides'} processed in {window_elapsed/60:.2f} min")
+
         return {
             'results': peptide_results,
             'parquet_file': parquet_output,
@@ -1855,6 +2473,221 @@ class FastXCorr:
             'num_peptides': len(peptides_in_window),
             'isolation_window': isolation_window
         }
+
+    @staticmethod
+    def predict_isotope_pattern(sequence: str, charge: int, aa_masses: Dict[str, float]) -> np.ndarray:
+        """
+        Predict isotope pattern intensities for M-1, M+0, M+1, M+2, M+3.
+
+        Uses averagine model for rapid isotope distribution estimation.
+
+        Args:
+            sequence: Peptide sequence
+            charge: Precursor charge state
+            aa_masses: Amino acid masses dict (with modifications applied)
+
+        Returns:
+            np.array of 5 intensities [M-1, M+0, M+1, M+2, M+3], normalized to sum=1
+            M-1 is always 0.0 (theoretical)
+        """
+        # Calculate peptide mass
+        mass = sum(aa_masses.get(aa, 0) for aa in sequence)
+        mass += 18.010565  # Add H2O for neutral mass
+
+        # Simple averagine-based isotope distribution
+        # Averagine approximation: C4.9384 H7.7583 N1.3577 O1.4773 S0.0417 (110.5 Da)
+        # For most peptides, use empirical model based on mass
+
+        # Calculate number of carbon atoms (approximate)
+        num_carbons = mass / 110.5 * 4.9384
+
+        # Natural isotope abundance: C13 = 1.07%, N15 = 0.37%
+        # For simplicity, use carbon contribution (dominant)
+        p_c13 = 0.0107  # Probability of C13
+
+        # Binomial distribution for isotope peaks
+        # M+0: all C12
+        # M+1: one C13
+        # M+2: two C13
+        # M+3: three C13
+
+        from scipy.special import comb
+
+        intensities = np.zeros(5)
+        intensities[0] = 0.0  # M-1 is always 0
+
+        # Calculate probabilities using binomial distribution
+        p_c12 = 1 - p_c13
+        for k in range(4):  # M+0, M+1, M+2, M+3
+            intensities[k + 1] = comb(num_carbons, k, exact=False) * (p_c13 ** k) * (p_c12 ** (num_carbons - k))
+
+        # Normalize (excluding M-1 which is 0)
+        total = intensities[1:].sum()
+        if total > 0:
+            intensities[1:] /= total
+
+        return intensities
+
+    @staticmethod
+    def calculate_isotope_mz_values(precursor_mz: float, charge: int) -> np.ndarray:
+        """
+        Calculate m/z values for M-1, M+0, M+1, M+2, M+3 isotope peaks.
+
+        Args:
+            precursor_mz: Monoisotopic precursor m/z (M+0)
+            charge: Precursor charge state
+
+        Returns:
+            np.array of 5 m/z values [M-1, M+0, M+1, M+2, M+3]
+        """
+        neutron_mass = 1.002868  # Mass difference between isotopes
+        isotope_gap = neutron_mass / charge
+
+        mz_values = np.array([
+            precursor_mz - isotope_gap,    # M-1
+            precursor_mz,                  # M+0 (monoisotopic)
+            precursor_mz + isotope_gap,    # M+1
+            precursor_mz + 2 * isotope_gap, # M+2
+            precursor_mz + 3 * isotope_gap  # M+3
+        ])
+
+        return mz_values
+
+    @staticmethod
+    def extract_isotope_envelope(ms1_spectrum: MS1Spectrum, precursor_mz: float,
+                                 charge: int, tolerance_ppm: float = 10.0) -> np.ndarray:
+        """
+        Extract isotope envelope intensities from MS1 spectrum.
+
+        Args:
+            ms1_spectrum: MS1Spectrum object
+            precursor_mz: Monoisotopic precursor m/z
+            charge: Precursor charge state
+            tolerance_ppm: m/z matching tolerance in ppm
+
+        Returns:
+            np.array of 5 extracted intensities [M-1, M+0, M+1, M+2, M+3]
+            Returns 0 for unmatched peaks
+        """
+        # Calculate expected m/z values
+        expected_mz = FastXCorr.calculate_isotope_mz_values(precursor_mz, charge)
+
+        # Extract intensities
+        extracted_intensities = np.zeros(5)
+
+        for i, target_mz in enumerate(expected_mz):
+            # Find matching peak in MS1
+            matched_intensity = 0.0
+
+            for j, obs_mz in enumerate(ms1_spectrum.mz_array):
+                # Calculate ppm error
+                ppm_error = abs(obs_mz - target_mz) / target_mz * 1e6
+
+                if ppm_error <= tolerance_ppm:
+                    # Match found
+                    matched_intensity = max(matched_intensity, ms1_spectrum.intensity_array[j])
+
+            extracted_intensities[i] = matched_intensity
+
+        return extracted_intensities
+
+    @staticmethod
+    def calculate_cosine_angle(vec1: np.ndarray, vec2: np.ndarray) -> float:
+        """
+        Calculate cosine angle between two vectors.
+
+        Formula: cos(θ) = dot(v1, v2) / (||v1|| * ||v2||)
+
+        Args:
+            vec1: First vector (e.g., experimental intensities)
+            vec2: Second vector (e.g., library intensities)
+
+        Returns:
+            Cosine angle (0 to 1), or 0 if either vector has zero norm
+        """
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+
+        cos_angle = np.dot(vec1, vec2) / (norm1 * norm2)
+
+        # Clamp to [0, 1] to handle numerical errors
+        return max(0.0, min(1.0, cos_angle))
+
+    @staticmethod
+    def match_fragments_ppm(experimental_mz: np.ndarray, experimental_intensity: np.ndarray,
+                           library_fragments: List[Dict], tolerance_ppm: float = 10.0) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Match experimental fragments to library fragments using ppm tolerance.
+
+        Args:
+            experimental_mz: Experimental m/z array
+            experimental_intensity: Experimental intensity array
+            library_fragments: List of library fragment dicts with 'mz' and 'intensity'
+            tolerance_ppm: m/z matching tolerance in ppm
+
+        Returns:
+            (matched_exp_intensities, matched_lib_intensities)
+            Arrays of matched intensities in corresponding order
+        """
+        matched_exp = []
+        matched_lib = []
+
+        for lib_frag in library_fragments:
+            lib_mz = lib_frag['mz']
+            lib_intensity = lib_frag['intensity']
+
+            # Find best matching experimental peak
+            best_intensity = 0.0
+
+            for exp_mz, exp_intensity in zip(experimental_mz, experimental_intensity):
+                ppm_error = abs(exp_mz - lib_mz) / lib_mz * 1e6
+
+                if ppm_error <= tolerance_ppm:
+                    best_intensity = max(best_intensity, exp_intensity)
+
+            # Include this fragment (0 intensity if not matched)
+            matched_exp.append(best_intensity)
+            matched_lib.append(lib_intensity)
+
+        return np.array(matched_exp), np.array(matched_lib)
+
+    @staticmethod
+    def calculate_library_cosine_score(experimental_mz: np.ndarray, experimental_intensity: np.ndarray,
+                                      library_fragments: List[Dict], tolerance_ppm: float = 10.0) -> float:
+        """
+        Calculate library cosine score with SMZ preprocessing.
+
+        SMZ preprocessing: preprocessed_intensity = sqrt(intensity) * mz^2
+
+        Args:
+            experimental_mz: Experimental m/z array
+            experimental_intensity: Experimental intensity array
+            library_fragments: List of library fragment dicts
+            tolerance_ppm: Fragment m/z tolerance in ppm
+
+        Returns:
+            Cosine angle score (0 to 1)
+        """
+        # Match fragments
+        matched_exp, matched_lib = FastXCorr.match_fragments_ppm(
+            experimental_mz, experimental_intensity, library_fragments, tolerance_ppm
+        )
+
+        if len(matched_exp) == 0:
+            return 0.0
+
+        # Get corresponding m/z values for matched fragments
+        matched_mz = np.array([frag['mz'] for frag in library_fragments])
+
+        # Apply SMZ preprocessing: sqrt(intensity) * mz^2
+        exp_preprocessed = np.sqrt(matched_exp) * (matched_mz ** 2)
+        lib_preprocessed = np.sqrt(matched_lib) * (matched_mz ** 2)
+
+        # Calculate cosine angle
+        return FastXCorr.calculate_cosine_angle(exp_preprocessed, lib_preprocessed)
 
 
 class PepXMLWriter:
@@ -2114,10 +2947,13 @@ class PINWriter:
 class DIAResultsWriter:
     """Class to write DIA peptide-centric search results."""
     
-    def __init__(self, output_file: str, mzml_file: str):
+    def __init__(self, output_file: str, mzml_file: str, write_lock=None, library_mode=False):
         self.output_file = output_file
         self.mzml_file = mzml_file
         self.file_handle = None
+        self.write_lock = write_lock  # Optional lock for thread-safe writing
+        self.library_mode = library_mode  # Whether using library search
+        self.header_written = False
         
     def __enter__(self):
         self.file_handle = open(self.output_file, 'w')
@@ -2128,12 +2964,29 @@ class DIAResultsWriter:
         if self.file_handle:
             self.file_handle.close()
     
+    def open_for_append(self):
+        """Open file for appending (for incremental writes from multiple workers)."""
+        self.file_handle = open(self.output_file, 'a')
+    
+    def close(self):
+        """Close file handle."""
+        if self.file_handle:
+            self.file_handle.close()
+            self.file_handle = None
+    
     def _write_header(self):
         """Write DIA results header."""
-        header = "Peptide\tCharge\tProteinID\tMass\tIsTarget\tIsolationWindow\t"
-        header += "BestXCorrRaw\tBestXCorrSmoothed\tBestRT\tBestScan\t"
-        header += "EValue\tNumSpectraScored\t"
-        header += "XCorrZScore\n"
+        if self.library_mode:
+            # Library mode: simplified columns (no PairID, single XCorr at LibCosine peak)
+            header = "Peptide\tCharge\tProteinID\tMass\tIsTarget\tIsolationWindow\t"
+            header += "NumSpectraScored\tLibCosine\tLibCosineZScore\tXCorr\tRT\tScanID\t"
+            header += "PrecursorCosine\n"
+        else:
+            # Non-library mode: XCorr-based search with e-value
+            header = "Peptide\tCharge\tProteinID\tMass\tIsTarget\tIsolationWindow\t"
+            header += "BestXCorr\tBestRT\tBestScan\t"
+            header += "EValue\tNumSpectraScored\tXCorrZScore\n"
+        
         self.file_handle.write(header)
     
     def write_dia_results(self, results: Dict):
@@ -2143,7 +2996,7 @@ class DIAResultsWriter:
         Args:
             results: Dictionary from search_dia_peptide_centric
                      Keys: (peptide_sequence, charge, is_target)
-                     Values: dict with peptide info, scores, and e-value
+                     Values: dict with peptide info, scores, e-value, and pair_id
         """
         for (peptide_sequence, charge, is_target), result in results.items():
             # Basic peptide info
@@ -2151,71 +3004,97 @@ class DIAResultsWriter:
             isolation_window = result['isolation_window']
             window_str = f"[{isolation_window[0]:.4f}-{isolation_window[1]:.4f}]"
             
-            # Best scores - both raw and smoothed XCorr
-            best_xcorr_raw = result['best_xcorr']
-            best_xcorr_smoothed = result['best_smoothed_xcorr']
-            best_rt_smoothed = result['best_smoothed_rt']
-            best_scan_smoothed = result['best_smoothed_scan']
-            
-            # E-value (one value per peptide, based on raw XCorr distribution)
-            e_value = result['e_value']
+            # Number of spectra scored
             num_spectra = result['num_spectra_scored']
             
-            # Calculate Z-score (standard score) from raw XCorr values
-            # Z-score = (best_score - mean) / std_dev
-            # This measures how many standard deviations the best score is above the mean
-            all_xcorrs_raw = result['all_xcorr_values']
-            mean_xcorr = sum(all_xcorrs_raw) / len(all_xcorrs_raw) if all_xcorrs_raw else 0.0
-            
-            # Standard deviation
-            if len(all_xcorrs_raw) > 1:
-                variance = sum((x - mean_xcorr)**2 for x in all_xcorrs_raw) / len(all_xcorrs_raw)
-                std_xcorr = variance ** 0.5
-            else:
-                std_xcorr = 0.0
-            
-            # Calculate Z-score
-            if std_xcorr > 0:
-                z_score = (best_xcorr_raw - mean_xcorr) / std_xcorr
-            else:
-                z_score = 0.0  # No variation in scores
-            
-            # Write line with peptide summary statistics
-            # For RT and Scan, report the smoothed version (typically more reliable)
+            # IsTarget string
             target_str = "Target" if is_target else "Decoy"
-            line = f"{peptide_sequence}\t{charge}\t{peptide.protein_id}\t{peptide.mass:.6f}\t{target_str}\t{window_str}\t"
-            line += f"{best_xcorr_raw:.4f}\t{best_xcorr_smoothed:.4f}\t{best_rt_smoothed:.2f}\t{best_scan_smoothed}\t"
-            line += f"{e_value:.6e}\t{num_spectra}\t"  # Use scientific notation for e-values
-            line += f"{z_score:.4f}\n"
             
+            if self.library_mode:
+                # Library mode: simplified output with single XCorr at LibCosine peak
+                # Peptide  Charge  ProteinID  Mass  IsTarget  IsolationWindow  NumSpectraScored
+                # LibCosine  LibCosineZScore  XCorr  RT  ScanID  PrecursorCosine
+                
+                lib_cosine = result['best_lib_cosine_target']
+                lib_zscore = result['lib_cosine_target_zscore']
+                xcorr = result['best_xcorr']  # XCorr at LibCosine peak
+                rt = result['best_rt']  # RT at LibCosine peak
+                scan = result['best_scan']  # Scan at LibCosine peak
+                precursor_cosine = result['precursor_cosine_target']
+                
+                line = f"{peptide_sequence}\t{charge}\t{peptide.protein_id}\t{peptide.mass:.6f}\t{target_str}\t{window_str}\t"
+                line += f"{num_spectra}\t{lib_cosine:.4f}\t{lib_zscore:.4f}\t{xcorr:.4f}\t{rt:.2f}\t{scan}\t"
+                line += f"{precursor_cosine:.4f}\n"
+                
+            else:
+                # Non-library mode: XCorr-based search with e-value and Z-score
+                best_xcorr = result['best_xcorr']
+                best_rt = result['best_rt']
+                best_scan = result['best_scan']
+                e_value = result['e_value']
+                
+                # Calculate XCorr Z-score from distribution
+                all_xcorrs = result['all_xcorr_values']
+                mean_xcorr = sum(all_xcorrs) / len(all_xcorrs) if all_xcorrs else 0.0
+                
+                if len(all_xcorrs) > 1:
+                    variance = sum((x - mean_xcorr)**2 for x in all_xcorrs) / len(all_xcorrs)
+                    std_xcorr = variance ** 0.5
+                    z_score = (best_xcorr - mean_xcorr) / std_xcorr if std_xcorr > 0 else 0.0
+                else:
+                    z_score = 0.0
+                
+                line = f"{peptide_sequence}\t{charge}\t{peptide.protein_id}\t{peptide.mass:.6f}\t{target_str}\t{window_str}\t"
+                line += f"{best_xcorr:.4f}\t{best_rt:.2f}\t{best_scan}\t"
+                line += f"{e_value:.6e}\t{num_spectra}\t{z_score:.4f}\n"
+
             self.file_handle.write(line)
-        
-        self.file_handle.flush()
+    
+    def write_dia_results_synchronized(self, results: Dict):
+        """
+        Write DIA results with thread-safe locking for parallel workers.
+        Opens file in append mode, acquires lock, writes, then closes.
+        """
+        if self.write_lock:
+            with self.write_lock:
+                self.open_for_append()
+                self.write_dia_results(results)
+                self.file_handle.flush()  # Ensure data is written
+                self.close()
+        else:
+            # No lock provided, just write directly
+            self.write_dia_results(results)
+            if self.file_handle:
+                self.file_handle.flush()
 
 
 # Worker function for parallel processing of isolation windows
 def process_isolation_window_worker(args):
     """
     Worker function to process one isolation window in parallel.
-    
+
     This function is designed to be called by multiprocessing.Pool.
     Each worker creates its own FastXCorr instance to avoid pickling issues.
-    
+
     Args:
         args: Tuple of (window_idx, total_windows, isolation_window, window_spectra,
                        fasta_file, target_decoy_pairs, charge_states,
-                       parquet_file, enzyme, decoy_cycle_length, verbose)
-    
+                       parquet_file, enzyme, decoy_cycle_length,
+                       library_path, ms1_spectra, lib_fragment_tol_ppm, lib_precursor_tol_ppm,
+                       verbose)
+
     Returns:
         Dictionary with search results and metadata
     """
     (window_idx, total_windows, isolation_window, window_spectra,
      fasta_file, target_decoy_pairs_data, charge_states,
-     parquet_file, enzyme, decoy_cycle_length, verbose) = args
-    
+     parquet_file, enzyme, decoy_cycle_length,
+     library_path, ms1_spectra, lib_fragment_tol_ppm, lib_precursor_tol_ppm,
+     verbose) = args
+
     # Create a fresh FastXCorr instance for this worker process
     xcorr_engine = FastXCorr()
-    
+
     # Reconstruct target_decoy_pairs from serialized data
     # (PeptideCandidate objects need to be reconstructed)
     target_decoy_pairs = []
@@ -2231,27 +3110,38 @@ def process_isolation_window_worker(args):
             mass=decoy_data['mass']
         )
         target_decoy_pairs.append((target, decoy))
-    
+
+    # Load library if provided
+    library = None
+    if library_path:
+        library = SpectrumLibrary(library_path, verbose=False)
+        # Print informative message about which window is being processed
+        print(f"  Loaded library {library_path.split('/')[-1]} for isolation window {window_idx+1} of {total_windows}")
+
     # Only print worker start message if verbose >= 1
     if verbose >= 1:
         print(f"\n[Worker {window_idx+1}/{total_windows}] Processing isolation window: "
               f"[{isolation_window[0]:.4f}-{isolation_window[1]:.4f}] m/z, "
               f"{len(window_spectra)} spectra")
-    
+
     # Perform DIA peptide-centric search
     search_result = xcorr_engine.search_dia_peptide_centric(
         window_spectra,
         target_decoy_pairs,
         charge_states,
         parquet_output=parquet_file,
+        library=library,
+        ms1_spectra=ms1_spectra,
+        lib_fragment_tol_ppm=lib_fragment_tol_ppm,
+        lib_precursor_tol_ppm=lib_precursor_tol_ppm,
         verbose=verbose
     )
-    
+
     # Only print completion message if verbose >= 1
     if verbose >= 1:
         print(f"[Worker {window_idx+1}/{total_windows}] Completed: "
               f"{len(search_result['results'])} peptide-charge combinations")
-    
+
     return search_result
 
 
@@ -2292,7 +3182,18 @@ def main():
                        help='Mass bin width in Th for spectrum binning (default: 1.0005079, Comet default)')
     parser.add_argument('--bin_offset', '-bo', type=float, default=0.4,
                        help='Bin offset for mass binning calculation (default: 0.4, Comet default)')
-    
+    # Library-related arguments
+    parser.add_argument('--speclib', type=str, default='',
+                       help='DIA-NN spectrum library file (parquet format) for library-based scoring')
+    parser.add_argument('--lib_fragment_tol', type=float, default=10.0,
+                       help='Fragment m/z tolerance for library matching (default: 10.0 ppm)')
+    parser.add_argument('--lib_fragment_tol_unit', type=str, default='ppm', choices=['ppm', 'mz'],
+                       help='Fragment tolerance unit: ppm or mz (default: ppm)')
+    parser.add_argument('--lib_precursor_tol', type=float, default=10.0,
+                       help='Precursor m/z tolerance for MS1 isotope matching (default: 10.0 ppm)')
+    parser.add_argument('--lib_precursor_tol_unit', type=str, default='ppm', choices=['ppm', 'mz'],
+                       help='Precursor tolerance unit: ppm or mz (default: ppm)')
+
     args = parser.parse_args()
     
     # Parse static modifications
@@ -2356,20 +3257,98 @@ def main():
         base_name = os.path.splitext(args.mzml_file)[0]
         args.pin_output = base_name + '.pin'
     
-    print("Reading FASTA file...")
-    proteins = xcorr_engine.read_fasta(args.fasta_file)
-    print(f"Loaded {len(proteins)} proteins")
+    # Check if using spectrum library for DIA mode - load it early to set defaults
+    library_mode = args.dia_mode and args.speclib
     
-    print("Digesting proteins...")
-    all_target_peptides = []
-    for protein_id, sequence in proteins.items():
-        peptides = xcorr_engine.digest_protein(sequence, protein_id, 
-                                               enzyme=args.enzyme, 
-                                               missed_cleavages=args.missed_cleavages,
-                                               min_length=args.min_peptide_length,
-                                               max_length=args.max_peptide_length)
-        all_target_peptides.extend(peptides)
-    print(f"Generated {len(all_target_peptides)} target peptide candidates")
+    if library_mode:
+        print(f"\nLoading spectrum library: {args.speclib}")
+        library = SpectrumLibrary(args.speclib)
+        
+        # Extract unique peptide sequences and metadata from library
+        print("Extracting peptides from spectrum library...")
+        library_sequences = set()
+        library_charge_states = set()
+        library_peptide_lengths = []
+        
+        for (sequence, charge), precursor_data in library.peptide_index.items():
+            library_sequences.add(sequence)
+            library_charge_states.add(int(charge))  # Convert numpy int64 to Python int
+            library_peptide_lengths.append(len(sequence))
+        
+        print(f"  Found {len(library_sequences)} unique peptide sequences in library")
+        
+        # Set peptide length range from library if not explicitly set by user
+        # Check if user provided non-default values
+        user_set_min = '--min_peptide_length' in sys.argv
+        user_set_max = '--max_peptide_length' in sys.argv
+        
+        if library_peptide_lengths:
+            lib_min_length = min(library_peptide_lengths)
+            lib_max_length = max(library_peptide_lengths)
+            
+            if not user_set_min:
+                args.min_peptide_length = lib_min_length
+            if not user_set_max:
+                args.max_peptide_length = lib_max_length
+            
+            print(f"  Library peptide length range: {lib_min_length}-{lib_max_length}")
+            if user_set_min or user_set_max:
+                print(f"  Using command-line length range: {args.min_peptide_length}-{args.max_peptide_length}")
+        
+        # Handle charge states: use command-line if specified, otherwise use library defaults
+        if args.charge_states == '2,3':  # Default value - use library charges
+            charge_states = sorted(library_charge_states)
+            print(f"  Using library charge states: {charge_states}")
+        else:
+            # Command-line override - filter to only library charges that were requested
+            requested_charges = set(charge_states)
+            available_charges = requested_charges & library_charge_states
+            if not available_charges:
+                print(f"  WARNING: Requested charges {charge_states} not in library {sorted(library_charge_states)}")
+                print(f"  Using library charge states instead: {sorted(library_charge_states)}")
+                charge_states = sorted(library_charge_states)
+            else:
+                charge_states = sorted(available_charges)
+                print(f"  Restricting to requested charge states: {charge_states}")
+    
+    # For library mode, skip FASTA reading and protein mapping
+    # We'll map high-scoring peptides to proteins after scoring
+    if library_mode:
+        print("\n*** Library-based search: Skipping FASTA digestion ***")
+        print("  Proteins will be mapped after scoring for high-confidence peptides")
+        
+        # Create PeptideCandidate objects for library peptides without protein mapping
+        print("  Creating peptide candidates from library...")
+        all_target_peptides = []
+        for sequence in library_sequences:
+            # Skip length filtering - library defines the peptides
+            # Use generic protein ID - will be mapped later for significant hits
+            protein_id = f"LIBRARY_{sequence}"
+            mass = xcorr_engine.calculate_peptide_mass(sequence)
+            peptide = PeptideCandidate(sequence, protein_id, mass)
+            all_target_peptides.append(peptide)
+        
+        print(f"  Created {len(all_target_peptides)} library peptide candidates")
+        
+        # Store proteins for later mapping, but don't process now
+        proteins = None
+    else:
+        # Standard FASTA-based search workflow
+        print("Reading FASTA file...")
+        proteins = xcorr_engine.read_fasta(args.fasta_file)
+        print(f"Loaded {len(proteins)} proteins")
+        
+        # Digest proteins to generate peptide candidates
+        print("Digesting proteins...")
+        all_target_peptides = []
+        for protein_id, sequence in proteins.items():
+            peptides = xcorr_engine.digest_protein(sequence, protein_id, 
+                                                   enzyme=args.enzyme, 
+                                                   missed_cleavages=args.missed_cleavages,
+                                                   min_length=args.min_peptide_length,
+                                                   max_length=args.max_peptide_length)
+            all_target_peptides.extend(peptides)
+        print(f"Generated {len(all_target_peptides)} target peptide candidates")
     
     print("Making peptide list non-redundant...")
     non_redundant_targets = xcorr_engine.make_peptides_non_redundant(all_target_peptides)
@@ -2392,18 +3371,29 @@ def main():
         print("\n*** DIA PEPTIDE-CENTRIC SEARCH MODE ***")
         print("Strategy: Score ALL peptides in isolation window against ALL spectra in that window")
         print("Output: Raw and smoothed XCorr chromatograms with e-values for each peptide")
-        
+
+        # Spectrum library already loaded above if provided
+        # Workers will receive library_path and load it per-process
+        library_path = args.speclib if args.speclib else None
+
+        # Load MS1 spectra if library is provided (needed for precursor isotope scoring)
+        ms1_spectra = None
+        if args.speclib:
+            print(f"\nReading MS1 spectra from {args.mzml_file} for precursor isotope scoring...")
+            ms1_spectra = xcorr_engine.read_ms1_spectra(args.mzml_file)
+            print(f"  Loaded {len(ms1_spectra)} MS1 spectra")
+
         # Determine DIA output filename
         if not args.dia_output:
             base_name = os.path.splitext(args.mzml_file)[0]
             args.dia_output = base_name + '.dia.tsv'
-        
+
         # Determine unified parquet output filename
         mzml_dir = os.path.dirname(args.mzml_file) or '.'
         mzml_basename = os.path.basename(args.mzml_file)
         parquet_basename = os.path.splitext(mzml_basename)[0] + '.dia-chrom.parquet'
         unified_parquet_file = os.path.join(mzml_dir, parquet_basename)
-        
+
         print(f"- Summary results (TSV): {args.dia_output}")
         print(f"- Unified chromatograms (Parquet): {unified_parquet_file}")
         
@@ -2458,29 +3448,79 @@ def main():
                 parquet_file,
                 args.enzyme,
                 args.decoy_cycle_length,
+                library_path,
+                ms1_spectra,
+                args.lib_fragment_tol if args.lib_fragment_tol_unit == 'ppm' else args.lib_fragment_tol,
+                args.lib_precursor_tol if args.lib_precursor_tol_unit == 'ppm' else args.lib_precursor_tol,
                 args.verbose
             ))
         
-        # Process isolation windows in parallel
+        # Process isolation windows in parallel with incremental TSV writing
         print(f"\nProcessing {len(window_groups)} isolation windows in parallel...")
-        all_dia_results = {}
+        
+        # Initialize TSV file with header
+        dia_writer = DIAResultsWriter(args.dia_output, args.mzml_file, library_mode=library_mode)
+        with open(args.dia_output, 'w') as f:
+            # Write header manually - matches what _write_header() does
+            if library_mode:
+                # Library mode: simplified columns
+                header = "Peptide\tCharge\tProteinID\tMass\tIsTarget\tIsolationWindow\t"
+                header += "NumSpectraScored\tLibCosine\tLibCosineZScore\tXCorr\tRT\tScanID\t"
+                header += "PrecursorCosine\n"
+            else:
+                # Non-library mode: XCorr-based search with e-value
+                header = "Peptide\tCharge\tProteinID\tMass\tIsTarget\tIsolationWindow\t"
+                header += "BestXCorr\tBestRT\tBestScan\t"
+                header += "EValue\tNumSpectraScored\tXCorrZScore\n"
+            
+            f.write(header)
+        
         parquet_files = []
+        all_dia_results = {}  # Keep for summary statistics
+        completed_windows = 0
         
         if n_workers == 1:
             # Sequential processing (for debugging or single-core machines)
             print("Running in single-threaded mode...")
-            search_results = [process_isolation_window_worker(item) for item in work_items]
+            for item in work_items:
+                search_result = process_isolation_window_worker(item)
+                dia_results = search_result['results']
+                parquet_files.append(search_result['parquet_file'])
+                all_dia_results.update(dia_results)
+                
+                # Write results immediately
+                dia_writer.open_for_append()
+                dia_writer.write_dia_results(dia_results)
+                dia_writer.close()
+                
+                completed_windows += 1
+                print(f"  Progress: {completed_windows}/{len(work_items)} windows completed")
         else:
-            # Parallel processing
+            # Parallel processing with incremental writing
+            from multiprocessing import Manager
             print(f"Running in parallel mode with {n_workers} workers...")
+            
+            # Create a lock for synchronized file writing
+            manager = Manager()
+            write_lock = manager.Lock()
+            
+            # Create writer with lock and library mode flag
+            dia_writer_parallel = DIAResultsWriter(args.dia_output, args.mzml_file, write_lock, library_mode=library_mode)
+            
             with Pool(n_workers) as pool:
-                search_results = pool.map(process_isolation_window_worker, work_items)
+                # Use imap_unordered to process results as they complete
+                for search_result in pool.imap_unordered(process_isolation_window_worker, work_items):
+                    dia_results = search_result['results']
+                    parquet_files.append(search_result['parquet_file'])
+                    all_dia_results.update(dia_results)
+                    
+                    # Write results immediately with synchronized access
+                    dia_writer_parallel.write_dia_results_synchronized(dia_results)
+                    
+                    completed_windows += 1
+                    print(f"  Progress: {completed_windows}/{len(work_items)} windows completed")
         
-        # Collect results from all workers
-        for search_result in search_results:
-            dia_results = search_result['results']
-            parquet_files.append(search_result['parquet_file'])
-            all_dia_results.update(dia_results)
+        print(f"\nAll {len(work_items)} isolation windows processed!")
         
         # Merge all per-window parquet files into single unified file
         print(f"\nMerging {len(parquet_files)} per-window parquet files into unified file...")
@@ -2517,10 +3557,7 @@ def main():
         #         os.remove(f)
         # os.rmdir(parquet_dir)
         
-        # Write DIA summary results
-        print(f"\nWriting DIA summary to {args.dia_output}...")
-        with DIAResultsWriter(args.dia_output, args.mzml_file) as dia_writer:
-            dia_writer.write_dia_results(all_dia_results)
+        # TSV results already written incrementally during processing
         
         # Print summary
         print("\n=== DIA PEPTIDE-CENTRIC SEARCH COMPLETED ===")

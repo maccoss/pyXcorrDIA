@@ -1,22 +1,25 @@
 # pyXcorrDIA
 
-A fast proteomics database search engine implementing the SEQUEST Cross-Correlation (XCorr) algorithm based on Comet's approach. Designed for peptide-spectrum matching with target-decoy competition for FDR estimation.
+A proteomics database search engine implementing the SEQUEST Cross-Correlation (XCorr) algorithm based on Comet's approach. Designed for peptide-spectrum matching with target-decoy competition for FDR estimation.
 
 ## Features
 
 - **Unified XCorr calculation** - Single function for both vector and matrix operations, eliminating code duplication
 - **Comet-compatible algorithm** - Faithful implementation matching Comet's preprocessing and scoring
 - **DIA peptide-centric mode** - Optimized search for data-independent acquisition with RT profiling
+- **Spectral library support** - Search against DIA-NN spectral libraries with cosine similarity scoring
+- **Unified target-decoy competition** - Winner-only reporting for both library and non-library modes
+- **Incremental TSV writing** - Real-time results output with thread-safe file access for memory efficiency
 - **Vectorized matrix scoring** - N×M peptide-spectrum scoring using optimized BLAS operations
 - **Multi-enzyme support** - 10 protease digestion options including Trypsin, Lys-C, Arg-C, and more
 - **Fast spectrum preprocessing** - Efficient binning, windowing normalization, and Fast XCorr calculation
 - **Target-decoy search** - Built-in decoy generation and target-decoy competition
 - **Multiple file formats** - Supports mzML (via pymzml) and MGF (via pyteomics) input
 - **Flexible modifications** - Configurable static modifications (default: Carbamidomethyl-C)
-- **Multiple output formats** - pepXML and Percolator Input (PIN) files
-- **E-value calculation** - Comet's LinearRegression approach with proper statistical significance
+- **Multiple output formats** - pepXML and Percolator Input (PIN) files for spectrum-centric; simplified TSV for DIA
+- **E-value calculation** - Comet's LinearRegression approach with proper statistical significance (non-library mode)
 - **Z-score reporting** - Signal-to-noise ratio for chromatographic peaks in DIA mode
-- **Comprehensive testing** - 124 tests covering all major functionality including unified XCorr and e-values
+- **Comprehensive testing** - 163 tests covering all major functionality including competition logic and incremental writing
 
 ## Installation
 
@@ -155,13 +158,17 @@ python pyXcorrDIA.py database.fasta dia_data.mzML \
 1. **Group spectra** by isolation window
 2. **Preprocess theoretical spectra** for peptides in each window (binning → MakeCorrData → Fast XCorr)
 3. **Score each peptide** across all spectra in the window
-4. **Track best XCorr** and RT for target and decoy
-5. **Apply Savitzky-Golay smoothing** to chromatographic profiles
-6. **Output** peptide-level results with RT profiles
+4. **Target-decoy competition**: Select winner based on primary score (LibCosine in library mode, XCorr in non-library mode)
+5. **Incremental writing**: Write results immediately as each window completes (memory efficient)
+6. **Output** peptide-level results with unified competition scoring
 
 ### DIA Output Format
 
-The `.dia.tsv` file contains tab-delimited results with these columns:
+The output format differs between library and non-library search modes:
+
+#### Library Mode Output (`--speclib` provided)
+
+Tab-delimited TSV with 13 columns (one row per peptide - winner only):
 
 | Column | Description |
 |--------|-------------|
@@ -169,22 +176,48 @@ The `.dia.tsv` file contains tab-delimited results with these columns:
 | `Charge` | Charge state |
 | `ProteinID` | Source protein identifier |
 | `Mass` | Neutral peptide mass |
+| `IsTarget` | 1 for target, 0 for decoy (winner only) |
 | `IsolationWindow` | Precursor m/z window `[lower-upper]` |
-| `TargetBestXCorr` | Highest XCorr for target peptide |
-| `TargetBestRT` | RT where best XCorr occurred |
-| `TargetBestScan` | Scan ID where best XCorr occurred |
-| `DecoyBestXCorr` | Highest XCorr for decoy peptide |
-| `DecoyBestRT` | RT where decoy best XCorr occurred |
-| `DecoyBestScan` | Scan ID where decoy best XCorr occurred |
-| `TargetProfile` | Smoothed XCorr profile: `rt:scan:xcorr;...` |
-| `DecoyProfile` | Smoothed decoy XCorr profile |
+| `NumSpectraScored` | Number of spectra in RT window |
+| `LibCosine` | Library cosine similarity score (primary score) |
+| `LibCosineZScore` | Z-score of LibCosine across chromatogram |
+| `XCorr` | XCorr at the spectrum with best LibCosine |
+| `RT` | Retention time at best LibCosine peak |
+| `ScanID` | Scan ID at best LibCosine peak |
+| `PrecursorCosine` | MS1 precursor isotope pattern similarity |
+
+**Note:** In library mode, XCorr is calculated only at the single spectrum with the best LibCosine score, so e-value calculation is not meaningful.
+
+#### Non-Library Mode Output (no `--speclib`)
+
+Tab-delimited TSV with 12 columns (one row per peptide - winner only):
+
+| Column | Description |
+|--------|-------------|
+| `Peptide` | Peptide sequence |
+| `Charge` | Charge state |
+| `ProteinID` | Source protein identifier |
+| `Mass` | Neutral peptide mass |
+| `IsTarget` | 1 for target, 0 for decoy (winner only) |
+| `IsolationWindow` | Precursor m/z window `[lower-upper]` |
+| `BestXCorr` | Highest XCorr across chromatogram (primary score) |
+| `BestRT` | Retention time at best XCorr |
+| `BestScan` | Scan ID at best XCorr |
+| `EValue` | Statistical significance from XCorr distribution |
+| `NumSpectraScored` | Number of spectra in RT window |
+| `XCorrZScore` | Z-score of best XCorr relative to distribution |
+
+**Note:** In non-library mode, XCorr is calculated across the full chromatogram, making e-value calculation meaningful.
 
 ### DIA Mode Notes
 
+- **Winner-only reporting**: Each peptide reported once (target OR decoy, whichever wins)
 - **Performance**: Faster for true DIA data (theoretical spectra reused across RT)
-- **Memory**: Higher usage (all spectra per window loaded simultaneously)
-- **FDR**: Compare `TargetBestXCorr` vs `DecoyBestXCorr` for each peptide
-- **Smoothing**: Savitzky-Golay filter (window=7, polynomial=2) applied to profiles
+- **Memory**: Incremental writing reduces memory usage (results written immediately)
+- **FDR**: Use `IsTarget` field to compute false discovery rate from winner-only results
+- **Library mode**: Primary score is LibCosine, XCorr is confirmatory
+- **Non-library mode**: Primary score is XCorr with full statistical significance (e-value)
+- **Thread safety**: Results writing uses multiprocessing.Lock() for safe parallel processing
 - **Best for**: Data with multiple spectra per isolation window
 
 ## Command-Line Options
@@ -197,6 +230,8 @@ The `.dia.tsv` file contains tab-delimited results with these columns:
 | `-p, --pin_output` | Percolator PIN file path | `{mzml}.pin` |
 | `--dia_mode` | Enable DIA peptide-centric search | Off |
 | `--dia_output` | DIA results output file | `{mzml}.dia.tsv` |
+| `--speclib` | Path to DIA-NN spectral library (.tsv) | None |
+| `--dia_rt_window` | RT window in seconds for DIA grouping | 10.0 |
 | `-t, --threads` | Number of threads (0 = auto) | 0 |
 | `-v, --verbose` | Increase output verbosity | 0 |
 | `-n, --top_hits` | Top PSMs to report per spectrum | 10 |
@@ -249,16 +284,51 @@ pyXcorrDIA implements the Fast XCorr algorithm as described in Eng et al. (2008)
 4. **Fast XCorr Preprocessing** - Sliding window background subtraction (offset=75)
 5. **Theoretical Spectrum Generation** - Fragment ions for peptide candidates
 6. **XCorr Scoring** - Dot product of preprocessed spectra
-7. **E-value Calculation** - Comet's LinearRegression approach
+7. **E-value Calculation (Non-Library Mode Only)** - Comet's LinearRegression approach
    - Histogram binning (0.1 XCorr units)
    - Cumulative distribution from right to left
    - Log transformation and linear regression
    - E-value range: [1e-10, 1.0] (capped at 1.0 for poor fits)
    - Spectrum-centric: charge-specific score distributions
    - Peptide-centric: distribution of spectrum scores per peptide
+   - **Not calculated in library mode** (XCorr only at single spectrum with best LibCosine)
 8. **Z-score Calculation (DIA mode)** - Signal-to-noise ratio
    - Z-score = (best_score - mean_score) / std_dev
    - Measures how many standard deviations the peak is above background
+   - Library mode: LibCosineZScore across chromatogram
+   - Non-library mode: XCorrZScore from score distribution
+
+### Target-Decoy Competition
+
+pyXcorrDIA uses unified target-decoy competition for both library and non-library modes:
+
+- **Primary Score Selection**:
+  - Library mode: LibCosine (cosine similarity to library spectrum)
+  - Non-library mode: XCorr (cross-correlation score)
+  
+- **Winner Selection**:
+  - Compare primary scores between target and decoy
+  - Higher primary score wins
+  - Ties favor decoy (conservative for FDR estimation)
+  
+- **Winner-Only Reporting**:
+  - One peptide per target/decoy pair (50% fewer rows than reporting both)
+  - `IsTarget` field indicates if winner was target (1) or decoy (0)
+  - No PairID needed (simplified output)
+  
+- **Metrics at Winner's Peak**:
+  - Library mode: XCorr, RT, ScanID at spectrum with best LibCosine
+  - Non-library mode: XCorr, RT, ScanID, and e-value at best XCorr
+
+### Incremental TSV Writing
+
+DIA mode writes results progressively as isolation windows complete:
+
+- **Memory Efficiency**: Results written immediately, not accumulated
+- **Real-Time Progress**: "Progress: X/Y windows completed" updates
+- **Thread Safety**: multiprocessing.Lock() prevents file corruption in parallel mode
+- **Sequential Mode**: Write after each window completes
+- **Parallel Mode**: pool.imap_unordered() streams results from workers
 
 ### Decoy Generation
 
@@ -306,11 +376,14 @@ See `XCorr_Preprocessing_Analysis.ipynb` for more detailed examples.
 
 ## Testing
 
-pyXcorrDIA has a comprehensive test suite with 56 tests:
+pyXcorrDIA has a comprehensive test suite with **156 tests** covering all major functionality:
 
 ```bash
 # Run all tests
 pytest
+
+# Run with verbose output
+pytest -v
 
 # Run with coverage report
 pytest --cov=pyXcorrDIA --cov-report=html
@@ -318,11 +391,29 @@ pytest --cov=pyXcorrDIA --cov-report=html
 # Quick validation script
 python run_tests_quick.py
 
-# Run specific test module
-pytest tests/test_search.py -v
+# Run specific test modules
+pytest tests/test_search.py -v              # Database search
+pytest tests/test_evalue.py -v              # E-value calculation
+pytest tests/test_unified_xcorr.py -v       # Unified XCorr function
+pytest tests/test_dia_parallelization.py -v # DIA parallel processing
+pytest tests/test_library_search.py -v      # Spectral library search
 ```
 
-See `tests/README.md` for detailed testing documentation.
+### Test Coverage
+
+- **18 tests** - Core functionality (initialization, modifications, mass calculations)
+- **13 tests** - File I/O (FASTA, mzML, MGF reading)
+- **42 tests** - Protein digestion, decoys, and multi-enzyme support
+- **13 tests** - Spectrum preprocessing and XCorr calculation
+- **7 tests** - Database search workflow with real data
+- **8 tests** - Peptide-centric scoring (mock data)
+- **8 tests** - Peptide-centric scoring (real data validation)
+- **17 tests** - Unified XCorr implementation (vector and matrix operations)
+- **9 tests** - DIA parallelization
+- **11 tests** - E-value calculation and Z-scores
+- **Additional tests** - Spectral library search and other features
+
+See `TESTING_QUICKSTART.md` for quick start guide and `TEST_INFRASTRUCTURE_SUMMARY.md` for detailed testing documentation.
 
 ## Output Formats
 
