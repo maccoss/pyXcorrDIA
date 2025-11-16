@@ -68,6 +68,10 @@ class TestDIAParallelization:
             parquet_file,  # parquet_file (use tmp_path)
             'trypsin',  # enzyme
             1,  # decoy_cycle_length
+            None,  # library
+            None,  # ms1_spectra
+            10.0,  # lib_fragment_tol_ppm
+            10.0,  # lib_precursor_tol_ppm
             0  # verbose (suppress output)
         )
         
@@ -108,7 +112,8 @@ class TestDIAParallelization:
         args = (
             0, 1, (400.0, 405.0), [spectrum], None,
             [(target_data, decoy_data)], [2],
-            None, 'trypsin', 1, 0
+            None, 'trypsin', 1,
+            None, None, 10.0, 10.0, 0
         )
         
         # Patch FastXCorr to track instantiation
@@ -184,10 +189,12 @@ class TestDIAParallelization:
         work_items = [
             (0, 2, (400.0, 405.0), [spectrum1], None,
              target_decoy_pairs_data, [2],
-             parquet_file1, 'trypsin', 1, 0),
+             parquet_file1, 'trypsin', 1,
+             None, None, 10.0, 10.0, 0),
             (1, 2, (325.0, 330.0), [spectrum2], None,
              target_decoy_pairs_data, [2],
-             parquet_file2, 'trypsin', 1, 0)
+             parquet_file2, 'trypsin', 1,
+             None, None, 10.0, 10.0, 0)
         ]
         
         # Process sequentially
@@ -237,7 +244,8 @@ class TestDIAParallelization:
         args = (
             0, 1, (400.0, 405.0), spectra, None,
             [(target_data, decoy_data)], [2],
-            parquet_file, 'trypsin', 1, 0
+            parquet_file, 'trypsin', 1,
+            None, None, 10.0, 10.0, 0
         )
         
         # Process window
@@ -273,7 +281,8 @@ class TestDIAParallelization:
             0, 1, (400.0, 405.0), [spectrum], None,
             [(target_data, decoy_data)],
             [2, 3, 4],  # Multiple charge states
-            parquet_file, 'trypsin', 1, 0
+            parquet_file, 'trypsin', 1,
+            None, None, 10.0, 10.0, 0
         )
         
         result = process_isolation_window_worker(args)
@@ -309,7 +318,8 @@ class TestDIAParallelization:
         args = (
             0, 1, (400.0, 405.0), [spectrum], None,
             [(target_data, decoy_data)], [2],
-            parquet_file, 'trypsin', 1, 0  # verbose=0
+            parquet_file, 'trypsin', 1,
+            None, None, 10.0, 10.0, 0  # verbose=0
         )
         
         process_isolation_window_worker(args)
@@ -349,7 +359,8 @@ class TestDIAParallelization:
         args = (
             0, 1, (400.0, 405.0), [spectrum], None,
             [(target_data, decoy_data)], [2],
-            parquet_file, 'trypsin', 1, 0
+            parquet_file, 'trypsin', 1,
+            None, None, 10.0, 10.0, 0
         )
         
         result = process_isolation_window_worker(args)

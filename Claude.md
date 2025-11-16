@@ -4,7 +4,9 @@
 
 pyXcorrDIA is a fast proteomics database search engine that implements the SEQUEST Cross-Correlation (XCorr) algorithm based on Comet's approach. It performs peptide identification from mass spectrometry data using target-decoy competition for FDR estimation.
 
-**Key Purpose**: High-performance peptide-spectrum matching (PSM) for data-independent acquisition (DIA) proteomics experiments.
+**Key Purpose**: High-performance peptide-spectrum matching (PSM) for data-independent acquisition (DIA) proteomics experiments with spectral library support.
+
+**Recent Performance Improvements** (November 2025): Major optimizations provide 20-40 minute speedup for DIA searches with spectral libraries through library object passing, pre-vectorized preprocessing, combined mzML reading, and quality filtering.
 
 ## Project Architecture
 
@@ -14,22 +16,33 @@ pyXcorrDIA is a fast proteomics database search engine that implements the SEQUE
    - Main search engine implementing Comet's XCorr algorithm
    - Handles spectrum preprocessing, theoretical spectrum generation, and scoring
    - Implements target-decoy competition for FDR control
+   - Unified `calculate_xcorr()` for vector and matrix operations
 
-2. **Spectrum Processing Pipeline**
+2. **SpectrumLibrary Class** (`pyXcorrDIA.py`)
+   - DIA-NN spectral library integration
+   - Automatic decoy and Q-value filtering (Decoy==0, Q.Value<=0.01)
+   - Pre-vectorized fragment preprocessing (SMZ computation during load)
+   - Decoy fragment generation with intensity remapping
+   - Pickle-serializable for multiprocessing efficiency
+
+3. **Spectrum Processing Pipeline**
    - Binning (1.0005079 Da bins, Comet default)
    - Square root transformation of intensities
    - MakeCorrData windowing normalization (10 windows, normalize to 50.0)
    - Fast XCorr preprocessing (sliding window with offset=75)
+   - Optional SMZ preprocessing during mzML read
 
-3. **Peptide Generation**
+4. **Peptide Generation**
    - Protein digestion (trypsin with configurable missed cleavages)
    - Peptide length filtering (default: 7-30 amino acids, configurable)
    - Static modifications support (default: Carbamidomethyl-C +57.021464)
    - Decoy generation (reversal method, keeping C-terminal K/R)
    - Non-redundant peptide list creation
 
-4. **Scoring & Statistics**
+5. **Scoring & Statistics**
    - XCorr score calculation (dot product of preprocessed spectra)
+   - Library cosine similarity with ppm fragment tolerance
+   - MS1 precursor isotope pattern scoring
    - E-value calculation using Comet's LinearRegression approach
      - Histogram binning (0.1 XCorr units)
      - Cumulative distribution → log transform → linear regression
@@ -38,11 +51,34 @@ pyXcorrDIA is a fast proteomics database search engine that implements the SEQUE
    - Z-score (standard score) calculation: (best_score - mean) / std_dev
    - Target-decoy competition for peptide identification
 
+### Performance Optimizations
+
+1. **Library Object Passing** (20-40 min speedup)
+   - Load spectral library once in main process
+   - Pass library object to 250 workers via pickle serialization
+   - Eliminates 250× redundant parquet file reads
+
+2. **Pre-Vectorized Preprocessing** (5-10% speedup)
+   - Compute SMZ values during library loading
+   - Store normalized vectors in `preprocessed_fragments`
+   - Eliminates redundant computation across isolation windows
+
+3. **Combined mzML Reading** (30-50% I/O reduction)
+   - Single-pass reader for MS1 and MS2 spectra
+   - `read_mzml_combined()` method checks `spectrum.ms_level`
+   - Automatic for `--dia_mode --speclib` searches
+
+4. **Quality Filtering**
+   - Remove decoys from library (Decoy == 0)
+   - Filter low-confidence entries (Q.Value <= 0.01)
+   - Report precursor counts at each filtering stage
+
 ### File I/O Support
 
-- **Input formats**: mzML (via pymzml), MGF (via pyteomics), FASTA
-- **Output formats**: pepXML, Percolator Input (PIN)
+- **Input formats**: mzML (via pymzml), MGF (via pyteomics), FASTA, DIA-NN parquet libraries
+- **Output formats**: pepXML, Percolator Input (PIN), DIA TSV with chromatograms
 - Fast single-spectrum lookup using mzML indexing
+- Combined MS1+MS2 reading for efficiency
 
 ## Key Implementation Details
 

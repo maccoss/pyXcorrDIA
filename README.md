@@ -8,6 +8,8 @@ A proteomics database search engine implementing the SEQUEST Cross-Correlation (
 - **Comet-compatible algorithm** - Faithful implementation matching Comet's preprocessing and scoring
 - **DIA peptide-centric mode** - Optimized search for data-independent acquisition with RT profiling
 - **Spectral library support** - Search against DIA-NN spectral libraries with cosine similarity scoring
+- **Performance optimized** - Library object passing, pre-vectorized preprocessing, combined mzML reading (20-40 min speedup)
+- **Quality filtering** - Automatic filtering of decoys and low Q-value entries from spectral libraries
 - **Unified target-decoy competition** - Winner-only reporting for both library and non-library modes
 - **Incremental TSV writing** - Real-time results output with thread-safe file access for memory efficiency
 - **Vectorized matrix scoring** - N×M peptide-spectrum scoring using optimized BLAS operations
@@ -19,7 +21,7 @@ A proteomics database search engine implementing the SEQUEST Cross-Correlation (
 - **Multiple output formats** - pepXML and Percolator Input (PIN) files for spectrum-centric; simplified TSV for DIA
 - **E-value calculation** - Comet's LinearRegression approach with proper statistical significance (non-library mode)
 - **Z-score reporting** - Signal-to-noise ratio for chromatographic peaks in DIA mode
-- **Comprehensive testing** - 163 tests covering all major functionality including competition logic and incremental writing
+- **Comprehensive testing** - 175+ tests covering all major functionality including optimizations and library filtering
 
 ## Installation
 

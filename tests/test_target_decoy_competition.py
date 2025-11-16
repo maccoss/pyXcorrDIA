@@ -1,12 +1,13 @@
 """
-Tests for unified target/decoy competition in DIA search.
+Tests for target/decoy paired reporting in DIA search.
 
-This module tests the new competition logic that:
-1. Reports only the winner of target/decoy competition (not both)
-2. Uses LibCosine as primary score in library mode
-3. Uses XCorr as primary score in non-library mode
-4. Reports all metrics at the primary score peak location
-5. Outputs simplified TSV format without redundant columns
+This module tests the paired reporting format where:
+1. Both target and decoy results are reported in a single row
+2. Decoy columns are prefixed with 'decoy_'
+3. Competition between target/decoy is done as post-processing on the TSV
+4. LibCosine is used as primary score in library mode
+5. XCorr is used as primary score in non-library mode
+6. Allows QC of both target and decoy scores before final competition
 """
 
 import pytest
@@ -165,21 +166,38 @@ class TestDIAResultsWriter:
         # Create writer in library mode
         writer = DIAResultsWriter(output_file, "test.mzml", library_mode=True)
         
-        # Create mock result
-        peptide = PeptideCandidate("PEPTIDE", "P12345", mass=799.359954)
+        # Create mock result - current paired format
+        target_peptide = PeptideCandidate("PEPTIDE", "P12345", mass=799.359954)
+        decoy_peptide = PeptideCandidate("EDPTIEP", "DECOY_P12345", mass=799.359954)
+        
         results = {
-            ('PEPTIDE', 2, True): {
-                'peptide': peptide,
-                'charge': 2,
-                'is_target': True,
-                'isolation_window': (400.0, 425.0),
-                'best_xcorr': 1.5,  # XCorr at LibCosine peak
-                'best_rt': 10.5,
-                'best_scan': 1234,
-                'num_spectra_scored': 50,
-                'best_lib_cosine_target': 0.85,
-                'lib_cosine_target_zscore': 3.2,
-                'precursor_cosine_target': 0.92,
+            'pair_1': {
+                'target': {
+                    'peptide': target_peptide,
+                    'charge': 2,
+                    'is_target': True,
+                    'isolation_window': (400.0, 425.0),
+                    'best_xcorr': 1.5,
+                    'best_rt': 10.5,
+                    'best_scan': 1234,
+                    'num_spectra_scored': 50,
+                    'best_lib_cosine_target': 0.85,
+                    'lib_cosine_target_zscore': 3.2,
+                    'precursor_cosine_target': 0.92,
+                },
+                'decoy': {
+                    'peptide': decoy_peptide,
+                    'charge': 2,
+                    'is_target': False,
+                    'isolation_window': (400.0, 425.0),
+                    'best_xcorr': 1.2,
+                    'best_rt': 10.3,
+                    'best_scan': 1230,
+                    'num_spectra_scored': 50,
+                    'best_lib_cosine_decoy': 0.75,
+                    'lib_cosine_decoy_zscore': 2.8,
+                    'precursor_cosine_decoy': 0.88,
+                }
             }
         }
         
@@ -190,35 +208,29 @@ class TestDIAResultsWriter:
         # Read and validate output
         df = pd.read_csv(output_file, sep='\t')
         
-        # Check columns - library mode format
+        # Check columns - library mode format (single row with target and decoy_ columns)
         expected_columns = [
-            'Peptide', 'Charge', 'ProteinID', 'Mass', 'IsTarget', 'IsolationWindow',
-            'NumSpectraScored', 'LibCosine', 'LibCosineZScore', 'XCorr', 'RT', 'ScanID',
-            'PrecursorCosine'
+            'Peptide', 'Charge', 'ProteinID', 'Mass', 'IsolationWindow', 'NumSpectraScored',
+            'LibCosine', 'LibCosineZScore', 'XCorr', 'RT', 'ScanID', 'PrecursorCosine',
+            'decoy_Peptide', 'decoy_LibCosine', 'decoy_LibCosineZScore', 'decoy_XCorr',
+            'decoy_RT', 'decoy_ScanID', 'decoy_PrecursorCosine'
         ]
         assert list(df.columns) == expected_columns, f"Columns mismatch: {list(df.columns)}"
         
-        # Check data
-        assert len(df) == 1, "Should have one row"
+        # Check data - should be single row with both target and decoy
+        assert len(df) == 1, "Should have one row (target + decoy in same row)"
         assert df.iloc[0]['Peptide'] == 'PEPTIDE'
+        assert df.iloc[0]['decoy_Peptide'] == 'EDPTIEP'
         assert df.iloc[0]['Charge'] == 2
-        assert df.iloc[0]['IsTarget'] == 'Target'
         assert df.iloc[0]['LibCosine'] == 0.85
         assert df.iloc[0]['XCorr'] == 1.5
         assert df.iloc[0]['RT'] == 10.5
         assert df.iloc[0]['ScanID'] == 1234
-        
-        # Check that PairID is NOT in columns
-        assert 'PairID' not in df.columns, "PairID should not be in library mode"
-        
-        # Check that e-value columns are NOT present
-        assert 'EValue' not in df.columns, "EValue should not be in library mode"
-        assert 'BestXCorrRaw' not in df.columns, "BestXCorrRaw should not be present"
-        assert 'BestXCorrSmoothed' not in df.columns, "BestXCorrSmoothed should not be present"
-        assert 'XCorrZScore' not in df.columns, "XCorrZScore should not be in library mode"
+        assert df.iloc[0]['decoy_LibCosine'] == 0.75
+        assert df.iloc[0]['decoy_XCorr'] == 1.2
         
         print("✓ Library mode output format validated")
-        print(f"  Columns: {list(df.columns)}")
+        print(f"  Columns: {list(df.columns)[:6]}... (19 total)")
         
     def test_non_library_mode_output_format(self):
         """Test that non-library mode outputs correct TSV format."""
@@ -227,20 +239,36 @@ class TestDIAResultsWriter:
         # Create writer in non-library mode
         writer = DIAResultsWriter(output_file, "test.mzml", library_mode=False)
         
-        # Create mock result
-        peptide = PeptideCandidate("PEPTIDE", "P12345", mass=799.359954)
+        # Create mock result - current paired format
+        target_peptide = PeptideCandidate("PEPTIDE", "P12345", mass=799.359954)
+        decoy_peptide = PeptideCandidate("EDPTIEP", "DECOY_P12345", mass=799.359954)
+        
         results = {
-            ('PEPTIDE', 2, True): {
-                'peptide': peptide,
-                'charge': 2,
-                'is_target': True,
-                'isolation_window': (400.0, 425.0),
-                'best_xcorr': 1.8,
-                'best_rt': 10.5,
-                'best_scan': 1234,
-                'e_value': 0.001,
-                'num_spectra_scored': 50,
-                'all_xcorr_values': [0.5, 0.8, 1.8, 1.2, 0.6],  # For Z-score calc
+            'pair_1': {
+                'target': {
+                    'peptide': target_peptide,
+                    'charge': 2,
+                    'is_target': True,
+                    'isolation_window': (400.0, 425.0),
+                    'best_xcorr': 1.8,
+                    'best_rt': 10.5,
+                    'best_scan': 1234,
+                    'e_value': 0.001,
+                    'num_spectra_scored': 50,
+                    'xcorr_zscore': 2.5,
+                },
+                'decoy': {
+                    'peptide': decoy_peptide,
+                    'charge': 2,
+                    'is_target': False,
+                    'isolation_window': (400.0, 425.0),
+                    'best_xcorr': 1.5,
+                    'best_rt': 10.3,
+                    'best_scan': 1230,
+                    'e_value': 0.002,
+                    'num_spectra_scored': 50,
+                    'xcorr_zscore': 2.0,
+                }
             }
         }
         
@@ -251,37 +279,40 @@ class TestDIAResultsWriter:
         # Read and validate output
         df = pd.read_csv(output_file, sep='\t')
         
-        # Check columns - non-library mode format
+        # Check columns - non-library mode format (single row with target and decoy_ columns)
         expected_columns = [
-            'Peptide', 'Charge', 'ProteinID', 'Mass', 'IsTarget', 'IsolationWindow',
-            'BestXCorr', 'BestRT', 'BestScan', 'EValue', 'NumSpectraScored', 'XCorrZScore'
+            'Peptide', 'Charge', 'ProteinID', 'Mass', 'IsolationWindow', 'NumSpectraScored',
+            'BestXCorr', 'BestRT', 'BestScan', 'EValue', 'XCorrZScore',
+            'decoy_Peptide', 'decoy_BestXCorr', 'decoy_BestRT', 'decoy_BestScan',
+            'decoy_EValue', 'decoy_XCorrZScore'
         ]
         assert list(df.columns) == expected_columns, f"Columns mismatch: {list(df.columns)}"
         
-        # Check data
-        assert len(df) == 1, "Should have one row"
+        # Check data - should be single row with both target and decoy
+        assert len(df) == 1, "Should have one row (target + decoy in same row)"
         assert df.iloc[0]['Peptide'] == 'PEPTIDE'
+        assert df.iloc[0]['decoy_Peptide'] == 'EDPTIEP'
         assert df.iloc[0]['BestXCorr'] == 1.8
         assert df.iloc[0]['EValue'] > 0, "E-value should be present"
-        
-        # Check that library columns are NOT present
-        assert 'LibCosine' not in df.columns, "LibCosine should not be in non-library mode"
-        assert 'PrecursorCosine' not in df.columns, "PrecursorCosine should not be in non-library mode"
+        assert df.iloc[0]['decoy_BestXCorr'] == 1.5
+        assert df.iloc[0]['decoy_EValue'] > 0, "Decoy E-value should be present"
         
         print("✓ Non-library mode output format validated")
-        print(f"  Columns: {list(df.columns)}")
+        print(f"  Columns: {list(df.columns)[:6]}... (17 total)")
         
-    def test_output_has_no_pair_id(self):
-        """Test that PairID column is not present (winner-only reporting)."""
-        output_file = os.path.join(self.temp_dir, "test_no_pair_id.tsv")
+    def test_output_paired_format(self):
+        """Test that output uses paired format (single row with target and decoy_ columns)."""
+        output_file = os.path.join(self.temp_dir, "test_paired_format.tsv")
         
         # Test both modes
         for library_mode in [True, False]:
             writer = DIAResultsWriter(output_file, "test.mzml", library_mode=library_mode)
             
-            peptide = PeptideCandidate("PEPTIDE", "P12345", mass=799.359954)
-            result_dict = {
-                'peptide': peptide,
+            target_peptide = PeptideCandidate("PEPTIDE", "P12345", mass=799.359954)
+            decoy_peptide = PeptideCandidate("EDPTIEP", "DECOY_P12345", mass=799.359954)
+            
+            target_dict = {
+                'peptide': target_peptide,
                 'charge': 2,
                 'is_target': True,
                 'isolation_window': (400.0, 425.0),
@@ -291,27 +322,55 @@ class TestDIAResultsWriter:
                 'num_spectra_scored': 50,
             }
             
+            decoy_dict = {
+                'peptide': decoy_peptide,
+                'charge': 2,
+                'is_target': False,
+                'isolation_window': (400.0, 425.0),
+                'best_xcorr': 1.2,
+                'best_rt': 10.3,
+                'best_scan': 1230,
+                'num_spectra_scored': 50,
+            }
+            
             if library_mode:
-                result_dict.update({
+                target_dict.update({
                     'best_lib_cosine_target': 0.85,
                     'lib_cosine_target_zscore': 3.2,
                     'precursor_cosine_target': 0.92,
                 })
+                decoy_dict.update({
+                    'best_lib_cosine_decoy': 0.75,
+                    'lib_cosine_decoy_zscore': 2.8,
+                    'precursor_cosine_decoy': 0.88,
+                })
             else:
-                result_dict.update({
+                target_dict.update({
                     'e_value': 0.001,
-                    'all_xcorr_values': [0.5, 0.8, 1.5, 1.2, 0.6],
+                    'xcorr_zscore': 2.5,
+                })
+                decoy_dict.update({
+                    'e_value': 0.002,
+                    'xcorr_zscore': 2.0,
                 })
             
-            results = {('PEPTIDE', 2, True): result_dict}
+            results = {'pair_1': {'target': target_dict, 'decoy': decoy_dict}}
             
             with writer:
                 writer.write_dia_results(results)
             
             df = pd.read_csv(output_file, sep='\t')
-            assert 'PairID' not in df.columns, f"PairID should not be in {'library' if library_mode else 'non-library'} mode"
             
-        print("✓ PairID column correctly excluded from both modes")
+            # Check paired format: single row with target and decoy_ columns
+            assert len(df) == 1, f"Should have 1 row (paired format) in {'library' if library_mode else 'non-library'} mode"
+            assert 'Peptide' in df.columns, "Should have target Peptide column"
+            assert 'decoy_Peptide' in df.columns, "Should have decoy_Peptide column"
+            
+            # Verify both peptides are in the same row
+            assert df.iloc[0]['Peptide'] == 'PEPTIDE'
+            assert df.iloc[0]['decoy_Peptide'] == 'EDPTIEP'
+            
+        print("✓ Paired format (single row with target and decoy_ columns) validated for both modes")
 
 
 class TestPairProcessing:
