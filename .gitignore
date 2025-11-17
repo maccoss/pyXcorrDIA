@@ -5,6 +5,7 @@ Ast*.dia.tsv
 *.pdf
 *.pepXML
 *.pin
+*.png
 /__pycache__
 comet.params
 *.pyc
@@ -13,3 +14,6 @@ __pycache__/pyXcorrDIA.cpython-312.pyc
 *.dia.tsv
 __pycache__/pyXcorrDIA.cpython-312.pyc
 DIANN-Output/report-lib.predicted.speclib
+tests/data/test_dia_60000-70000.mzML
+tests/data/test_dia_full.mzML
+/data

@@ -1,0 +1,79 @@
+Logging output to: Ast-Neo-15min-2mz-4ms-200agc-10.dia.log
+Using charge states: [2, 3]
+pyXcorrDIA: Using Comet XCorr with target-decoy competition
+- Enzyme: trypsin (Trypsin with proline suppression)
+- Missed cleavages: 1
+- Decoy generation: cycling 1 amino acid(s)
+- Bin width: 0.0200000 Th
+- Bin offset: 0.0
+- Static modifications:
+    C: +57.021464 Th
+- Peptide length range: 7-30 amino acids
+
+Loading spectrum library: report-lib.parquet
+  Filtered library precursors: 61191 -> 60600 (removed decoys) -> 60600 (Q.Value <= 0.01)
+Loaded library with 60600 precursors from report-lib.parquet
+Extracting peptides from spectrum library...
+  60600 precursors = 52968 unique peptides selected from library
+  Library peptide length range: 7-29
+  Using library charge states: [2, 3]
+
+*** Library-based search: Skipping FASTA digestion ***
+  Proteins will be mapped after scoring for high-confidence peptides
+  Creating peptide candidates from library...
+  Created 52968 library peptide candidates
+Generating target-decoy pairs for competition...
+Target-decoy pair generation summary:
+  Target peptides: 52968
+  Target-decoy pairs created: 52967
+  Collisions resolved: 0
+  Cycling fallback used: 6
+  Peptides without valid decoys: 1
+Target-decoy pairs: 52967 pairs ready for competition
+Reading mzML file...
+Using combined single-pass mzML reader (MS1 + MS2)...
+  Loaded 143903 MS2 spectra
+  Loaded 576 MS1 spectra for precursor isotope scoring
+Processing 143903 MS2 spectra with Target-Decoy Competition
+
+*** DIA PEPTIDE-CENTRIC SEARCH MODE ***
+Strategy: Score ALL peptides in isolation window against ALL spectra in that window
+Output: TSV file with paired target/decoy results (competition performed during analysis)
+- Summary results (TSV): Ast-Neo-15min-2mz-4ms-200agc-10.dia.tsv
+- Unified chromatograms (Parquet): ./Ast-Neo-15min-2mz-4ms-200agc-10.dia-chrom.parquet
+- Temp per-window files: Ast-Neo-15min-2mz-4ms-200agc-10_dia_chromatograms/ (will be merged and can be deleted)
+
+================================================================================
+CALIBRATION SEARCH
+================================================================================
+
+Calibration attempt 1: Sampling 2000 high-quality precursors...
+  Sampled 2000 precursors from library
+  Created 2000 target-decoy pairs for calibration search
+  Grouping spectra by isolation window...
+  Found 250 isolation windows
+  Searching 250 isolation windows with 2000 peptides...
+  DIA: Completed window 404.4-406.4: 20 pairs processed in 0.29 min
+  DIA: Completed window 406.4-408.4: 14 pairs processed in 0.28 min
+  DIA: Completed window 408.4-410.4: 16 pairs processed in 0.26 min
+  DIA: Completed window 410.4-412.4: 20 pairs processed in 0.29 min
+  DIA: Completed window 416.4-418.4: 13 pairs processed in 0.26 min
+Traceback (most recent call last):
+  File "/mnt/d/GitHub-Repo/maccoss/pyXcorrDIA/pyXcorrDIA.py", line 5436, in <module>
+    main()
+  File "/mnt/d/GitHub-Repo/maccoss/pyXcorrDIA/pyXcorrDIA.py", line 4869, in main
+    calibration = run_calibration_workflow(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/GitHub-Repo/maccoss/pyXcorrDIA/pyXcorrDIA.py", line 4175, in run_calibration_workflow
+    search_result = xcorr_engine.search_dia_peptide_centric(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/GitHub-Repo/maccoss/pyXcorrDIA/pyXcorrDIA.py", line 2418, in search_dia_peptide_centric
+    windowed = self.preprocess_spectrum(spectrum)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/GitHub-Repo/maccoss/pyXcorrDIA/pyXcorrDIA.py", line 1750, in preprocess_spectrum
+    windowed_spectrum = self._make_corr_data(binned_spectrum, highest_ion_bin, highest_intensity)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/GitHub-Repo/maccoss/pyXcorrDIA/pyXcorrDIA.py", line 1778, in _make_corr_data
+    if raw_spectrum[bin_idx] > max_window_intensity:
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

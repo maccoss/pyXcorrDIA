@@ -27,9 +27,15 @@ from pyteomics import mgf
 import os
 import bisect
 import sys
+import json
 from datetime import datetime
 from multiprocessing import Pool, cpu_count
 import pandas as pd
+from scipy import stats
+try:
+    from statsmodels.nonparametric.smoothers_lowess import lowess
+except ImportError:
+    lowess = None  # Will fall back to linear regression if statsmodels not available
 
 
 class MassSpectrum:
@@ -55,10 +61,11 @@ class MassSpectrum:
 class PeptideCandidate:
     """Represents a peptide candidate with its theoretical spectrum."""
 
-    def __init__(self, sequence: str, protein_id: str, mass: float):
+    def __init__(self, sequence: str, protein_id: str, mass: float, charge: int = None):
         self.sequence = sequence
         self.protein_id = protein_id
         self.mass = mass
+        self.charge = charge  # Optional: used for calibration mode with library sampling
         self.theoretical_spectrum = None
 
 
@@ -106,7 +113,8 @@ class SpectrumLibrary:
         Args:
             library_path: Path to DIA-NN parquet library file
             verbose: Print library loading message (default: True)
-            test_limit_peptides: For testing, limit to first N peptides (0 = use all, default: 0)
+            test_limit_peptides: For testing, randomly select N precursors (0 = use all, default: 0)
+                               Uses fixed seed (42) for reproducibility
         """
         self.library_path = library_path
         self.library_df = None
@@ -166,8 +174,13 @@ class SpectrumLibrary:
             # Get unique precursors (sequence, charge combinations)
             unique_precursors = self.library_df[['Stripped.Sequence', 'Precursor.Charge']].drop_duplicates()
             
-            # Take first N peptides
-            limited_precursors = unique_precursors.head(self.test_limit_peptides)
+            # Randomly select N precursors with fixed seed for reproducibility
+            import random
+            random.seed(42)  # Fixed seed for reproducible selection
+            if len(unique_precursors) > self.test_limit_peptides:
+                limited_precursors = unique_precursors.sample(n=self.test_limit_peptides, random_state=42)
+            else:
+                limited_precursors = unique_precursors
             
             # Filter library to only include these peptides
             self.library_df = self.library_df.merge(
@@ -178,7 +191,7 @@ class SpectrumLibrary:
             
             final_precursors = self.library_df.groupby(['Stripped.Sequence', 'Precursor.Charge']).ngroups
             if self.verbose:
-                print(f"  Test mode: Limited to first {self.test_limit_peptides} peptides -> {final_precursors} precursors")
+                print(f"  Test mode: Randomly selected {self.test_limit_peptides} precursors (seed=42) -> {final_precursors} precursors in library")
 
         # Build index: (stripped_sequence, charge) -> precursor data
         # Group by precursor to collect all fragments
@@ -428,6 +441,44 @@ class SpectrumLibrary:
         # Add additional protons for charge and divide
         mz = (mass + (frag_charge - 1) * xcorr_engine.proton_mass) / frag_charge
         return mz
+
+    def sample_precursors(self, n: int, seed: int = 42, max_qvalue: float = 0.01):
+        """
+        Randomly sample N high-quality precursors from library for calibration.
+        
+        Args:
+            n: Number of precursors to sample
+            seed: Random seed for reproducibility
+            max_qvalue: Maximum q-value for "high-quality" (default: 0.01)
+            
+        Returns:
+            List of (stripped_sequence, charge) tuples
+        """
+        import random
+        random.seed(seed)
+        
+        if self.library_df is None:
+            raise ValueError("Library not loaded")
+        
+        # Filter to high quality if Q.Value column exists
+        if 'Q.Value' in self.library_df.columns:
+            high_quality = self.library_df[self.library_df['Q.Value'] <= max_qvalue]
+        else:
+            high_quality = self.library_df
+        
+        # Get unique precursors (Stripped.Sequence + Precursor.Charge)
+        precursors = high_quality[['Stripped.Sequence', 'Precursor.Charge']].drop_duplicates()
+        
+        # Sample N
+        if len(precursors) < n:
+            print(f"Warning: Only {len(precursors)} high-quality precursors available (requested {n})")
+            sampled = precursors
+        else:
+            sampled = precursors.sample(n=n, random_state=seed)
+        
+        # Return as list of tuples
+        return [(row['Stripped.Sequence'], row['Precursor.Charge']) 
+                for _, row in sampled.iterrows()]
 
 
 class FastXCorr:
@@ -2243,6 +2294,8 @@ class FastXCorr:
                                    lib_precursor_tol_ppm: float = 10.0,
                                    lib_fragment_tol_unit: str = 'ppm',
                                    lib_precursor_tol_unit: str = 'ppm',
+                                   calibration: Dict = None,
+                                   skip_xcorr_matrix: bool = False,
                                    verbose: int = 0) -> Dict:
         """
         Perform comprehensive peptide-centric DIA search.
@@ -2254,14 +2307,17 @@ class FastXCorr:
         4. E-value: best peptide XCorr vs all its XCorr scores across spectra
         5. If library provided: LibCosine-centric scoring with target/decoy competition (report winner only)
         6. If no library: Track target/decoy pairs for downstream competition analysis
+        7. If calibration provided: Apply RT filtering and adjusted m/z tolerances, calculate delta columns
         
         Args:
             spectra: List of spectra (should be from same isolation window)
             target_decoy_pairs: List of (target, decoy) peptide pairs
             charge_states: Charge states to search
-            parquet_output: Path to write Parquet file (if None, uses temp file)
+            parquet_output: Path to write Parquet file (if None, skips parquet writing)
             library: Optional SpectrumLibrary for LibCosine scoring
             ms1_spectra: Optional MS1 spectra for precursor isotope scoring
+            calibration: Optional calibration dict with ms1_calibration, ms2_calibration, rt_calibration
+            skip_xcorr_matrix: If True and library mode, skip XCorr calculation entirely (for calibration)
             
         Returns:
             Dictionary with results per peptide (and path to Parquet file)
@@ -2284,40 +2340,83 @@ class FastXCorr:
         # Get isolation window (same for all spectra in this group)
         isolation_window = (spectra[0].isolation_window_lower, spectra[0].isolation_window_upper)
         
-        # Set up Parquet output file
-        if parquet_output is None:
+        # Set up Parquet output file (skip if None - used during calibration)
+        skip_parquet = parquet_output is None
+        if not skip_parquet:
+            # Only create default filename if not skipping
             window_str = f"{isolation_window[0]:.1f}_{isolation_window[1]:.1f}"
-            parquet_output = f"dia_chromatograms_window_{window_str}.parquet"
+            if parquet_output == '':
+                parquet_output = f"dia_chromatograms_window_{window_str}.parquet"
         
         # Find all peptides in this isolation window
         # Track target/decoy pairs for later linkage
-        peptides_in_window = []  # List of (peptide, charge, is_target, pair_id)
+        peptides_in_window = []  # List of (peptide, charge, is_target, pair_id, lib_rt)
         pair_id = 0
         unique_peptide_sequences = set()  # Track unique sequences for diagnostics
+        peptides_filtered_by_rt = 0  # Count peptides filtered by RT calibration
         
         for target_peptide, decoy_peptide in target_decoy_pairs:
-            for charge in charge_states:
+            # Check if peptide has a specific charge (calibration mode with library sampling)
+            # In this case, use only that charge instead of iterating through charge_states
+            if hasattr(target_peptide, 'charge') and target_peptide.charge is not None:
+                charges_to_test = [target_peptide.charge]
+            else:
+                charges_to_test = charge_states
+            
+            for charge in charges_to_test:
                 target_mz = (target_peptide.mass + charge * self.proton_mass) / charge
                 
                 if isolation_window[0] <= target_mz <= isolation_window[1]:
-                    # Both target and decoy share the same pair_id for linkage
-                    peptides_in_window.append((target_peptide, charge, True, pair_id))
-                    peptides_in_window.append((decoy_peptide, charge, False, pair_id))
-                    unique_peptide_sequences.add(target_peptide.sequence)
-                    pair_id += 1
+                    # Get library RT if available for RT filtering
+                    lib_rt = None
+                    if library is not None:
+                        lib_data = library.get_precursor(target_peptide.sequence, charge)
+                        if lib_data:
+                            lib_rt = lib_data['rt']
+                    
+                    # Apply RT filtering if calibration available
+                    skip_peptide = False
+                    if calibration is not None and lib_rt is not None:
+                        rt_cal = calibration.get('rt_calibration', {})
+                        if rt_cal.get('model_type') is not None:
+                            # Predict expected RT from library RT
+                            predicted_rt = self.apply_rt_calibration(lib_rt, calibration)
+                            rt_window = rt_cal.get('residual_sd', 0) * 3  # 3σ window
+                            
+                            # Check if any spectrum in this window falls within RT range
+                            rt_range_min = predicted_rt - rt_window
+                            rt_range_max = predicted_rt + rt_window
+                            
+                            # Check if any spectrum RT falls in range
+                            has_spectrum_in_range = any(
+                                rt_range_min <= s.retention_time <= rt_range_max 
+                                for s in spectra if hasattr(s, 'retention_time')
+                            )
+                            
+                            if not has_spectrum_in_range:
+                                skip_peptide = True
+                                peptides_filtered_by_rt += 1
+                    
+                    if not skip_peptide:
+                        # Both target and decoy share the same pair_id for linkage
+                        peptides_in_window.append((target_peptide, charge, True, pair_id, lib_rt))
+                        peptides_in_window.append((decoy_peptide, charge, False, pair_id, lib_rt))
+                        unique_peptide_sequences.add(target_peptide.sequence)
+                        pair_id += 1
         
         # Preprocess all theoretical spectra once
         # Count targets and decoys
-        n_targets = sum(1 for _, _, is_target, _ in peptides_in_window if is_target)
+        n_targets = sum(1 for _, _, is_target, _, _ in peptides_in_window if is_target)
         n_decoys = len(peptides_in_window) - n_targets
         window_str = f"{isolation_window[0]:.1f}-{isolation_window[1]:.1f}"
         if verbose >= 1:
             n_unique_seqs = len(unique_peptide_sequences)
             n_precursors = pair_id
-            print(f"  DIA: Preprocessing {len(peptides_in_window)} theoretical spectra from {n_unique_seqs} unique peptides ({n_precursors} precursors = peptide+charge combinations) for isolation window {window_str}")
+            rt_filter_msg = f" ({peptides_filtered_by_rt} filtered by RT)" if peptides_filtered_by_rt > 0 else ""
+            print(f"  DIA: Preprocessing {len(peptides_in_window)} theoretical spectra from {n_unique_seqs} unique peptides ({n_precursors} precursors = peptide+charge combinations) for isolation window {window_str}{rt_filter_msg}")
         peptide_theoretical_preprocessed = {}
         
-        for peptide, charge, is_target, pair_id in peptides_in_window:
+        for peptide, charge, is_target, pair_id, lib_rt in peptides_in_window:
             theoretical = self.generate_theoretical_spectrum(peptide, charge)
             preprocessed = self.preprocess_theoretical_spectrum(theoretical)
             peptide_theoretical_preprocessed[(peptide, charge)] = preprocessed
@@ -2340,25 +2439,41 @@ class FastXCorr:
         if verbose >= 1:
             print(f"  DIA: Scoring {len(peptides_in_window)} peptides vs {len(spectra)} spectra using vectorized matrix multiplication for isolation window {window_str}")
         
-        # Stack all theoretical spectra into a matrix: (n_peptides, n_bins)
-        theoretical_matrix = np.vstack([peptide_theoretical_preprocessed[(p, c)] 
-                                        for p, c, t, pair_id in peptides_in_window])
+        # Skip if no peptides in window
+        if len(peptides_in_window) == 0:
+            if verbose >= 1:
+                print(f"  DIA: No peptides in isolation window {window_str}, skipping")
+            return {
+                'results': {},
+                'parquet_file': None,
+                'qc_data': qc_data,
+                'num_results': 0
+            }
         
-        # Stack all experimental spectra into a matrix: (n_spectra, n_bins)
-        experimental_matrix = np.vstack(experimental_preprocessed)
-        
-        # Matrix multiply: (n_peptides, n_spectra) in one operation using unified calculate_xcorr()
-        # This replaces the nested loops with a single optimized BLAS call
-        # Use peptide-centric scaling factor (0.0001 instead of 0.005)
-        xcorr_result = self.calculate_xcorr(theoretical_matrix, experimental_matrix, 
-                                             scaling_factor=0.0001)
-        # Type assertion: matrix inputs always return ndarray
-        assert isinstance(xcorr_result, np.ndarray), "Matrix scoring should return ndarray"
-        xcorr_matrix_raw: np.ndarray = xcorr_result
-        
-        # Show matrix scoring complete if verbose
-        if verbose >= 1:
-            print("  DIA: Matrix scoring complete, processing results...")
+        # **XCORR MATRIX CALCULATION** (skip during calibration for speed)
+        xcorr_matrix_raw = None
+        if library is None or not skip_xcorr_matrix:
+            # Stack all theoretical spectra into a matrix: (n_peptides, n_bins)
+            theoretical_matrix = np.vstack([peptide_theoretical_preprocessed[(p, c)] 
+                                            for p, c, t, pair_id, lib_rt in peptides_in_window])
+            
+            # Stack all experimental spectra into a matrix: (n_spectra, n_bins)
+            experimental_matrix = np.vstack(experimental_preprocessed)
+            
+            # Matrix multiply: (n_peptides, n_spectra) in one operation using unified calculate_xcorr()
+            # This replaces the nested loops with a single optimized BLAS call
+            # Use peptide-centric scaling factor (0.0001 instead of 0.005)
+            xcorr_result = self.calculate_xcorr(theoretical_matrix, experimental_matrix, 
+                                                 scaling_factor=0.0001)
+            # Type assertion: matrix inputs always return ndarray
+            assert isinstance(xcorr_result, np.ndarray), "Matrix scoring should return ndarray"
+            xcorr_matrix_raw: np.ndarray = xcorr_result
+            
+            # Show matrix scoring complete if verbose
+            if verbose >= 1:
+                print("  DIA: Matrix scoring complete, processing results...")
+        elif verbose >= 1:
+            print("  DIA: Skipping XCorr matrix calculation (calibration mode)")
 
         # **LIBRARY SCORING**: Score library fragments if library is provided
         lib_cosine_matrix_target = None
@@ -2382,6 +2497,7 @@ class FastXCorr:
                 sorted_intensity = spectrum.intensity_array[sorted_indices]
                 
                 # Apply SMZ preprocessing: sqrt(intensity) * mz^2
+                # This is separate from XCorr preprocessing which uses sqrt only
                 preprocessed_intensity = np.sqrt(sorted_intensity) * (sorted_mz ** 2)
                 
                 experimental_preprocessed_lib.append({
@@ -2389,8 +2505,20 @@ class FastXCorr:
                     'intensity_preprocessed': preprocessed_intensity
                 })
 
+            # Calculate adjusted m/z tolerances if calibration available
+            adjusted_precursor_tol_ppm = lib_precursor_tol_ppm
+            adjusted_fragment_tol_ppm = lib_fragment_tol_ppm
+            if calibration is not None:
+                ms1_cal = calibration.get('ms1_calibration', {})
+                ms2_cal = calibration.get('ms2_calibration', {})
+                # Expand tolerance to mean + 3σ for both precursor and fragments
+                if ms1_cal.get('mean_ppm') is not None and ms1_cal.get('sd_ppm') is not None:
+                    adjusted_precursor_tol_ppm = abs(ms1_cal['mean_ppm']) + 3 * ms1_cal['sd_ppm']
+                if ms2_cal.get('mean_ppm') is not None and ms2_cal.get('sd_ppm') is not None:
+                    adjusted_fragment_tol_ppm = abs(ms2_cal['mean_ppm']) + 3 * ms2_cal['sd_ppm']
+            
             # Score each peptide's library fragments
-            for pep_idx, (peptide, charge, is_target, pair_id) in enumerate(peptides_in_window):
+            for pep_idx, (peptide, charge, is_target, pair_id, lib_rt) in enumerate(peptides_in_window):
                 # Get target library data
                 target_lib_data = library.get_precursor(peptide.sequence, charge)
 
@@ -2403,17 +2531,28 @@ class FastXCorr:
                         fragments = target_lib_data['fragments']
                         lib_mz = np.array([frag['mz'] for frag in fragments])
                         
+                        # Store MS2 errors temporarily for each spectrum (will only keep best spectrum's errors)
+                        temp_ms2_errors = {}  # spectrum_idx -> list of errors
+                        
                         # Score against all spectra
                         for spec_idx, exp_data in enumerate(experimental_preprocessed_lib):
                             # Extract matching peaks using binary search with tolerance
                             matched_exp = []
                             matched_lib = []
+                            spectrum_ms2_errors = []  # Errors for this spectrum
                             
                             for lib_idx, lib_mz_val in enumerate(lib_mz):
-                                # Calculate tolerance window
-                                tol_da = lib_mz_val * lib_fragment_tol_ppm / 1e6
-                                mz_min = lib_mz_val - tol_da
-                                mz_max = lib_mz_val + tol_da
+                                # Apply m/z correction if calibration available
+                                corrected_lib_mz = lib_mz_val
+                                if calibration is not None:
+                                    ms2_cal = calibration.get('ms2_calibration', {})
+                                    if ms2_cal.get('mean_ppm') is not None:
+                                        corrected_lib_mz = lib_mz_val * (1 + ms2_cal['mean_ppm'] / 1e6)
+                                
+                                # Calculate tolerance window using adjusted tolerance
+                                tol_da = corrected_lib_mz * adjusted_fragment_tol_ppm / 1e6
+                                mz_min = corrected_lib_mz - tol_da
+                                mz_max = corrected_lib_mz + tol_da
                                 
                                 # Binary search for matching peaks
                                 left_idx = np.searchsorted(exp_data['mz'], mz_min, side='left')
@@ -2429,18 +2568,22 @@ class FastXCorr:
                                     matched_exp.append(window_intensity[best_idx])
                                     matched_lib.append(lib_preprocessed_normalized[lib_idx])
                                     
-                                    # Collect QC data: MS2 fragment mass error with peptide identifier
+                                    # Store MS2 error temporarily (will only add to qc_data at best spectrum)
                                     matched_mz = window_mz[best_idx]
                                     if lib_fragment_tol_unit == 'ppm':
                                         ms2_mass_error = (matched_mz - lib_mz_val) / lib_mz_val * 1e6  # PPM
                                     else:
                                         ms2_mass_error = matched_mz - lib_mz_val  # m/z
-                                    qc_data['ms2_mass_errors'].append({
+                                    spectrum_ms2_errors.append({
                                         'error': ms2_mass_error,
                                         'peptide': peptide.sequence,
                                         'charge': charge,
                                         'is_target': is_target
                                     })
+                            
+                            # Store errors for this spectrum
+                            if len(spectrum_ms2_errors) > 0:
+                                temp_ms2_errors[spec_idx] = spectrum_ms2_errors
                             
                             # Calculate cosine similarity
                             if len(matched_exp) > 0:
@@ -2451,6 +2594,12 @@ class FastXCorr:
                                 if exp_norm > 0:
                                     matched_exp_normalized = matched_exp / exp_norm
                                     lib_cosine_matrix_target[pep_idx, spec_idx] = np.dot(matched_exp_normalized, matched_lib)
+                        
+                        # Store temp errors for later (will only add best spectrum's errors after finding best LibCosine)
+                        # Use pep_idx as key to retrieve later
+                        if not hasattr(self, '_temp_ms2_errors_target'):
+                            self._temp_ms2_errors_target = {}
+                        self._temp_ms2_errors_target[pep_idx] = temp_ms2_errors
 
                     # Generate and score decoy fragments
                     decoy_lib_data = library.generate_decoy_fragments(peptide.sequence, charge, self)
@@ -2464,16 +2613,27 @@ class FastXCorr:
                             fragments_decoy = decoy_lib_data['fragments']
                             lib_mz_decoy = np.array([frag['mz'] for frag in fragments_decoy])
                             
+                            # Store MS2 errors temporarily for each spectrum (will only keep best spectrum's errors)
+                            temp_ms2_errors_decoy = {}  # spectrum_idx -> list of errors
+                            
                             # Score against all spectra
                             for spec_idx, exp_data in enumerate(experimental_preprocessed_lib):
                                 # Extract matching peaks
                                 matched_exp = []
                                 matched_lib = []
+                                spectrum_ms2_errors = []  # Errors for this spectrum
                                 
                                 for lib_idx, lib_mz_val in enumerate(lib_mz_decoy):
-                                    tol_da = lib_mz_val * lib_fragment_tol_ppm / 1e6
-                                    mz_min = lib_mz_val - tol_da
-                                    mz_max = lib_mz_val + tol_da
+                                    # Apply m/z correction if calibration available
+                                    corrected_lib_mz = lib_mz_val
+                                    if calibration is not None:
+                                        ms2_cal = calibration.get('ms2_calibration', {})
+                                        if ms2_cal.get('mean_ppm') is not None:
+                                            corrected_lib_mz = lib_mz_val * (1 + ms2_cal['mean_ppm'] / 1e6)
+                                    
+                                    tol_da = corrected_lib_mz * adjusted_fragment_tol_ppm / 1e6
+                                    mz_min = corrected_lib_mz - tol_da
+                                    mz_max = corrected_lib_mz + tol_da
                                     
                                     left_idx = np.searchsorted(exp_data['mz'], mz_min, side='left')
                                     right_idx = np.searchsorted(exp_data['mz'], mz_max, side='right')
@@ -2485,6 +2645,23 @@ class FastXCorr:
                                         best_idx = np.argmin(np.abs(window_mz - lib_mz_val))
                                         matched_exp.append(window_intensity[best_idx])
                                         matched_lib.append(lib_preprocessed_decoy_normalized[lib_idx])
+                                        
+                                        # Store MS2 error temporarily (will only add to qc_data at best spectrum)
+                                        matched_mz = window_mz[best_idx]
+                                        if lib_fragment_tol_unit == 'ppm':
+                                            ms2_mass_error = (matched_mz - lib_mz_val) / lib_mz_val * 1e6  # PPM
+                                        else:
+                                            ms2_mass_error = matched_mz - lib_mz_val  # m/z
+                                        spectrum_ms2_errors.append({
+                                            'error': ms2_mass_error,
+                                            'peptide': peptide.sequence,
+                                            'charge': charge,
+                                            'is_target': False
+                                        })
+                                
+                                # Store errors for this spectrum
+                                if len(spectrum_ms2_errors) > 0:
+                                    temp_ms2_errors_decoy[spec_idx] = spectrum_ms2_errors
                                 
                                 if len(matched_exp) > 0:
                                     matched_exp = np.array(matched_exp)
@@ -2494,12 +2671,15 @@ class FastXCorr:
                                     if exp_norm > 0:
                                         matched_exp_normalized = matched_exp / exp_norm
                                         lib_cosine_matrix_decoy[pep_idx, spec_idx] = np.dot(matched_exp_normalized, matched_lib)
+                            
+                            # Store temp errors for later (will only add best spectrum's errors after finding best LibCosine)
+                            if not hasattr(self, '_temp_ms2_errors_decoy'):
+                                self._temp_ms2_errors_decoy = {}
+                            self._temp_ms2_errors_decoy[pep_idx] = temp_ms2_errors_decoy
 
             if verbose >= 1:
                 print("  DIA: Library scoring complete")
 
-        chromatogram_data = []  # Unified chromatogram data with all information
-        batch_size = 100  # Write every 100 peptides
         peptide_results = {}  # Track results by pair_id for paired output
         
         # PAIRED TARGET/DECOY OUTPUT (no competition during search):
@@ -2516,17 +2696,22 @@ class FastXCorr:
                 break  # Should not happen with proper pairing
             
             # Get target and decoy from pair
-            target_peptide, target_charge, target_is_target, target_pair_id = peptides_in_window[pair_idx]
-            decoy_peptide, decoy_charge, decoy_is_target, decoy_pair_id = peptides_in_window[pair_idx + 1]
+            target_peptide, target_charge, target_is_target, target_pair_id, target_lib_rt = peptides_in_window[pair_idx]
+            decoy_peptide, decoy_charge, decoy_is_target, decoy_pair_id, decoy_lib_rt = peptides_in_window[pair_idx + 1]
             
             # Verify this is a proper target/decoy pair
             if not target_is_target or decoy_is_target or target_pair_id != decoy_pair_id:
                 print(f"Warning: Improper pairing at index {pair_idx}")
                 continue
             
-            # Get XCorr series for both
-            target_xcorr = xcorr_matrix_raw[pair_idx, :].tolist()
-            decoy_xcorr = xcorr_matrix_raw[pair_idx + 1, :].tolist()
+            # Get XCorr series for both (if calculated)
+            if xcorr_matrix_raw is not None:
+                target_xcorr = xcorr_matrix_raw[pair_idx, :].tolist()
+                decoy_xcorr = xcorr_matrix_raw[pair_idx + 1, :].tolist()
+            else:
+                # Library-only mode (calibration): no XCorr calculated
+                target_xcorr = [0.0] * len(spectra)
+                decoy_xcorr = [0.0] * len(spectra)
             
             # Process target and decoy independently (no competition)
             if library is not None:
@@ -2556,6 +2741,13 @@ class FastXCorr:
             target_scan_id, target_rt, target_spec_idx = spectrum_metadata[target_primary_idx]
             target_xcorr_at_peak = target_xcorr[target_primary_idx]
             
+            # Add MS2 errors from best spectrum only (target)
+            if library is not None and hasattr(self, '_temp_ms2_errors_target'):
+                if pair_idx in self._temp_ms2_errors_target:
+                    temp_errors = self._temp_ms2_errors_target[pair_idx]
+                    if target_spec_idx in temp_errors:
+                        qc_data['ms2_mass_errors'].extend(temp_errors[target_spec_idx])
+            
             # Calculate target e-value (non-library mode only)
             if library is None:
                 temp_engine = FastXCorr()
@@ -2563,25 +2755,41 @@ class FastXCorr:
             else:
                 target_e_value = 0.0
             
+            # Calculate delta_rt if library RT available
+            target_delta_rt = None
+            if target_lib_rt is not None:
+                target_delta_rt = target_rt - target_lib_rt
+            
             # Calculate target precursor cosine (library mode with MS1)
             target_precursor_cosine = 0.0
+            target_delta_mz_ppm_precursor = None
             if library is not None and ms1_spectra is not None:
                 closest_ms1 = FastXCorr.find_closest_ms1(ms1_spectra, target_rt)
                 if closest_ms1 is not None:
                     lib_data = library.get_precursor(target_peptide.sequence, target_charge)
                     if lib_data:
+                        # Apply m/z correction if calibration available
+                        corrected_precursor_mz = lib_data['precursor_mz']
+                        if calibration is not None:
+                            ms1_cal = calibration.get('ms1_calibration', {})
+                            if ms1_cal.get('mean_ppm') is not None:
+                                corrected_precursor_mz = lib_data['precursor_mz'] * (1 + ms1_cal['mean_ppm'] / 1e6)
+                        
                         # Collect QC data: MS1 M+0 mass error
                         experimental_isotopes, m0_mass_error = FastXCorr.extract_isotope_envelope(
                             closest_ms1,
-                            lib_data['precursor_mz'],
+                            corrected_precursor_mz,
                             target_charge,
-                            lib_precursor_tol_ppm,
+                            adjusted_precursor_tol_ppm,
                             collect_qc=True
                         )
                         if m0_mass_error is not None:
-                            # Convert to PPM if needed
+                            # Calculate delta_mz_ppm_precursor (always in PPM)
+                            target_delta_mz_ppm_precursor = m0_mass_error / lib_data['precursor_mz'] * 1e6
+                            
+                            # Convert to appropriate unit for QC data
                             if lib_precursor_tol_unit == 'ppm':
-                                m0_mass_error_final = m0_mass_error / lib_data['precursor_mz'] * 1e6  # PPM
+                                m0_mass_error_final = target_delta_mz_ppm_precursor  # PPM
                             else:
                                 m0_mass_error_final = m0_mass_error  # m/z
                             qc_data['ms1_mass_errors'].append({
@@ -2616,6 +2824,18 @@ class FastXCorr:
             # **PROCESS DECOY**
             decoy_scan_id, decoy_rt, decoy_spec_idx = spectrum_metadata[decoy_primary_idx]
             decoy_xcorr_at_peak = decoy_xcorr[decoy_primary_idx]
+            
+            # Calculate delta_rt for decoy if library RT available
+            decoy_delta_rt = None
+            if decoy_lib_rt is not None:
+                decoy_delta_rt = decoy_rt - decoy_lib_rt
+            
+            # Add MS2 errors from best spectrum only (decoy)
+            if library is not None and hasattr(self, '_temp_ms2_errors_decoy'):
+                if pair_idx + 1 in self._temp_ms2_errors_decoy:
+                    temp_errors = self._temp_ms2_errors_decoy[pair_idx + 1]
+                    if decoy_spec_idx in temp_errors:
+                        qc_data['ms2_mass_errors'].extend(temp_errors[decoy_spec_idx])
             
             # Calculate decoy e-value (non-library mode only)
             if library is None:
@@ -2674,44 +2894,52 @@ class FastXCorr:
                 if lib_std > 0:
                     decoy_lib_zscore = (decoy_lib_cosine - lib_mean) / lib_std
             
-            # Store chromatogram data for both target and decoy
-            target_peptide_id = f"{target_peptide.sequence}_{target_charge}_T"
-            decoy_peptide_id = f"{decoy_peptide.sequence}_{target_charge}_D"
+            # Calculate delta_mz_ppm_fragments for target (average MS2 error from best spectrum)
+            target_delta_mz_ppm_fragments = None
+            if library is not None and hasattr(self, '_temp_ms2_errors_target'):
+                if pair_idx in self._temp_ms2_errors_target:
+                    temp_errors = self._temp_ms2_errors_target[pair_idx]
+                    if target_spec_idx in temp_errors:
+                        # Average of all fragment errors (already in PPM)
+                        errors = [e['error'] for e in temp_errors[target_spec_idx]]
+                        if len(errors) > 0:
+                            target_delta_mz_ppm_fragments = np.mean(errors)
             
-            for spec_idx in range(len(target_xcorr)):
-                scan_id, rt_minutes, _ = spectrum_metadata[spec_idx]
-                
-                # Target chromatogram entry
-                target_chrom_entry = {
-                    'peptide_id': target_peptide_id,
-                    'peptide_sequence': target_peptide.sequence,
-                    'charge': target_charge,
-                    'is_target': True,
-                    'scan_id': scan_id,
-                    'retention_time': rt_minutes,
-                    'xcorr_raw': target_xcorr[spec_idx],
-                    'xcorr_smoothed': target_xcorr[spec_idx],
-                }
-                if target_lib is not None:
-                    target_chrom_entry['lib_cosine_target'] = target_lib[spec_idx]
-                    target_chrom_entry['lib_cosine_decoy'] = 0.0
-                chromatogram_data.append(target_chrom_entry)
-                
-                # Decoy chromatogram entry
-                decoy_chrom_entry = {
-                    'peptide_id': decoy_peptide_id,
-                    'peptide_sequence': decoy_peptide.sequence,
-                    'charge': target_charge,
-                    'is_target': False,
-                    'scan_id': scan_id,
-                    'retention_time': rt_minutes,
-                    'xcorr_raw': decoy_xcorr[spec_idx],
-                    'xcorr_smoothed': decoy_xcorr[spec_idx],
-                }
-                if decoy_lib is not None:
-                    decoy_chrom_entry['lib_cosine_target'] = 0.0
-                    decoy_chrom_entry['lib_cosine_decoy'] = decoy_lib[spec_idx]
-                chromatogram_data.append(decoy_chrom_entry)
+            # Calculate delta_mz_ppm_fragments for decoy (average MS2 error from best spectrum)
+            decoy_delta_mz_ppm_fragments = None
+            if library is not None and hasattr(self, '_temp_ms2_errors_decoy'):
+                if pair_idx + 1 in self._temp_ms2_errors_decoy:
+                    temp_errors = self._temp_ms2_errors_decoy[pair_idx + 1]
+                    if decoy_spec_idx in temp_errors:
+                        # Average of all fragment errors (already in PPM)
+                        errors = [e['error'] for e in temp_errors[decoy_spec_idx]]
+                        if len(errors) > 0:
+                            decoy_delta_mz_ppm_fragments = np.mean(errors)
+            
+            # Calculate delta_mz_ppm_precursor for decoy
+            decoy_delta_mz_ppm_precursor = None
+            if library is not None and ms1_spectra is not None:
+                closest_ms1_decoy = FastXCorr.find_closest_ms1(ms1_spectra, decoy_rt)
+                if closest_ms1_decoy is not None:
+                    lib_data_decoy = library.get_precursor(target_peptide.sequence, target_charge)
+                    if lib_data_decoy:
+                        # Apply m/z correction if calibration available
+                        corrected_precursor_mz_decoy = lib_data_decoy['precursor_mz']
+                        if calibration is not None:
+                            ms1_cal = calibration.get('ms1_calibration', {})
+                            if ms1_cal.get('mean_ppm') is not None:
+                                corrected_precursor_mz_decoy = lib_data_decoy['precursor_mz'] * (1 + ms1_cal['mean_ppm'] / 1e6)
+                        
+                        experimental_isotopes_decoy, m0_mass_error_decoy = FastXCorr.extract_isotope_envelope(
+                            closest_ms1_decoy,
+                            corrected_precursor_mz_decoy,
+                            target_charge,
+                            adjusted_precursor_tol_ppm,
+                            collect_qc=True
+                        )
+                        
+                        if m0_mass_error_decoy is not None:
+                            decoy_delta_mz_ppm_precursor = m0_mass_error_decoy / lib_data_decoy['precursor_mz'] * 1e6
             
             # Store paired results
             target_result_dict = {
@@ -2724,6 +2952,9 @@ class FastXCorr:
                 'e_value': target_e_value,
                 'num_spectra_scored': len(target_xcorr),
                 'xcorr_zscore': target_xcorr_zscore,
+                'delta_rt': target_delta_rt,
+                'delta_mz_ppm_precursor': target_delta_mz_ppm_precursor,
+                'delta_mz_ppm_fragments': target_delta_mz_ppm_fragments,
             }
             
             decoy_result_dict = {
@@ -2736,6 +2967,9 @@ class FastXCorr:
                 'e_value': decoy_e_value,
                 'num_spectra_scored': len(decoy_xcorr),
                 'xcorr_zscore': decoy_xcorr_zscore,
+                'delta_rt': decoy_delta_rt,
+                'delta_mz_ppm_precursor': decoy_delta_mz_ppm_precursor,
+                'delta_mz_ppm_fragments': decoy_delta_mz_ppm_fragments,
             }
             
             # Add library-specific fields
@@ -2748,12 +2982,12 @@ class FastXCorr:
                 decoy_result_dict['lib_cosine_decoy_zscore'] = decoy_lib_zscore
                 decoy_result_dict['precursor_cosine_decoy'] = decoy_precursor_cosine
                 
-                # Collect QC data: RT pairs for library mode
+                # Collect QC data: RT pairs for library mode (targets only)
                 # Get library RT for this peptide from the library
                 lib_data = library.get_precursor(target_peptide.sequence, target_charge)
                 if lib_data and 'rt' in lib_data:
                     library_rt = lib_data['rt']
-                    # Store RT pairs for target (will filter by FDR later)
+                    # Store RT pair for target only (decoys don't have meaningful library RTs)
                     qc_data['rt_pairs'].append({
                         'library_rt': library_rt,
                         'measured_rt': target_rt,
@@ -2762,35 +2996,12 @@ class FastXCorr:
                         'peptide': target_peptide.sequence,
                         'charge': target_charge
                     })
-                    # Also store decoy RT pairs (for completeness)
-                    qc_data['rt_pairs'].append({
-                        'library_rt': library_rt,
-                        'measured_rt': decoy_rt,
-                        'lib_cosine': decoy_lib_cosine,
-                        'is_target': False,
-                        'peptide': decoy_peptide.sequence,
-                        'charge': target_charge
-                    })
             
             # Store paired results by pair_id
             peptide_results[target_pair_id] = {
                 'target': target_result_dict,
                 'decoy': decoy_result_dict
             }
-            
-            # Write batch to Parquet incrementally
-            if (pair_idx + 2) % (batch_size * 2) == 0 or (pair_idx + 2) >= len(peptides_in_window):
-                chrom_df = pd.DataFrame(chromatogram_data)
-                if pair_idx < batch_size * 2:
-                    chrom_df.to_parquet(parquet_output, engine='pyarrow', index=False)
-                else:
-                    existing_chrom = pd.read_parquet(parquet_output)
-                    combined_chrom = pd.concat([existing_chrom, chrom_df], ignore_index=True)
-                    combined_chrom.to_parquet(parquet_output, engine='pyarrow', index=False)
-                
-                if verbose >= 1:
-                    print(f"  DIA: Processed {(pair_idx + 2)//2}/{len(peptides_in_window)//2} pairs, wrote batch")
-                chromatogram_data = []
         
         # Show completion at verbose=0 (always show, once per window)
         window_elapsed = time.time() - window_start_time
@@ -2799,7 +3010,7 @@ class FastXCorr:
 
         return {
             'results': peptide_results,
-            'parquet_file': parquet_output,
+            'parquet_file': None if skip_parquet else parquet_output,
             'num_spectra': len(spectra),
             'num_peptides': len(peptides_in_window),
             'isolation_window': isolation_window,
@@ -2872,7 +3083,7 @@ class FastXCorr:
         Returns:
             np.array of 5 m/z values [M-1, M+0, M+1, M+2, M+3]
         """
-        neutron_mass = 1.002868  # Mass difference between isotopes
+        neutron_mass = 1.002868  # Mass difference between isotopes. This came from Devin Schweppe.
         isotope_gap = neutron_mass / charge
 
         mz_values = np.array([
@@ -3037,6 +3248,198 @@ class FastXCorr:
 
         # Calculate cosine angle
         return FastXCorr.calculate_cosine_angle(exp_preprocessed, lib_preprocessed)
+
+    def calculate_mz_calibration(self, qc_data: Dict) -> Dict:
+        """
+        Calculate m/z calibration parameters from QC data.
+        
+        Args:
+            qc_data: QC data dictionary with ms1_mass_errors and ms2_mass_errors
+                     (can be either list of dicts with 'error' key or list of scalar values)
+            
+        Returns:
+            Dictionary with MS1 and MS2 calibration parameters
+        """
+        # Handle both formats: list of dicts or list of scalars
+        ms1_list = qc_data['ms1_mass_errors']
+        ms2_list = qc_data['ms2_mass_errors']
+        
+        # Extract errors if they're in dict format, otherwise use directly
+        # Check for dict by trying to access 'error' key rather than isinstance
+        try:
+            if len(ms1_list) > 0:
+                # Try to access as dict
+                _ = ms1_list[0]['error']
+                ms1_errors = np.array([e['error'] for e in ms1_list])
+            else:
+                ms1_errors = np.array([])
+        except (TypeError, KeyError, IndexError):
+            # Not a dict or not indexable, use directly
+            ms1_errors = np.array(ms1_list)
+            
+        try:
+            if len(ms2_list) > 0:
+                # Try to access as dict
+                _ = ms2_list[0]['error']
+                ms2_errors = np.array([e['error'] for e in ms2_list])
+            else:
+                ms2_errors = np.array([])
+        except (TypeError, KeyError, IndexError):
+            # Not a dict or not indexable, use directly
+            ms2_errors = np.array(ms2_list)
+        
+        ms1_unit = qc_data['ms1_tol_unit']
+        ms2_unit = qc_data['ms2_tol_unit']
+        
+        # Calculate statistics
+        ms1_mean = np.mean(ms1_errors) if len(ms1_errors) > 0 else 0.0
+        ms1_sd = np.std(ms1_errors, ddof=1) if len(ms1_errors) > 1 else 0.0
+        
+        ms2_mean = np.mean(ms2_errors) if len(ms2_errors) > 0 else 0.0
+        ms2_sd = np.std(ms2_errors, ddof=1) if len(ms2_errors) > 1 else 0.0
+        
+        return {
+            'ms1_mean': ms1_mean,
+            'ms1_sd': ms1_sd,
+            'ms1_unit': ms1_unit,
+            'ms2_mean': ms2_mean,
+            'ms2_sd': ms2_sd,
+            'ms2_unit': ms2_unit
+        }
+    
+    def fit_rt_calibration(self, rt_pairs: List[Dict]) -> Dict:
+        """
+        Fit RT calibration model using LOESS regression with fallback to linear.
+        
+        Args:
+            rt_pairs: List of {library_rt, measured_rt, lib_cosine, is_target, ...} dicts
+            
+        Returns:
+            Dictionary with RT calibration model and residual SD
+        """
+        if len(rt_pairs) < 50:
+            print(f"Warning: Only {len(rt_pairs)} RT pairs for calibration. Using linear regression.")
+            method = 'linear'
+        elif lowess is None:
+            print("Warning: statsmodels not available. Using linear regression for RT calibration.")
+            method = 'linear'
+        else:
+            method = 'loess'
+        
+        library_rts = np.array([p['library_rt'] for p in rt_pairs])
+        measured_rts = np.array([p['measured_rt'] for p in rt_pairs])
+        
+        if method == 'loess':
+            try:
+                # LOESS smoothing (frac=0.3 for local smoothing)
+                smoothed = lowess(measured_rts, library_rts, frac=0.3, return_sorted=True)
+                
+                # Calculate R² and RMSE
+                predicted_rts = np.interp(library_rts, smoothed[:, 0], smoothed[:, 1])
+                residuals = measured_rts - predicted_rts
+                ss_res = np.sum(residuals ** 2)
+                ss_tot = np.sum((measured_rts - np.mean(measured_rts)) ** 2)
+                r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+                rmse = np.sqrt(np.mean(residuals ** 2))
+                
+                # Store LOESS model as interpolation points
+                model_params = {
+                    'library_rts': smoothed[:, 0].tolist(),
+                    'predicted_rts': smoothed[:, 1].tolist()
+                }
+                
+                # Check if LOESS fit is acceptable (R² >= 0.7)
+                if r_squared < 0.7:
+                    print(f"Warning: LOESS fit R²={r_squared:.3f} < 0.7. Falling back to linear regression.")
+                    method = 'linear'
+                else:
+                    residual_sd = np.std(residuals, ddof=1)
+                    
+                    return {
+                        'method': method,
+                        'r_squared': r_squared,
+                        'rmse': rmse,
+                        'residual_sd': residual_sd,
+                        'model_params': model_params
+                    }
+            except Exception as e:
+                print(f"Warning: LOESS fitting failed: {e}. Falling back to linear regression.")
+                method = 'linear'
+        
+        # Linear regression fallback
+        if method == 'linear':
+            slope, intercept, r_value, p_value, std_err = stats.linregress(library_rts, measured_rts)
+            predicted_rts = slope * library_rts + intercept
+            residuals = measured_rts - predicted_rts
+            rmse = np.sqrt(np.mean(residuals ** 2))
+            residual_sd = np.std(residuals, ddof=1)
+            
+            return {
+                'method': 'linear',
+                'r_squared': r_value ** 2,
+                'rmse': rmse,
+                'residual_sd': residual_sd,
+                'model_params': {
+                    'slope': slope,
+                    'intercept': intercept
+                }
+            }
+    
+    def apply_rt_calibration(self, library_rt: float, calibration: Dict) -> float:
+        """
+        Apply RT calibration model to predict expected RT.
+        
+        Args:
+            library_rt: Library retention time
+            calibration: RT calibration dictionary from fit_rt_calibration()
+            
+        Returns:
+            Predicted RT in data
+        """
+        method = calibration['method']
+        params = calibration['model_params']
+        
+        if method == 'loess':
+            # Interpolate using LOESS model
+            library_rts = np.array(params['library_rts'])
+            predicted_rts = np.array(params['predicted_rts'])
+            predicted_rt = np.interp(library_rt, library_rts, predicted_rts)
+        else:  # linear
+            predicted_rt = params['slope'] * library_rt + params['intercept']
+        
+        return predicted_rt
+    
+    @staticmethod
+    def save_calibration_json(calibration_params: Dict, output_path: str):
+        """
+        Save calibration parameters to JSON file.
+        
+        Args:
+            calibration_params: Complete calibration dictionary
+            output_path: Path to save JSON file
+        """
+        with open(output_path, 'w') as f:
+            json.dump(calibration_params, f, indent=2)
+    
+    @staticmethod
+    def load_calibration_json(input_path: str) -> Dict:
+        """
+        Load calibration parameters from JSON file.
+        
+        Args:
+            input_path: Path to calibration JSON file
+            
+        Returns:
+            Calibration parameters dictionary
+        """
+        with open(input_path, 'r') as f:
+            return json.load(f)
+    
+    @staticmethod
+    def get_calibration_filename(output_path: str) -> str:
+        """Generate calibration JSON filename from output path."""
+        base = os.path.splitext(output_path)[0]
+        return f"{base}.calibration.json"
 
 
 class PepXMLWriter:
@@ -3326,12 +3729,14 @@ class DIAResultsWriter:
     def _write_header(self):
         """Write DIA results header."""
         if self.library_mode:
-            # Library mode: paired target/decoy output
+            # Library mode: paired target/decoy output with delta columns
             header = "Peptide\tCharge\tProteinID\tMass\tIsolationWindow\tNumSpectraScored\t"
             header += "LibCosine\tLibCosineZScore\tXCorr\tRT\tScanID\tPrecursorCosine\t"
-            header += "decoy_Peptide\tdecoy_LibCosine\tdecoy_LibCosineZScore\tdecoy_XCorr\tdecoy_RT\tdecoy_ScanID\tdecoy_PrecursorCosine\n"
+            header += "delta_rt\tdelta_mz_ppm_precursor\tdelta_mz_ppm_fragments\t"
+            header += "decoy_Peptide\tdecoy_LibCosine\tdecoy_LibCosineZScore\tdecoy_XCorr\tdecoy_RT\tdecoy_ScanID\tdecoy_PrecursorCosine\t"
+            header += "decoy_delta_rt\tdecoy_delta_mz_ppm_precursor\tdecoy_delta_mz_ppm_fragments\n"
         else:
-            # Non-library mode: paired target/decoy output with XCorr
+            # Non-library mode: paired target/decoy output with XCorr (no delta columns without library)
             header = "Peptide\tCharge\tProteinID\tMass\tIsolationWindow\tNumSpectraScored\t"
             header += "BestXCorr\tBestRT\tBestScan\tEValue\tXCorrZScore\t"
             header += "decoy_Peptide\tdecoy_BestXCorr\tdecoy_BestRT\tdecoy_BestScan\tdecoy_EValue\tdecoy_XCorrZScore\n"
@@ -3374,6 +3779,9 @@ class DIAResultsWriter:
                 target_rt = target_result['best_rt']
                 target_scan = target_result['best_scan']
                 target_precursor_cosine = target_result['precursor_cosine_target']
+                target_delta_rt = target_result.get('delta_rt')
+                target_delta_mz_precursor = target_result.get('delta_mz_ppm_precursor')
+                target_delta_mz_fragments = target_result.get('delta_mz_ppm_fragments')
                 
                 decoy_lib_cosine = decoy_result['best_lib_cosine_decoy']
                 decoy_lib_zscore = decoy_result['lib_cosine_decoy_zscore']
@@ -3381,10 +3789,23 @@ class DIAResultsWriter:
                 decoy_rt = decoy_result['best_rt']
                 decoy_scan = decoy_result['best_scan']
                 decoy_precursor_cosine = decoy_result['precursor_cosine_decoy']
+                decoy_delta_rt = decoy_result.get('delta_rt')
+                decoy_delta_mz_precursor = decoy_result.get('delta_mz_ppm_precursor')
+                decoy_delta_mz_fragments = decoy_result.get('delta_mz_ppm_fragments')
+                
+                # Format delta columns (use empty string if None)
+                target_delta_rt_str = f"{target_delta_rt:.4f}" if target_delta_rt is not None else ""
+                target_delta_mz_precursor_str = f"{target_delta_mz_precursor:.4f}" if target_delta_mz_precursor is not None else ""
+                target_delta_mz_fragments_str = f"{target_delta_mz_fragments:.4f}" if target_delta_mz_fragments is not None else ""
+                decoy_delta_rt_str = f"{decoy_delta_rt:.4f}" if decoy_delta_rt is not None else ""
+                decoy_delta_mz_precursor_str = f"{decoy_delta_mz_precursor:.4f}" if decoy_delta_mz_precursor is not None else ""
+                decoy_delta_mz_fragments_str = f"{decoy_delta_mz_fragments:.4f}" if decoy_delta_mz_fragments is not None else ""
                 
                 line = f"{target_peptide.sequence}\t{charge}\t{target_peptide.protein_id}\t{target_peptide.mass:.6f}\t{window_str}\t{num_spectra}\t"
                 line += f"{target_lib_cosine:.4f}\t{target_lib_zscore:.4f}\t{target_xcorr:.4f}\t{target_rt:.2f}\t{target_scan}\t{target_precursor_cosine:.4f}\t"
-                line += f"{decoy_peptide.sequence}\t{decoy_lib_cosine:.4f}\t{decoy_lib_zscore:.4f}\t{decoy_xcorr:.4f}\t{decoy_rt:.2f}\t{decoy_scan}\t{decoy_precursor_cosine:.4f}\n"
+                line += f"{target_delta_rt_str}\t{target_delta_mz_precursor_str}\t{target_delta_mz_fragments_str}\t"
+                line += f"{decoy_peptide.sequence}\t{decoy_lib_cosine:.4f}\t{decoy_lib_zscore:.4f}\t{decoy_xcorr:.4f}\t{decoy_rt:.2f}\t{decoy_scan}\t{decoy_precursor_cosine:.4f}\t"
+                line += f"{decoy_delta_rt_str}\t{decoy_delta_mz_precursor_str}\t{decoy_delta_mz_fragments_str}\n"
                 
             else:
                 # Non-library mode: XCorr-based with e-value
@@ -3427,66 +3848,68 @@ class DIAResultsWriter:
 # QC Data Filtering Functions
 def filter_qc_data_by_fdr(qc_data, winners_df, fdr_threshold=0.01):
     """
-    Filter QC data to only include peptides at or below the specified FDR threshold.
+    Filter QC data to only include precursors at or below the specified FDR threshold.
     
     Args:
         qc_data: Dictionary with 'ms1_mass_errors', 'ms2_mass_errors', 'rt_pairs'
-        winners_df: DataFrame from competition with columns ['Peptide', 'IsTarget', 'LibCosine']
+        winners_df: DataFrame from competition with columns ['Peptide', 'Charge', 'IsTarget', 'LibCosine']
         fdr_threshold: FDR threshold (default 0.01 for 1% FDR)
     
     Returns:
-        Filtered qc_data dictionary with same structure but only high-confidence peptides
+        Filtered qc_data dictionary with same structure but only high-confidence precursors
     """
-    # Calculate FDR for each peptide based on LibCosine score
+    # Calculate FDR for each precursor based on LibCosine score
     winners_sorted = winners_df.sort_values('LibCosine', ascending=False).copy()
     winners_sorted['cumulative_targets'] = (winners_sorted['IsTarget'] == 'Target').cumsum()
     winners_sorted['cumulative_decoys'] = (winners_sorted['IsTarget'] == 'Decoy').cumsum()
     winners_sorted['fdr'] = winners_sorted['cumulative_decoys'] / winners_sorted['cumulative_targets'].replace(0, 1)
     
-    # Get peptides at or below FDR threshold (targets only)
-    valid_peptides = set(
-        winners_sorted[
-            (winners_sorted['fdr'] <= fdr_threshold) & 
-            (winners_sorted['IsTarget'] == 'Target')
-        ]['Peptide'].values
-    )
+    # Get precursors (peptide+charge) at or below FDR threshold (targets only)
+    high_conf = winners_sorted[
+        (winners_sorted['fdr'] <= fdr_threshold) & 
+        (winners_sorted['IsTarget'] == 'Target')
+    ]
+    valid_precursors = set(zip(high_conf['Peptide'].values, high_conf['Charge'].values))
     
-    print(f"\nFiltering QC data to peptides at {fdr_threshold*100:.1f}% FDR...")
-    print(f"  High-confidence peptides: {len(valid_peptides):,}")
+    print(f"\nFiltering QC data to precursors at {fdr_threshold*100:.1f}% FDR...")
+    print(f"  High-confidence precursors: {len(valid_precursors):,}")
     
-    # Filter MS1 mass errors
+    # Filter MS1 mass errors - match by precursor (peptide+charge)
     filtered_ms1 = [
         entry['error'] for entry in qc_data['ms1_mass_errors']
-        if entry['peptide'] in valid_peptides and entry['is_target']
+        if (entry['peptide'], entry['charge']) in valid_precursors and entry['is_target']
     ]
     
-    # Filter MS2 mass errors
+    # Filter MS2 mass errors - match by precursor (peptide+charge)
     filtered_ms2 = [
         entry['error'] for entry in qc_data['ms2_mass_errors']
-        if entry['peptide'] in valid_peptides and entry['is_target']
+        if (entry['peptide'], entry['charge']) in valid_precursors and entry['is_target']
     ]
     
-    # Filter RT pairs
+    # Filter RT pairs - match by precursor (peptide+charge)
     filtered_rt = [
         entry for entry in qc_data['rt_pairs']
-        if entry['peptide'] in valid_peptides and entry['is_target']
+        if (entry['peptide'], entry['charge']) in valid_precursors and entry['is_target']
     ]
     
-    print(f"  MS1 errors: {len(qc_data['ms1_mass_errors']):,} → {len(filtered_ms1):,}")
-    print(f"  MS2 errors: {len(qc_data['ms2_mass_errors']):,} → {len(filtered_ms2):,}")
-    print(f"  RT pairs: {len(qc_data['rt_pairs']):,} → {len(filtered_rt):,}")
+    print(f"  MS1 mass accuracy: {len(qc_data['ms1_mass_errors']):,} total → {len(filtered_ms1):,} at <{fdr_threshold*100:.0f}% FDR")
+    if len(filtered_ms1) < len(valid_precursors):
+        print(f"    ({len(valid_precursors) - len(filtered_ms1)} precursors have no detectable M+0 signal in MS1)")
+    print(f"  MS2 mass accuracy: {len(qc_data['ms2_mass_errors']):,} total → {len(filtered_ms2):,} at <{fdr_threshold*100:.0f}% FDR")
+    print(f"  RT pairs: {len(qc_data['rt_pairs']):,} total → {len(filtered_rt):,} at <{fdr_threshold*100:.0f}% FDR")
     
     return {
         'ms1_mass_errors': filtered_ms1,
         'ms2_mass_errors': filtered_ms2,
         'rt_pairs': filtered_rt,
         'ms1_tol_unit': qc_data['ms1_tol_unit'],
-        'ms2_tol_unit': qc_data['ms2_tol_unit']
+        'ms2_tol_unit': qc_data['ms2_tol_unit'],
+        'num_precursors': len(valid_precursors)
     }
 
 
 # QC Plotting Functions
-def plot_mass_accuracy_histograms(ms1_errors, ms2_errors, output_prefix, ms1_unit='ppm', ms2_unit='ppm'):
+def plot_mass_accuracy_histograms(ms1_errors, ms2_errors, output_prefix, ms1_unit='ppm', ms2_unit='ppm', num_precursors=None):
     """
     Generate MS1 and MS2 mass accuracy histogram plots.
     
@@ -3496,6 +3919,7 @@ def plot_mass_accuracy_histograms(ms1_errors, ms2_errors, output_prefix, ms1_uni
         output_prefix: Output file prefix (will add '_ms1_accuracy.png' and '_ms2_accuracy.png')
         ms1_unit: Unit for MS1 errors ('ppm' or 'mz')
         ms2_unit: Unit for MS2 errors ('ppm' or 'mz')
+        num_precursors: Number of high-confidence precursors (for plot title)
     """
     import matplotlib.pyplot as plt
     import matplotlib
@@ -3517,7 +3941,10 @@ def plot_mass_accuracy_histograms(ms1_errors, ms2_errors, output_prefix, ms1_uni
         
         ax.set_xlabel(f'Mass Error (observed - theoretical, {unit_label_ms1})', fontsize=12)
         ax.set_ylabel('Frequency', fontsize=12)
-        ax.set_title(f'MS1 Mass Accuracy (M+0 Peak)\nN = {len(ms1_errors):,}', fontsize=14, fontweight='bold')
+        title = f'MS1 Mass Accuracy (M+0 Peak)\n{len(ms1_errors):,} measurements'
+        if num_precursors:
+            title += f' from {num_precursors:,} precursors (<1% FDR)'
+        ax.set_title(title, fontsize=14, fontweight='bold')
         ax.legend(fontsize=10)
         ax.grid(axis='y', alpha=0.3)
         
@@ -3545,7 +3972,10 @@ def plot_mass_accuracy_histograms(ms1_errors, ms2_errors, output_prefix, ms1_uni
         
         ax.set_xlabel(f'Mass Error (observed - theoretical, {unit_label_ms2})', fontsize=12)
         ax.set_ylabel('Frequency', fontsize=12)
-        ax.set_title(f'MS2 Fragment Mass Accuracy\nN = {len(ms2_errors):,}', fontsize=14, fontweight='bold')
+        title = f'MS2 Fragment Mass Accuracy\n{len(ms2_errors):,} measurements'
+        if num_precursors:
+            title += f' from {num_precursors:,} precursors (<1% FDR)'
+        ax.set_title(title, fontsize=14, fontweight='bold')
         ax.legend(fontsize=10)
         ax.grid(axis='y', alpha=0.3)
         
@@ -3650,6 +4080,304 @@ def plot_rt_correlation(rt_pairs, output_prefix):
         print("  This may occur with insufficient data points or RT range")
 
 
+def run_calibration_workflow(xcorr_engine, library, spectra, ms1_spectra, charge_states,
+                             cal_library_peptides, lib_fragment_tol, lib_precursor_tol,
+                             lib_fragment_tol_unit, lib_precursor_tol_unit, output_file,
+                             fasta_file, enzyme, decoy_cycle_length, verbose=0):
+    """
+    Run calibration search workflow with escalation strategy.
+    
+    Args:
+        xcorr_engine: FastXCorr instance
+        library: SpectrumLibrary instance
+        spectra: All MS2 spectra from mzML
+        ms1_spectra: All MS1 spectra from mzML
+        charge_states: List of charge states to search
+        cal_library_peptides: Initial number of peptides to sample
+        lib_fragment_tol, lib_precursor_tol: Tolerances
+        lib_fragment_tol_unit, lib_precursor_tol_unit: Tolerance units
+        output_file: Output file path (for auto-naming calibration JSON)
+        fasta_file: FASTA file path (for generating decoys)
+        enzyme: Enzyme name
+        decoy_cycle_length: Decoy generation cycle length
+        verbose: Verbosity level
+        
+    Returns:
+        Dictionary with calibration parameters
+        
+    Raises:
+        RuntimeError if calibration fails after escalation
+    """
+    import time
+    calibration_start = time.time()
+    
+    print("\n" + "="*80)
+    print("CALIBRATION SEARCH")
+    print("="*80)
+    
+    # Try with initial number, then double once if needed
+    for attempt, num_peptides in enumerate([cal_library_peptides, cal_library_peptides * 2]):
+        print(f"\nCalibration attempt {attempt + 1}: Sampling {num_peptides} high-quality precursors...")
+        
+        # Sample precursors from library
+        sampled_precursors = library.sample_precursors(num_peptides, seed=42, max_qvalue=0.01)
+        print(f"  Sampled {len(sampled_precursors)} precursors from library")
+        
+        # Create PeptideCandidate objects for sampled precursors
+        # Include charge state info to avoid testing each precursor with multiple charges
+        from collections import namedtuple
+        PeptideCand = namedtuple('PeptideCandidate', ['sequence', 'protein_id', 'mass', 'charge'])
+        
+        target_decoy_pairs = []
+        for sequence, charge in sampled_precursors:
+            # Calculate mass
+            mass = sum(xcorr_engine.aa_masses.get(aa, 0) for aa in sequence)
+            mass += xcorr_engine.h2o_mass  # Add water for peptide mass
+            
+            # Create target with charge info
+            target = PeptideCand(sequence=sequence, protein_id='CALIBRATION', mass=mass, charge=charge)
+            
+            # Generate decoy
+            decoy_seq = xcorr_engine.generate_decoy_sequence(sequence, decoy_cycle_length)
+            decoy_mass = sum(xcorr_engine.aa_masses.get(aa, 0) for aa in decoy_seq)
+            decoy_mass += xcorr_engine.h2o_mass
+            decoy = PeptideCand(sequence=decoy_seq, protein_id='DECOY_CALIBRATION', mass=decoy_mass, charge=charge)
+            
+            target_decoy_pairs.append((target, decoy))
+        
+        print(f"  Created {len(target_decoy_pairs)} target-decoy pairs for calibration search")
+        
+        # Group spectra by isolation window
+        print("  Grouping spectra by isolation window...")
+        window_groups = xcorr_engine.group_spectra_by_isolation_window(spectra)
+        print(f"  Found {len(window_groups)} isolation windows")
+        
+        # Run DIA search on all isolation windows for calibration
+        print(f"  Searching {len(window_groups)} isolation windows with {len(target_decoy_pairs)} peptides...")
+        
+        # Use parallel processing for calibration search
+        from multiprocessing import Pool, cpu_count
+        
+        # Determine number of workers (same logic as full search)
+        n_workers = max(1, cpu_count() - 1)
+        print(f"  Using {n_workers} parallel workers for calibration search")
+        
+        # Serialize target_decoy_pairs for parallel processing
+        # Include charge in serialized data for calibration
+        target_decoy_pairs_data = []
+        for target, decoy in target_decoy_pairs:
+            target_data = {
+                'sequence': target.sequence,
+                'protein_id': target.protein_id,
+                'mass': target.mass,
+                'charge': target.charge
+            }
+            decoy_data = {
+                'sequence': decoy.sequence,
+                'protein_id': decoy.protein_id,
+                'mass': decoy.mass,
+                'charge': decoy.charge
+            }
+            target_decoy_pairs_data.append((target_data, decoy_data))
+        
+        # Prepare work items for parallel processing
+        work_items = []
+        for window_idx, (isolation_window, window_spectra) in enumerate(window_groups.items()):
+            work_items.append((
+                window_idx,
+                len(window_groups),
+                isolation_window,
+                window_spectra,
+                fasta_file,
+                target_decoy_pairs_data,
+                [],  # Empty charge_states list signals worker to use charge from peptide data
+                None,  # No parquet output for calibration
+                enzyme,
+                decoy_cycle_length,
+                library,
+                ms1_spectra,
+                lib_fragment_tol if lib_fragment_tol_unit == 'ppm' else lib_fragment_tol,
+                lib_precursor_tol if lib_precursor_tol_unit == 'ppm' else lib_precursor_tol,
+                lib_fragment_tol_unit,
+                lib_precursor_tol_unit,
+                None,  # No calibration during calibration search
+                0  # Suppress verbose output per worker
+            ))
+        
+        all_qc_data = {
+            'ms1_mass_errors': [],
+            'ms2_mass_errors': [],
+            'rt_pairs': [],
+            'ms1_tol_unit': lib_precursor_tol_unit,
+            'ms2_tol_unit': lib_fragment_tol_unit
+        }
+        
+        all_results = []
+        
+        # Process windows in parallel
+        if n_workers == 1:
+            # Sequential for debugging
+            for item in work_items:
+                search_result = process_isolation_window_worker(item)
+                
+                # Collect QC data
+                qc_data = search_result.get('qc_data', {})
+                all_qc_data['ms1_mass_errors'].extend(qc_data.get('ms1_mass_errors', []))
+                all_qc_data['ms2_mass_errors'].extend(qc_data.get('ms2_mass_errors', []))
+                all_qc_data['rt_pairs'].extend(qc_data.get('rt_pairs', []))
+                
+                # Collect results for FDR filtering
+                for pair_id, pair_data in search_result.get('results', {}).items():
+                    all_results.append(pair_data)
+        else:
+            # Parallel processing
+            with Pool(n_workers) as pool:
+                for window_idx, search_result in enumerate(pool.imap_unordered(process_isolation_window_worker, work_items)):
+                    # Progress indicator with timing
+                    if verbose >= 1 or (window_idx + 1) % 10 == 0:
+                        elapsed = time.time() - calibration_start
+                        print(f"  Calibration: {window_idx + 1}/{len(window_groups)} windows processed ({elapsed:.1f}s elapsed)")
+                    
+                    # Collect QC data
+                    qc_data = search_result.get('qc_data', {})
+                    all_qc_data['ms1_mass_errors'].extend(qc_data.get('ms1_mass_errors', []))
+                    all_qc_data['ms2_mass_errors'].extend(qc_data.get('ms2_mass_errors', []))
+                    all_qc_data['rt_pairs'].extend(qc_data.get('rt_pairs', []))
+                    
+                    # Collect results for FDR filtering
+                    for pair_id, pair_data in search_result.get('results', {}).items():
+                        all_results.append(pair_data)
+        
+        calibration_search_time = time.time() - calibration_start
+        print(f"\n  Calibration search complete in {calibration_search_time:.1f}s: Collected QC data")
+        print(f"    MS1 mass errors: {len(all_qc_data['ms1_mass_errors'])}")
+        print(f"    MS2 mass errors: {len(all_qc_data['ms2_mass_errors'])}")
+        print(f"    RT pairs: {len(all_qc_data['rt_pairs'])}")
+        
+        # Convert results to DataFrame for FDR filtering
+        winners_data = []
+        for pair_data in all_results:
+            target = pair_data['target']
+            decoy = pair_data['decoy']
+            
+            # Determine winner (higher LibCosine wins)
+            target_score = target.get('best_lib_cosine_target', 0)
+            decoy_score = decoy.get('best_lib_cosine_decoy', 0)
+            
+            if target_score >= decoy_score:
+                winners_data.append({
+                    'Peptide': target['peptide'].sequence,
+                    'Charge': target['charge'],
+                    'LibCosine': target_score,
+                    'IsTarget': 'Target'
+                })
+            else:
+                winners_data.append({
+                    'Peptide': decoy['peptide'].sequence,
+                    'Charge': decoy['charge'],
+                    'LibCosine': decoy_score,
+                    'IsTarget': 'Decoy'
+                })
+        
+        winners_df = pd.DataFrame(winners_data)
+        
+        # Filter to 1% FDR
+        print("\n  Filtering calibration results to 1% FDR...")
+        filtered_qc = filter_qc_data_by_fdr(all_qc_data, winners_df, fdr_threshold=0.01)
+        num_confident = filtered_qc['num_precursors']
+        
+        print(f"  High-confidence target precursors at 1% FDR: {num_confident}")
+        
+        if num_confident >= 100:
+            total_calibration_time = time.time() - calibration_start
+            print(f"✓ Calibration successful: {num_confident} confident peptides ({total_calibration_time:.1f}s total)")
+            
+            # Calculate calibration parameters
+            print("\n  Calculating m/z calibration...")
+            mz_cal = xcorr_engine.calculate_mz_calibration(filtered_qc)
+            
+            print(f"    MS1: mean = {mz_cal['ms1_mean']:.4f} {mz_cal['ms1_unit']}, "
+                  f"SD = {mz_cal['ms1_sd']:.4f} {mz_cal['ms1_unit']}")
+            print(f"    MS2: mean = {mz_cal['ms2_mean']:.4f} {mz_cal['ms2_unit']}, "
+                  f"SD = {mz_cal['ms2_sd']:.4f} {mz_cal['ms2_unit']}")
+            
+            print("\n  Fitting RT calibration...")
+            rt_cal = xcorr_engine.fit_rt_calibration(filtered_qc['rt_pairs'])
+            
+            print(f"    Method: {rt_cal['method']}")
+            print(f"    R² = {rt_cal['r_squared']:.4f}, RMSE = {rt_cal['rmse']:.4f} min")
+            print(f"    Residual SD = {rt_cal['residual_sd']:.4f} min")
+            print(f"    RT window (3σ) = ±{3 * rt_cal['residual_sd']:.2f} min")
+            
+            # Create calibration dictionary
+            calibration = {
+                'calibration_metadata': {
+                    'timestamp': datetime.now().isoformat(),
+                    'num_library_peptides_sampled': num_peptides,
+                    'num_passing_fdr': num_confident,
+                    'fdr_threshold': 0.01,
+                    'calibration_successful': True
+                },
+                'ms1_calibration': {
+                    'mean': mz_cal['ms1_mean'],
+                    'sd': mz_cal['ms1_sd'],
+                    'unit': mz_cal['ms1_unit'],
+                    'adjusted_tolerance': mz_cal['ms1_mean'] + 3 * mz_cal['ms1_sd'],
+                    'window_halfwidth_multiplier': 3.0
+                },
+                'ms2_calibration': {
+                    'mean': mz_cal['ms2_mean'],
+                    'sd': mz_cal['ms2_sd'],
+                    'unit': mz_cal['ms2_unit'],
+                    'adjusted_tolerance': mz_cal['ms2_mean'] + 3 * mz_cal['ms2_sd'],
+                    'window_halfwidth_multiplier': 3.0
+                },
+                'rt_calibration': rt_cal
+            }
+            
+            # Save calibration JSON
+            cal_file = FastXCorr.get_calibration_filename(output_file)
+            FastXCorr.save_calibration_json(calibration, cal_file)
+            print(f"\n  Calibration parameters saved: {cal_file}")
+            
+            # Generate QC plots
+            print("\n  Generating QC plots...")
+            qc_output_prefix = os.path.splitext(output_file)[0] + '.calibration'
+            
+            plot_mass_accuracy_histograms(
+                filtered_qc['ms1_mass_errors'],
+                filtered_qc['ms2_mass_errors'],
+                qc_output_prefix,
+                ms1_unit=mz_cal['ms1_unit'],
+                ms2_unit=mz_cal['ms2_unit'],
+                num_precursors=num_confident
+            )
+            
+            plot_rt_correlation(filtered_qc['rt_pairs'], qc_output_prefix)
+            
+            print("\n" + "="*80)
+            print("CALIBRATION COMPLETE")
+            print("="*80)
+            
+            return calibration
+        else:
+            print(f"✗ Only {num_confident} confident peptides (need ≥100)")
+            
+            if attempt == 0:
+                print(f"  Will retry with {cal_library_peptides * 2} peptides...")
+            else:
+                # Failed after doubling
+                raise RuntimeError(
+                    f"\nCalibration failed: Only {num_confident} peptides passed 1% FDR after searching "
+                    f"{num_peptides} library peptides.\n\n"
+                    f"This suggests:\n"
+                    f"  - Library may not match sample\n"
+                    f"  - Sample quality issues\n"
+                    f"  - Incorrect search parameters\n\n"
+                    f"Please review your library and sample, or try a larger calibration set."
+                )
+
+
 # Worker function for parallel processing of isolation windows
 def process_isolation_window_worker(args):
     """
@@ -3663,7 +4391,7 @@ def process_isolation_window_worker(args):
                        fasta_file, target_decoy_pairs, charge_states,
                        parquet_file, enzyme, decoy_cycle_length,
                        library_path, ms1_spectra, lib_fragment_tol_ppm, lib_precursor_tol_ppm,
-                       lib_fragment_tol_unit, lib_precursor_tol_unit, verbose)
+                       lib_fragment_tol_unit, lib_precursor_tol_unit, calibration, verbose)
 
     Returns:
         Dictionary with search results and metadata
@@ -3672,25 +4400,44 @@ def process_isolation_window_worker(args):
      fasta_file, target_decoy_pairs_data, charge_states,
      parquet_file, enzyme, decoy_cycle_length,
      library, ms1_spectra, lib_fragment_tol_ppm, lib_precursor_tol_ppm,
-     lib_fragment_tol_unit, lib_precursor_tol_unit, verbose) = args
+     lib_fragment_tol_unit, lib_precursor_tol_unit, calibration, verbose) = args
 
     # Create a fresh FastXCorr instance for this worker process
     xcorr_engine = FastXCorr()
 
     # Reconstruct target_decoy_pairs from serialized data
     # (PeptideCandidate objects need to be reconstructed)
+    # Check if charge is included in data (for calibration mode with library sampling)
+    has_charge = len(target_decoy_pairs_data) > 0 and 'charge' in target_decoy_pairs_data[0][0]
+    
     target_decoy_pairs = []
     for target_data, decoy_data in target_decoy_pairs_data:
-        target = PeptideCandidate(
-            sequence=target_data['sequence'],
-            protein_id=target_data['protein_id'],
-            mass=target_data['mass']
-        )
-        decoy = PeptideCandidate(
-            sequence=decoy_data['sequence'],
-            protein_id=decoy_data['protein_id'],
-            mass=decoy_data['mass']
-        )
+        if has_charge:
+            # Calibration mode: charge is specified per peptide
+            target = PeptideCandidate(
+                sequence=target_data['sequence'],
+                protein_id=target_data['protein_id'],
+                mass=target_data['mass'],
+                charge=target_data['charge']
+            )
+            decoy = PeptideCandidate(
+                sequence=decoy_data['sequence'],
+                protein_id=decoy_data['protein_id'],
+                mass=decoy_data['mass'],
+                charge=decoy_data['charge']
+            )
+        else:
+            # Normal mode: charge will be iterated in search function
+            target = PeptideCandidate(
+                sequence=target_data['sequence'],
+                protein_id=target_data['protein_id'],
+                mass=target_data['mass']
+            )
+            decoy = PeptideCandidate(
+                sequence=decoy_data['sequence'],
+                protein_id=decoy_data['protein_id'],
+                mass=decoy_data['mass']
+            )
         target_decoy_pairs.append((target, decoy))
 
     # Library object is passed directly (no loading needed per worker)
@@ -3701,6 +4448,9 @@ def process_isolation_window_worker(args):
         print(f"\n[Worker {window_idx+1}/{total_windows}] Processing isolation window: "
               f"[{isolation_window[0]:.4f}-{isolation_window[1]:.4f}] m/z, "
               f"{len(window_spectra)} spectra")
+
+    # Determine if this is calibration mode: no calibration input + no parquet output
+    is_calibration_mode = (calibration is None and parquet_file is None and library is not None)
 
     # Perform DIA peptide-centric search
     search_result = xcorr_engine.search_dia_peptide_centric(
@@ -3714,6 +4464,8 @@ def process_isolation_window_worker(args):
         lib_precursor_tol_ppm=lib_precursor_tol_ppm,
         lib_fragment_tol_unit=lib_fragment_tol_unit,
         lib_precursor_tol_unit=lib_precursor_tol_unit,
+        calibration=calibration,  # Pass calibration for RT filtering and adjusted tolerances
+        skip_xcorr_matrix=is_calibration_mode,  # Skip XCorr during calibration, calculate during full search
         verbose=verbose
     )
 
@@ -3725,8 +4477,233 @@ def process_isolation_window_worker(args):
     return search_result
 
 
+def write_pin_file(results_df: pd.DataFrame, output_path: str, library_mode: bool = True):
+    """
+    Write results in Percolator/Mokapot PIN format.
+    
+    Args:
+        results_df: DataFrame with DIA search results
+        output_path: Path to output PIN file
+        library_mode: Whether this is library-based search
+    """
+    print(f"\nWriting Mokapot PIN file: {output_path}")
+    
+    pin_data = []
+    for _, row in results_df.iterrows():
+        # Determine if target or decoy
+        is_target = not row['Peptide'].startswith('DECOY_')
+        
+        # Create unique PSM ID
+        psm_id = f"{row['Peptide']}_{row['Charge']}_{row['ScanID']}"
+        
+        pin_row = {
+            'PSMId': psm_id,
+            'Label': 1 if is_target else -1,
+            'ScanNr': row['ScanID'],
+            'ExpMass': row['Mass'],
+            'CalcMass': row['Mass'],  # For DIA, these are the same
+            'Peptide': row['Peptide'],
+            'Proteins': row['ProteinID'],
+        }
+        
+        # Add feature columns based on library mode
+        if library_mode:
+            pin_row['LibCosine'] = row.get('LibCosine', 0.0)
+            pin_row['LibCosineZScore'] = row.get('LibCosineZScore', 0.0)
+            pin_row['XCorr'] = row.get('XCorr', 0.0)
+            pin_row['PrecursorCosine'] = row.get('PrecursorCosine', 0.0)
+            
+            # Add delta columns if available
+            if 'delta_mz_ppm_precursor' in row:
+                pin_row['absDeltaMzPpmPrecursor'] = abs(row['delta_mz_ppm_precursor'])
+            if 'delta_mz_ppm_fragments' in row:
+                pin_row['absDeltaMzPpmFragments'] = abs(row['delta_mz_ppm_fragments'])
+            if 'delta_rt' in row:
+                pin_row['absDeltaRT'] = abs(row['delta_rt'])
+        else:
+            pin_row['XCorr'] = row.get('BestXCorr', 0.0)
+            pin_row['XCorrZScore'] = row.get('XCorrZScore', 0.0)
+        
+        pin_data.append(pin_row)
+    
+    # Write to file
+    pin_df = pd.DataFrame(pin_data)
+    pin_df.to_csv(output_path, sep='\t', index=False)
+    print(f"  Wrote {len(pin_df)} PSMs to PIN file")
+
+
+def run_mokapot(results_df: pd.DataFrame, library_mode: bool = True, n_workers: int = 4) -> pd.DataFrame:
+    """
+    Run Mokapot rescoring on search results.
+    
+    Args:
+        results_df: DataFrame with DIA search results (paired target/decoy format)
+        library_mode: Whether this is library-based search
+        n_workers: Number of parallel workers for Mokapot
+        
+    Returns:
+        DataFrame with added Mokapot q-value columns
+    """
+    print("\nRunning Mokapot for peptide-level FDR estimation...")
+    
+    try:
+        import mokapot
+    except ImportError:
+        print("ERROR: mokapot not installed. Install with: pip install mokapot")
+        print("Skipping Mokapot rescoring.")
+        return results_df
+    
+    # Unroll paired target/decoy format into separate rows for Mokapot
+    psm_data = []
+    for idx, row in results_df.iterrows():
+        # Create unique ID for this precursor (peptide+charge)
+        precursor_id = f"{row['Peptide']}_{row['Charge']}"
+        
+        # Target PSM
+        target_psm = {
+            'PSMId': f"{precursor_id}_target",
+            'PrecursorId': precursor_id,
+            'Label': 1,  # Target
+            'ScanNr': row['ScanID'],
+            'Peptide': row['Peptide'],
+            'Proteins': row['ProteinID'],
+            'RowIndex': idx  # Track original row for merging back
+        }
+        
+        # Decoy PSM
+        decoy_psm = {
+            'PSMId': f"{precursor_id}_decoy",
+            'PrecursorId': precursor_id,
+            'Label': -1,  # Decoy
+            'ScanNr': row.get('DecoyScanID', row['ScanID']),  # Use decoy scan if available
+            'Peptide': row.get('DecoyPeptide', f"DECOY_{row['Peptide']}"),
+            'Proteins': row['ProteinID'],
+            'RowIndex': idx
+        }
+        
+        # Add features for both target and decoy
+        if library_mode:
+            # Target features
+            target_psm['LibCosine'] = row.get('LibCosine', 0.0)
+            target_psm['LibCosineZScore'] = row.get('LibCosineZScore', 0.0)
+            target_psm['XCorr'] = row.get('XCorr', 0.0)
+            target_psm['PrecursorCosine'] = row.get('PrecursorCosine', 0.0)
+            
+            # Decoy features
+            decoy_psm['LibCosine'] = row.get('DecoyLibCosine', 0.0)
+            decoy_psm['LibCosineZScore'] = row.get('DecoyLibCosineZScore', 0.0)
+            decoy_psm['XCorr'] = row.get('DecoyXCorr', 0.0)
+            decoy_psm['PrecursorCosine'] = row.get('DecoyPrecursorCosine', 0.0)
+            
+            feature_cols = ['LibCosine', 'LibCosineZScore', 'XCorr', 'PrecursorCosine']
+            
+            # Add delta features if present (only for targets with calibration)
+            if pd.notna(row.get('delta_rt')):
+                target_psm['absDeltaRT'] = abs(row['delta_rt'])
+                feature_cols.append('absDeltaRT')
+            if pd.notna(row.get('delta_mz_ppm_precursor')):
+                target_psm['absDeltaMzPpmPrecursor'] = abs(row['delta_mz_ppm_precursor'])
+                feature_cols.append('absDeltaMzPpmPrecursor')
+            if pd.notna(row.get('delta_mz_ppm_fragments')):
+                target_psm['absDeltaMzPpmFragments'] = abs(row['delta_mz_ppm_fragments'])
+                feature_cols.append('absDeltaMzPpmFragments')
+        else:
+            target_psm['XCorr'] = row.get('BestXCorr', 0.0)
+            target_psm['XCorrZScore'] = row.get('XCorrZScore', 0.0)
+            decoy_psm['XCorr'] = row.get('DecoyXCorr', 0.0)
+            decoy_psm['XCorrZScore'] = row.get('DecoyXCorrZScore', 0.0)
+            feature_cols = ['XCorr', 'XCorrZScore']
+        
+        psm_data.append(target_psm)
+        psm_data.append(decoy_psm)
+    
+    psm_df = pd.DataFrame(psm_data)
+    
+    # Check for missing values in features
+    missing_features = []
+    for col in feature_cols:
+        if col in psm_df.columns and psm_df[col].isna().any():
+            missing_features.append(col)
+    
+    if missing_features:
+        print(f"Missing values detected in the following features:")
+        for feat in missing_features:
+            print(f"  - {feat}")
+        print("Dropping features with missing values...")
+        feature_cols = [f for f in feature_cols if f not in missing_features]
+    
+    if not feature_cols:
+        print("ERROR: No valid features remaining after dropping missing values.")
+        print("Returning results without Mokapot scores.")
+        return results_df
+    
+    # Create Mokapot dataset
+    try:
+        psms = mokapot.LinearPsmDataset(
+            psm_df,
+            target_column='Label',
+            spectrum_columns='ScanNr',
+            peptide_column='Peptide',
+            feature_columns=feature_cols
+        )
+        
+        # Run Mokapot
+        n_targets = (psm_df['Label'] == 1).sum()
+        n_decoys = (psm_df['Label'] == -1).sum()
+        print(f"  Training Mokapot model: {n_targets} targets, {n_decoys} decoys, {len(feature_cols)} features")
+        
+        results, models = mokapot.brew(psms, max_workers=n_workers, test_fdr=0.01)
+        
+        # Get results
+        psm_results_df = results.psms
+        peptide_df = results.peptides
+        
+        num_precursors_01fdr = len(psm_results_df[psm_results_df['mokapot q-value'] <= 0.01])
+        num_peptides_01fdr = len(peptide_df[peptide_df['mokapot q-value'] <= 0.01])
+        print(f"  Mokapot complete: {num_precursors_01fdr} precursors, {num_peptides_01fdr} peptides at 1% FDR")
+        
+        # Merge Mokapot precursor-level scores back (use 'PrecursorId' to map)
+        precursor_qvalues = {}
+        precursor_scores = {}
+        for _, psm_row in psm_results_df.iterrows():
+            prec_id = psm_row['PSMId'].rsplit('_', 1)[0]  # Remove _target or _decoy suffix
+            qval = psm_row['mokapot q-value']
+            score = psm_row['mokapot score']
+            
+            # Keep best (lowest q-value) for each precursor
+            if prec_id not in precursor_qvalues or qval < precursor_qvalues[prec_id]:
+                precursor_qvalues[prec_id] = qval
+                precursor_scores[prec_id] = score
+        
+        results_df['mokapot_precursor_qvalue'] = results_df.apply(
+            lambda row: precursor_qvalues.get(f"{row['Peptide']}_{row['Charge']}", None),
+            axis=1
+        )
+        results_df['mokapot_precursor_score'] = results_df.apply(
+            lambda row: precursor_scores.get(f"{row['Peptide']}_{row['Charge']}", None),
+            axis=1
+        )
+        
+        # Map peptide-level scores
+        peptide_qvalues = peptide_df.set_index('mokapot peptide')['mokapot q-value'].to_dict()
+        peptide_scores = peptide_df.set_index('mokapot peptide')['mokapot score'].to_dict()
+        
+        results_df['mokapot_peptide_qvalue'] = results_df['Peptide'].map(peptide_qvalues)
+        results_df['mokapot_peptide_score'] = results_df['Peptide'].map(peptide_scores)
+        
+        return results_df
+        
+    except Exception as e:
+        print(f"ERROR running Mokapot: {e}")
+        print("Returning results without Mokapot scores.")
+        return results_df
+
+
 def main():
     """Main function to run the Comet-style fast XCorr search."""
+    import time
+    workflow_start_time = time.time()
+    
     parser = argparse.ArgumentParser(description='Comet-style Fast XCorr Database Search with Target-Decoy Competition')
     parser.add_argument('fasta_file', help='FASTA file containing protein sequences')
     parser.add_argument('mzml_file', help='mzML file containing mass spectra')
@@ -3774,9 +4751,30 @@ def main():
     parser.add_argument('--lib_precursor_tol_unit', type=str, default='ppm', choices=['ppm', 'mz'],
                        help='Precursor tolerance unit: ppm or mz (default: ppm)')
     parser.add_argument('--test_library_peptides', type=int, default=0,
-                       help='For testing: limit library search to first N peptides (0 = use all peptides, default: 0)')
+                       help='For testing: randomly select N precursors from library (target, Q<=0.01) with fixed seed (default: 0 = all)')
+    
+    # Calibration arguments
+    parser.add_argument('--auto_calibrate', action='store_true',
+                       help='Automatically calibrate m/z and RT windows using library subset (recommended for DIA)')
+    parser.add_argument('--cal_library_peptides', type=int, default=2000,
+                       help='Number of high-quality library peptides to use for calibration (default: 2000)')
+    parser.add_argument('--use_calibration', type=str, default='',
+                       help='Use existing calibration JSON file from previous run')
+    parser.add_argument('--calibration_only', action='store_true',
+                       help='Only perform calibration, do not run full search')
+    
+    # Mokapot integration arguments
+    parser.add_argument('--output_pin', type=str, default='',
+                       help='Save Mokapot PIN file for external processing (optional)')
+    parser.add_argument('--skip_mokapot', action='store_true',
+                       help='Skip Mokapot rescoring (not recommended, default: False)')
 
     args = parser.parse_args()
+    
+    # Print command line for reproducibility
+    import sys
+    print(f"Command: {' '.join(sys.argv)}")
+    print()
     
     # Parse static modifications
     static_modifications = {}
@@ -3808,7 +4806,7 @@ def main():
     total_start_time = time.time()
     
     print(f"Using charge states: {charge_states}")
-    print("pyXcorrDIA: Using Comet XCorr with target-decoy competition")
+    print("pyXcorrDIA: A simple python search tool for DIA data")
     
     # Initialize engine to get enzyme description
     xcorr_engine = FastXCorr(bin_width=args.bin_width, bin_offset=args.bin_offset, static_modifications=static_modifications)
@@ -3843,12 +4841,16 @@ def main():
     library_mode = args.dia_mode and args.speclib
     
     if library_mode:
+        lib_start = time.time()
         print(f"\nLoading spectrum library: {args.speclib}")
         if args.test_library_peptides > 0:
-            print(f"  Test mode: Limiting to first {args.test_library_peptides} peptides (Decoy==0, Q.Value<=0.01)")
+            print(f"  Test mode: Randomly selecting {args.test_library_peptides} precursors (target, Q.Value<=0.01, seed=42)")
         library = SpectrumLibrary(args.speclib, test_limit_peptides=args.test_library_peptides)
         
         # Extract unique peptide sequences and metadata from library
+        lib_elapsed = time.time() - lib_start
+        print(f"  Library loaded in {lib_elapsed:.1f}s")
+
         print("Extracting peptides from spectrum library...")
         library_sequences = set()
         library_charge_states = set()
@@ -3859,7 +4861,10 @@ def main():
             library_charge_states.add(int(charge))  # Convert numpy int64 to Python int
             library_peptide_lengths.append(len(sequence))
         
-        print(f"  Found {len(library_sequences)} unique peptide sequences in library")
+        # Show relationship between precursors and unique peptides
+        n_precursors = len(library.peptide_index)
+        n_unique_peptides = len(library_sequences)
+        print(f"  {n_precursors} precursors = {n_unique_peptides} unique peptides selected from library")
         
         # Set peptide length range from library if not explicitly set by user
         # Check if user provided non-default values
@@ -3934,15 +4939,21 @@ def main():
             all_target_peptides.extend(peptides)
         print(f"Generated {len(all_target_peptides)} target peptide candidates")
     
-    print("Making peptide list non-redundant...")
-    non_redundant_targets = xcorr_engine.make_peptides_non_redundant(all_target_peptides)
-    print(f"Non-redundant target peptides: {len(non_redundant_targets)} (removed {len(all_target_peptides) - len(non_redundant_targets)} duplicates)")
+    # Make peptide list non-redundant (only needed for FASTA-based search)
+    if library_mode:
+        # Library peptides are already unique by design
+        non_redundant_targets = all_target_peptides
+    else:
+        print("Making peptide list non-redundant...")
+        non_redundant_targets = xcorr_engine.make_peptides_non_redundant(all_target_peptides)
+        print(f"Non-redundant target peptides: {len(non_redundant_targets)} (removed {len(all_target_peptides) - len(non_redundant_targets)} duplicates)")
     
     print("Generating target-decoy pairs for competition...")
     target_decoy_pairs = xcorr_engine.generate_target_decoy_pairs(non_redundant_targets, args.decoy_cycle_length, args.enzyme)
     print(f"Target-decoy pairs: {len(target_decoy_pairs)} pairs ready for competition")
     
     # No need for separate peptide indexing - we'll search pairs directly
+    mzml_start = time.time()
     print("Reading mzML file...")
     if args.max_spectra > 0:
         print(f"Limiting to first {args.max_spectra} MS2 spectra")
@@ -3951,11 +4962,15 @@ def main():
     if args.dia_mode and args.speclib:
         print("Using combined single-pass mzML reader (MS1 + MS2)...")
         spectra, ms1_spectra = xcorr_engine.read_mzml_combined(args.mzml_file, args.max_spectra)
+        mzml_elapsed = time.time() - mzml_start
         print(f"  Loaded {len(spectra)} MS2 spectra")
         print(f"  Loaded {len(ms1_spectra)} MS1 spectra for precursor isotope scoring")
+        print(f"  mzML read completed in {mzml_elapsed:.1f}s (elapsed: {time.time()-workflow_start_time:.1f}s)")
     else:
         # Standard MS2-only read
         spectra = xcorr_engine.read_mzml(args.mzml_file, args.max_spectra)
+        mzml_elapsed = time.time() - mzml_start
+        print(f"  mzML read completed in {mzml_elapsed:.1f}s (elapsed: {time.time()-workflow_start_time:.1f}s)")
         ms1_spectra = None
     
     print(f"Processing {len(spectra)} MS2 spectra with Target-Decoy Competition")
@@ -3975,19 +4990,46 @@ def main():
             base_name = os.path.splitext(args.mzml_file)[0]
             args.dia_output = base_name + '.dia.tsv'
 
-        # Determine unified parquet output filename
-        mzml_dir = os.path.dirname(args.mzml_file) or '.'
-        mzml_basename = os.path.basename(args.mzml_file)
-        parquet_basename = os.path.splitext(mzml_basename)[0] + '.dia-chrom.parquet'
-        unified_parquet_file = os.path.join(mzml_dir, parquet_basename)
-
         print(f"- Summary results (TSV): {args.dia_output}")
-        print(f"- Unified chromatograms (Parquet): {unified_parquet_file}")
         
-        # Set up temporary Parquet output directory for per-window files
-        parquet_dir = os.path.splitext(args.mzml_file)[0] + "_dia_chromatograms"
-        os.makedirs(parquet_dir, exist_ok=True)
-        print(f"- Temp per-window files: {parquet_dir}/ (will be merged and can be deleted)")
+        # Calibration workflow (if requested)
+        calibration = None
+        if library_mode and (args.auto_calibrate or args.use_calibration):
+            if args.use_calibration:
+                # Load existing calibration
+                print(f"\nLoading calibration from: {args.use_calibration}")
+                calibration = FastXCorr.load_calibration_json(args.use_calibration)
+                print(f"  Loaded calibration from {calibration['calibration_metadata']['timestamp']}")
+                print(f"  {calibration['calibration_metadata']['num_passing_fdr']} peptides used")
+            elif args.auto_calibrate:
+                # Run calibration workflow
+                try:
+                    calibration = run_calibration_workflow(
+                        xcorr_engine=xcorr_engine,
+                        library=library,
+                        spectra=spectra,
+                        ms1_spectra=ms1_spectra,
+                        charge_states=charge_states,
+                        cal_library_peptides=args.cal_library_peptides,
+                        lib_fragment_tol=args.lib_fragment_tol,
+                        lib_precursor_tol=args.lib_precursor_tol,
+                        lib_fragment_tol_unit=args.lib_fragment_tol_unit,
+                        lib_precursor_tol_unit=args.lib_precursor_tol_unit,
+                        output_file=args.dia_output,
+                        fasta_file=args.fasta_file,
+                        enzyme=args.enzyme,
+                        decoy_cycle_length=args.decoy_cycle_length,
+                        verbose=args.verbose
+                    )
+                    
+                    # If calibration-only mode, exit after calibration
+                    if args.calibration_only:
+                        print("\nCalibration complete. Exiting (--calibration_only mode).")
+                        return
+                        
+                except RuntimeError as e:
+                    print(f"\nERROR: {e}")
+                    sys.exit(1)
         
         # Group spectra by isolation window
         print("\nGrouping spectra by isolation window...")
@@ -4021,8 +5063,8 @@ def main():
         # Prepare work items for parallel processing
         work_items = []
         for window_idx, (isolation_window, window_spectra) in enumerate(window_groups.items()):
-            window_str = f"{isolation_window[0]:.1f}_{isolation_window[1]:.1f}"
-            parquet_file = os.path.join(parquet_dir, f"window_{window_str}.parquet")
+            # No parquet files for full search (only TSV output)
+            parquet_file = None
             
             work_items.append((
                 window_idx,
@@ -4041,6 +5083,7 @@ def main():
                 args.lib_precursor_tol if args.lib_precursor_tol_unit == 'ppm' else args.lib_precursor_tol,
                 args.lib_fragment_tol_unit,
                 args.lib_precursor_tol_unit,
+                calibration,  # Pass calibration to workers
                 args.verbose
             ))
         
@@ -4053,7 +5096,6 @@ def main():
             # Just write header, then close - actual results will be appended later
             pass
         
-        parquet_files = []
         all_dia_results = {}  # Keep for summary statistics
         completed_windows = 0
         
@@ -4072,7 +5114,6 @@ def main():
             for item in work_items:
                 search_result = process_isolation_window_worker(item)
                 dia_results = search_result['results']
-                parquet_files.append(search_result['parquet_file'])
                 all_dia_results.update(dia_results)
                 
                 # Aggregate QC data
@@ -4106,7 +5147,6 @@ def main():
                 # Use imap_unordered to process results as they complete
                 for search_result in pool.imap_unordered(process_isolation_window_worker, work_items):
                     dia_results = search_result['results']
-                    parquet_files.append(search_result['parquet_file'])
                     all_dia_results.update(dia_results)
                     
                     # Aggregate QC data
@@ -4122,42 +5162,8 @@ def main():
                     completed_windows += 1
                     print(f"  Progress: {completed_windows}/{len(work_items)} windows completed")
         
-        print(f"\nAll {len(work_items)} isolation windows processed!")
-        
-        # Merge all per-window parquet files into single unified file
-        print(f"\nMerging {len(parquet_files)} per-window parquet files into unified file...")
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-        
-        all_chromatograms = pd.concat([
-            pd.read_parquet(f) for f in parquet_files if f is not None
-        ], ignore_index=True)
-        
-        # Sort by peptide_id, target/decoy, charge, and RT for better compression and queries
-        all_chromatograms = all_chromatograms.sort_values(
-            ['peptide_id', 'is_target', 'charge', 'retention_time']
-        )
-        
-        # Write unified parquet file (filename was computed earlier)
-        table = pa.Table.from_pandas(all_chromatograms)
-        pq.write_table(
-            table,
-            unified_parquet_file,
-            compression='snappy',  # Fast compression, good for large files
-            use_dictionary=True,   # Efficient for repeated strings (scan_id, protein_id, etc.)
-            row_group_size=100000  # Optimize for typical query patterns
-        )
-        
-        print(f"Unified chromatogram file written to: {unified_parquet_file}")
-        print(f"  Total rows: {len(all_chromatograms):,}")
-        print(f"  File size: {os.path.getsize(unified_parquet_file) / 1024 / 1024:.2f} MB")
-        
-        # Optionally delete per-window files to save space
-        # Uncomment to automatically clean up temp files:
-        # for f in parquet_files:
-        #     if f and os.path.exists(f):
-        #         os.remove(f)
-        # os.rmdir(parquet_dir)
+        search_elapsed = time.time() - workflow_start_time
+        print(f"\nAll {len(work_items)} isolation windows processed! (total elapsed: {search_elapsed:.1f}s)")
         
         # TSV results already written incrementally during processing
         
@@ -4181,11 +5187,13 @@ def main():
                 decoy_libcosine = row['decoy_LibCosine']
                 target_xcorr = row['XCorr']
                 decoy_xcorr = row['decoy_XCorr']
+                charge = row['Charge']
                 
                 # LibCosine competition
                 if target_libcosine > decoy_libcosine:
                     competition_results.append({
                         'Peptide': row['Peptide'],
+                        'Charge': charge,
                         'IsTarget': 'Target',
                         'LibCosine': target_libcosine,
                         'XCorr': target_xcorr
@@ -4193,6 +5201,7 @@ def main():
                 elif decoy_libcosine > target_libcosine:
                     competition_results.append({
                         'Peptide': row['decoy_Peptide'],
+                        'Charge': charge,
                         'IsTarget': 'Decoy',
                         'LibCosine': decoy_libcosine,
                         'XCorr': decoy_xcorr
@@ -4201,6 +5210,7 @@ def main():
                     # Tie - decoy wins (conservative)
                     competition_results.append({
                         'Peptide': row['decoy_Peptide'],
+                        'Charge': charge,
                         'IsTarget': 'Decoy',
                         'LibCosine': decoy_libcosine,
                         'XCorr': decoy_xcorr
@@ -4323,10 +5333,10 @@ def main():
         print("\n=== GENERATING QUALITY CONTROL PLOTS ===")
         qc_output_prefix = os.path.splitext(args.dia_output)[0]
         
-        print("\nQC data collected (before filtering):")
-        print(f"  MS1 mass errors: {len(all_qc_data['ms1_mass_errors']):,}")
-        print(f"  MS2 mass errors: {len(all_qc_data['ms2_mass_errors']):,}")
-        print(f"  RT pairs: {len(all_qc_data['rt_pairs']):,}")
+        print("\nQC data collected (all target precursors scored):")
+        print(f"  MS1 mass accuracy: {len(all_qc_data['ms1_mass_errors']):,} measurements")
+        print(f"  MS2 mass accuracy: {len(all_qc_data['ms2_mass_errors']):,} measurements")
+        print(f"  RT pairs (library vs measured): {len(all_qc_data['rt_pairs']):,}")
         
         # Filter QC data to only include peptides at <1% FDR
         if is_library_mode:
@@ -4336,26 +5346,42 @@ def main():
             filtered_qc_data = all_qc_data
         
         # Generate mass accuracy histograms
+        num_precursors = filtered_qc_data.get('num_precursors')
         plot_mass_accuracy_histograms(
             filtered_qc_data['ms1_mass_errors'],
             filtered_qc_data['ms2_mass_errors'],
             qc_output_prefix,
             ms1_unit=filtered_qc_data['ms1_tol_unit'],
-            ms2_unit=filtered_qc_data['ms2_tol_unit']
+            ms2_unit=filtered_qc_data['ms2_tol_unit'],
+            num_precursors=num_precursors
         )
         
         # Generate RT correlation plot (library mode only)
         if library_mode and len(filtered_qc_data['rt_pairs']) > 0:
             plot_rt_correlation(filtered_qc_data['rt_pairs'], qc_output_prefix)
         
+        # Mokapot integration (library mode only, by default)
+        if library_mode and not args.skip_mokapot:
+            print("\n=== MOKAPOT RESCORING ===")
+            
+            # Use in-memory DataFrame from competition analysis
+            # (tsv_df already loaded above)
+            
+            # Optional: Write PIN file
+            if args.output_pin:
+                write_pin_file(tsv_df, args.output_pin, library_mode=True)
+            
+            # Run Mokapot on in-memory DataFrame
+            tsv_df = run_mokapot(tsv_df, library_mode=True, n_workers=n_workers)
+            
+            # Save updated results with Mokapot columns
+            print(f"\nSaving results with Mokapot scores: {args.dia_output}")
+            tsv_df.to_csv(args.dia_output, sep='\t', index=False)
+            print("  Updated TSV file with mokapot_precursor_qvalue and mokapot_peptide_qvalue columns")
+        
         # Print final summary
         print("\n=== DIA PEPTIDE-CENTRIC SEARCH COMPLETED ===")
         print(f"Summary (TSV): {args.dia_output}")
-        print(f"Chromatograms (Parquet): {unified_parquet_file}")
-        print(f"  - Total rows: {len(all_chromatograms):,}")
-        print(f"  - File size: {os.path.getsize(unified_parquet_file) / 1024 / 1024:.2f} MB")
-        print(f"\nTemp files: {parquet_dir}/ ({len(parquet_files)} per-window files)")
-        print("  - Can be safely deleted after verification")
         
         # Print total analysis time
         total_elapsed = time.time() - total_start_time
@@ -4469,4 +5495,37 @@ def main():
 
 
 if __name__ == '__main__':
+    import sys
+    
+    # Setup logging to file for DIA mode
+    # Parse args to check if DIA mode and get mzML filename
+    if '--dia_mode' in sys.argv:
+        # Find mzML file argument (second positional arg)
+        mzml_file = None
+        for i, arg in enumerate(sys.argv):
+            if i > 0 and not arg.startswith('-') and arg.endswith('.mzML'):
+                mzml_file = arg
+                break
+        
+        if mzml_file:
+            import os
+            log_file = os.path.splitext(mzml_file)[0] + '.dia.log'
+            
+            # Tee stdout/stderr to both console and log file
+            class TeeLogger:
+                def __init__(self, *files):
+                    self.files = files
+                def write(self, data):
+                    for f in self.files:
+                        f.write(data)
+                        f.flush()
+                def flush(self):
+                    for f in self.files:
+                        f.flush()
+            
+            log_handle = open(log_file, 'w')
+            sys.stdout = TeeLogger(sys.stdout, log_handle)
+            sys.stderr = TeeLogger(sys.stderr, log_handle)
+            print(f"Logging output to: {log_file}")
+    
     main()
