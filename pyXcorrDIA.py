@@ -2764,10 +2764,10 @@ class FastXCorr:
             target_precursor_cosine = 0.0
             target_delta_mz_ppm_precursor = None
             if library is not None and ms1_spectra is not None:
-                closest_ms1 = FastXCorr.find_closest_ms1(ms1_spectra, target_rt)
-                if closest_ms1 is not None:
-                    lib_data = library.get_precursor(target_peptide.sequence, target_charge)
-                    if lib_data:
+                lib_data = library.get_precursor(target_peptide.sequence, target_charge)
+                if lib_data:
+                    closest_ms1 = FastXCorr.find_closest_ms1(ms1_spectra, target_rt)
+                    if closest_ms1 is not None:
                         # Apply m/z correction if calibration available
                         corrected_precursor_mz = lib_data['precursor_mz']
                         if calibration is not None:
@@ -2805,6 +2805,10 @@ class FastXCorr:
                         target_precursor_cosine = FastXCorr.calculate_cosine_angle(
                             experimental_isotopes, theoretical_isotopes
                         )
+                    else:
+                        # No MS1 signal detected: use the search tolerance as penalty
+                        # This ensures we always have a delta value for Mokapot
+                        target_delta_mz_ppm_precursor = adjusted_precursor_tol_ppm
             
             # Calculate target Z-scores
             target_xcorr_zscore = 0.0
@@ -2845,12 +2849,13 @@ class FastXCorr:
             
             # Calculate decoy precursor cosine (library mode with MS1)
             decoy_precursor_cosine = 0.0
+            decoy_delta_mz_ppm_precursor = None
             if library is not None and ms1_spectra is not None:
-                closest_ms1 = FastXCorr.find_closest_ms1(ms1_spectra, decoy_rt)
-                if closest_ms1 is not None:
-                    # Use target sequence for isotope pattern (same mass)
-                    lib_data = library.get_precursor(target_peptide.sequence, target_charge)
-                    if lib_data:
+                lib_data = library.get_precursor(target_peptide.sequence, target_charge)
+                if lib_data:
+                    closest_ms1 = FastXCorr.find_closest_ms1(ms1_spectra, decoy_rt)
+                    if closest_ms1 is not None:
+                        # Use target sequence for isotope pattern (same mass)
                         # Collect QC data: MS1 M+0 mass error
                         experimental_isotopes, m0_mass_error = FastXCorr.extract_isotope_envelope(
                             closest_ms1,
@@ -2860,9 +2865,12 @@ class FastXCorr:
                             collect_qc=True
                         )
                         if m0_mass_error is not None:
+                            # Calculate delta for decoy
+                            decoy_delta_mz_ppm_precursor = m0_mass_error / lib_data['precursor_mz'] * 1e6
+                            
                             # Convert to PPM if needed
                             if lib_precursor_tol_unit == 'ppm':
-                                m0_mass_error_final = m0_mass_error / lib_data['precursor_mz'] * 1e6  # PPM
+                                m0_mass_error_final = decoy_delta_mz_ppm_precursor  # PPM
                             else:
                                 m0_mass_error_final = m0_mass_error  # m/z
                             qc_data['ms1_mass_errors'].append({
@@ -2878,6 +2886,9 @@ class FastXCorr:
                         decoy_precursor_cosine = FastXCorr.calculate_cosine_angle(
                             experimental_isotopes, theoretical_isotopes
                         )
+                    else:
+                        # No MS1 signal detected: use the search tolerance as penalty
+                        decoy_delta_mz_ppm_precursor = lib_precursor_tol_ppm
             
             # Calculate decoy Z-scores
             decoy_xcorr_zscore = 0.0
@@ -2895,51 +2906,37 @@ class FastXCorr:
                     decoy_lib_zscore = (decoy_lib_cosine - lib_mean) / lib_std
             
             # Calculate delta_mz_ppm_fragments for target (average MS2 error from best spectrum)
+            # Always report this - if no fragments matched, use fragment tolerance as penalty
             target_delta_mz_ppm_fragments = None
-            if library is not None and hasattr(self, '_temp_ms2_errors_target'):
-                if pair_idx in self._temp_ms2_errors_target:
-                    temp_errors = self._temp_ms2_errors_target[pair_idx]
-                    if target_spec_idx in temp_errors:
-                        # Average of all fragment errors (already in PPM)
-                        errors = [e['error'] for e in temp_errors[target_spec_idx]]
-                        if len(errors) > 0:
-                            target_delta_mz_ppm_fragments = np.mean(errors)
+            if library is not None:
+                if hasattr(self, '_temp_ms2_errors_target'):
+                    if pair_idx in self._temp_ms2_errors_target:
+                        temp_errors = self._temp_ms2_errors_target[pair_idx]
+                        if target_spec_idx in temp_errors:
+                            # Average of all fragment errors (already in PPM)
+                            errors = [e['error'] for e in temp_errors[target_spec_idx]]
+                            if len(errors) > 0:
+                                target_delta_mz_ppm_fragments = np.mean(errors)
+                
+                # If no fragments matched, use fragment tolerance as penalty
+                if target_delta_mz_ppm_fragments is None:
+                    target_delta_mz_ppm_fragments = adjusted_fragment_tol_ppm
             
             # Calculate delta_mz_ppm_fragments for decoy (average MS2 error from best spectrum)
             decoy_delta_mz_ppm_fragments = None
-            if library is not None and hasattr(self, '_temp_ms2_errors_decoy'):
-                if pair_idx + 1 in self._temp_ms2_errors_decoy:
-                    temp_errors = self._temp_ms2_errors_decoy[pair_idx + 1]
-                    if decoy_spec_idx in temp_errors:
-                        # Average of all fragment errors (already in PPM)
-                        errors = [e['error'] for e in temp_errors[decoy_spec_idx]]
-                        if len(errors) > 0:
-                            decoy_delta_mz_ppm_fragments = np.mean(errors)
-            
-            # Calculate delta_mz_ppm_precursor for decoy
-            decoy_delta_mz_ppm_precursor = None
-            if library is not None and ms1_spectra is not None:
-                closest_ms1_decoy = FastXCorr.find_closest_ms1(ms1_spectra, decoy_rt)
-                if closest_ms1_decoy is not None:
-                    lib_data_decoy = library.get_precursor(target_peptide.sequence, target_charge)
-                    if lib_data_decoy:
-                        # Apply m/z correction if calibration available
-                        corrected_precursor_mz_decoy = lib_data_decoy['precursor_mz']
-                        if calibration is not None:
-                            ms1_cal = calibration.get('ms1_calibration', {})
-                            if ms1_cal.get('mean_ppm') is not None:
-                                corrected_precursor_mz_decoy = lib_data_decoy['precursor_mz'] * (1 + ms1_cal['mean_ppm'] / 1e6)
-                        
-                        experimental_isotopes_decoy, m0_mass_error_decoy = FastXCorr.extract_isotope_envelope(
-                            closest_ms1_decoy,
-                            corrected_precursor_mz_decoy,
-                            target_charge,
-                            adjusted_precursor_tol_ppm,
-                            collect_qc=True
-                        )
-                        
-                        if m0_mass_error_decoy is not None:
-                            decoy_delta_mz_ppm_precursor = m0_mass_error_decoy / lib_data_decoy['precursor_mz'] * 1e6
+            if library is not None:
+                if hasattr(self, '_temp_ms2_errors_decoy'):
+                    if pair_idx + 1 in self._temp_ms2_errors_decoy:
+                        temp_errors = self._temp_ms2_errors_decoy[pair_idx + 1]
+                        if decoy_spec_idx in temp_errors:
+                            # Average of all fragment errors (already in PPM)
+                            errors = [e['error'] for e in temp_errors[decoy_spec_idx]]
+                            if len(errors) > 0:
+                                decoy_delta_mz_ppm_fragments = np.mean(errors)
+                
+                # If no fragments matched, use fragment tolerance as penalty
+                if decoy_delta_mz_ppm_fragments is None:
+                    decoy_delta_mz_ppm_fragments = lib_fragment_tol_ppm
             
             # Store paired results
             target_result_dict = {
@@ -4509,17 +4506,13 @@ def write_pin_file(results_df: pd.DataFrame, output_path: str, library_mode: boo
         # Add feature columns based on library mode
         if library_mode:
             pin_row['LibCosine'] = row.get('LibCosine', 0.0)
-            pin_row['LibCosineZScore'] = row.get('LibCosineZScore', 0.0)
             pin_row['XCorr'] = row.get('XCorr', 0.0)
             pin_row['PrecursorCosine'] = row.get('PrecursorCosine', 0.0)
             
-            # Add delta columns if available
-            if 'delta_mz_ppm_precursor' in row:
-                pin_row['absDeltaMzPpmPrecursor'] = abs(row['delta_mz_ppm_precursor'])
-            if 'delta_mz_ppm_fragments' in row:
-                pin_row['absDeltaMzPpmFragments'] = abs(row['delta_mz_ppm_fragments'])
-            if 'delta_rt' in row:
-                pin_row['absDeltaRT'] = abs(row['delta_rt'])
+            # Add delta columns - these are always present in library mode (SIGNED values)
+            pin_row['DeltaRT'] = row.get('delta_rt', 0.0) if pd.notna(row.get('delta_rt')) else 0.0
+            pin_row['DeltaMzPpmPrecursor'] = row.get('delta_mz_ppm_precursor', 0.0) if pd.notna(row.get('delta_mz_ppm_precursor')) else 0.0
+            pin_row['DeltaMzPpmFragments'] = row.get('delta_mz_ppm_fragments', 0.0) if pd.notna(row.get('delta_mz_ppm_fragments')) else 0.0
         else:
             pin_row['XCorr'] = row.get('BestXCorr', 0.0)
             pin_row['XCorrZScore'] = row.get('XCorrZScore', 0.0)
@@ -4553,91 +4546,122 @@ def run_mokapot(results_df: pd.DataFrame, library_mode: bool = True, n_workers: 
         print("Skipping Mokapot rescoring.")
         return results_df
     
+    # Determine feature columns globally (do not build per-row)
+    # Base feature sets
+    # Note: LibCosineZScore removed - doesn't make sense with narrow RT window scoring
+    lib_base = ['LibCosine', 'XCorr', 'PrecursorCosine']
+    nonlib_base = ['XCorr', 'XCorrZScore']
+
+    # Delta features - these are ALWAYS present (not optional)
+    # They measure deviation from predicted values, regardless of calibration
+    # Using SIGNED deltas to distinguish systematic bias from random error
+    delta_features = ['DeltaRT', 'DeltaMzPpmPrecursor', 'DeltaMzPpmFragments']
+
+    # Choose candidate columns depending on library_mode
+    if library_mode:
+        candidate_features = lib_base + delta_features
+    else:
+        candidate_features = list(nonlib_base)
+
+    # Print planned feature set
+    print("Planned Mokapot features:")
+    print(f"  {candidate_features}")
+    
+    # Diagnostic: Print available delta columns in DataFrame
+    delta_cols = [col for col in results_df.columns if 'delta' in col.lower()]
+    if delta_cols:
+        print(f"Available delta columns in DataFrame: {delta_cols}")
+    
+    # Diagnostic: Check for decoy columns
+    decoy_cols = [col for col in results_df.columns if col.startswith('decoy_')]
+    print(f"Found {len(decoy_cols)} decoy-prefixed columns in paired format")
+
     # Unroll paired target/decoy format into separate rows for Mokapot
-    psm_data = []
+    psm_rows = []
     for idx, row in results_df.iterrows():
-        # Create unique ID for this precursor (peptide+charge)
         precursor_id = f"{row['Peptide']}_{row['Charge']}"
-        
-        # Target PSM
-        target_psm = {
+
+        # target
+        t = {
             'PSMId': f"{precursor_id}_target",
             'PrecursorId': precursor_id,
-            'Label': 1,  # Target
-            'ScanNr': row['ScanID'],
+            'Label': 1,
+            'ScanNr': row.get('ScanID'),
             'Peptide': row['Peptide'],
-            'Proteins': row['ProteinID'],
-            'RowIndex': idx  # Track original row for merging back
+            'Proteins': row.get('ProteinID', None),
         }
-        
-        # Decoy PSM
-        decoy_psm = {
+        # decoy
+        d = {
             'PSMId': f"{precursor_id}_decoy",
             'PrecursorId': precursor_id,
-            'Label': -1,  # Decoy
-            'ScanNr': row.get('DecoyScanID', row['ScanID']),  # Use decoy scan if available
+            'Label': -1,
+            'ScanNr': row.get('DecoyScanID', row.get('ScanID')),
             'Peptide': row.get('DecoyPeptide', f"DECOY_{row['Peptide']}"),
-            'Proteins': row['ProteinID'],
-            'RowIndex': idx
+            'Proteins': row.get('ProteinID', None),
         }
-        
-        # Add features for both target and decoy
+
+        # Fill feature values (use 0/default when missing for decoys)
         if library_mode:
-            # Target features
-            target_psm['LibCosine'] = row.get('LibCosine', 0.0)
-            target_psm['LibCosineZScore'] = row.get('LibCosineZScore', 0.0)
-            target_psm['XCorr'] = row.get('XCorr', 0.0)
-            target_psm['PrecursorCosine'] = row.get('PrecursorCosine', 0.0)
-            
-            # Decoy features
-            decoy_psm['LibCosine'] = row.get('DecoyLibCosine', 0.0)
-            decoy_psm['LibCosineZScore'] = row.get('DecoyLibCosineZScore', 0.0)
-            decoy_psm['XCorr'] = row.get('DecoyXCorr', 0.0)
-            decoy_psm['PrecursorCosine'] = row.get('DecoyPrecursorCosine', 0.0)
-            
-            feature_cols = ['LibCosine', 'LibCosineZScore', 'XCorr', 'PrecursorCosine']
-            
-            # Add delta features if present (only for targets with calibration)
-            if pd.notna(row.get('delta_rt')):
-                target_psm['absDeltaRT'] = abs(row['delta_rt'])
-                feature_cols.append('absDeltaRT')
-            if pd.notna(row.get('delta_mz_ppm_precursor')):
-                target_psm['absDeltaMzPpmPrecursor'] = abs(row['delta_mz_ppm_precursor'])
-                feature_cols.append('absDeltaMzPpmPrecursor')
-            if pd.notna(row.get('delta_mz_ppm_fragments')):
-                target_psm['absDeltaMzPpmFragments'] = abs(row['delta_mz_ppm_fragments'])
-                feature_cols.append('absDeltaMzPpmFragments')
+            t['LibCosine'] = row.get('LibCosine', 0.0)
+            t['XCorr'] = row.get('XCorr', 0.0)
+            t['PrecursorCosine'] = row.get('PrecursorCosine', 0.0)
+
+            d['LibCosine'] = row.get('decoy_LibCosine', 0.0)
+            d['XCorr'] = row.get('decoy_XCorr', 0.0)
+            d['PrecursorCosine'] = row.get('decoy_PrecursorCosine', 0.0)
         else:
-            target_psm['XCorr'] = row.get('BestXCorr', 0.0)
-            target_psm['XCorrZScore'] = row.get('XCorrZScore', 0.0)
-            decoy_psm['XCorr'] = row.get('DecoyXCorr', 0.0)
-            decoy_psm['XCorrZScore'] = row.get('DecoyXCorrZScore', 0.0)
-            feature_cols = ['XCorr', 'XCorrZScore']
-        
-        psm_data.append(target_psm)
-        psm_data.append(decoy_psm)
-    
-    psm_df = pd.DataFrame(psm_data)
-    
-    # Check for missing values in features
-    missing_features = []
-    for col in feature_cols:
-        if col in psm_df.columns and psm_df[col].isna().any():
-            missing_features.append(col)
-    
+            t['XCorr'] = row.get('BestXCorr', 0.0)
+            t['XCorrZScore'] = row.get('XCorrZScore', 0.0)
+            d['XCorr'] = row.get('decoy_XCorr', 0.0)
+            d['XCorrZScore'] = row.get('decoy_XCorrZScore', 0.0)
+
+        # Add delta (SIGNED) features - these are ALWAYS present in library mode
+        # Using signed values to distinguish positive vs negative systematic bias
+        # For decoys: use decoy-specific delta if available, otherwise use target delta
+        # (Decoys are matched in same scan/window, so calibration errors should be similar)
+        if library_mode:
+            # Delta RT (signed)
+            t['DeltaRT'] = row.get('delta_rt', 0.0) if pd.notna(row.get('delta_rt')) else 0.0
+            decoy_delta = row.get('decoy_delta_rt')
+            d['DeltaRT'] = decoy_delta if pd.notna(decoy_delta) else t['DeltaRT']
+            
+            # Delta precursor m/z (PPM, signed)
+            t['DeltaMzPpmPrecursor'] = row.get('delta_mz_ppm_precursor', 0.0) if pd.notna(row.get('delta_mz_ppm_precursor')) else 0.0
+            decoy_delta = row.get('decoy_delta_mz_ppm_precursor')
+            d['DeltaMzPpmPrecursor'] = decoy_delta if pd.notna(decoy_delta) else t['DeltaMzPpmPrecursor']
+            
+            # Delta fragments m/z (PPM, signed)
+            t['DeltaMzPpmFragments'] = row.get('delta_mz_ppm_fragments', 0.0) if pd.notna(row.get('delta_mz_ppm_fragments')) else 0.0
+            decoy_delta = row.get('decoy_delta_mz_ppm_fragments')
+            d['DeltaMzPpmFragments'] = decoy_delta if pd.notna(decoy_delta) else t['DeltaMzPpmFragments']
+
+        psm_rows.append(t)
+        psm_rows.append(d)
+
+    psm_df = pd.DataFrame(psm_rows)
+
+    # Determine final feature columns present in psm_df
+    feature_cols = [c for c in candidate_features if c in psm_df.columns]
+
+    # Drop any feature columns that are all-missing
+    missing_features = [c for c in feature_cols if psm_df[c].isna().all()]
     if missing_features:
-        print(f"Missing values detected in the following features:")
+        print("Missing values detected in the following features:")
         for feat in missing_features:
             print(f"  - {feat}")
         print("Dropping features with missing values...")
-        feature_cols = [f for f in feature_cols if f not in missing_features]
-    
+        feature_cols = [c for c in feature_cols if c not in missing_features]
+
     if not feature_cols:
         print("ERROR: No valid features remaining after dropping missing values.")
         print("Returning results without Mokapot scores.")
         return results_df
-    
-    # Create Mokapot dataset
+
+    # Report counts before running mokapot
+    n_targets = (psm_df['Label'] == 1).sum()
+    n_decoys = (psm_df['Label'] == -1).sum()
+    print(f"  Training Mokapot model: {n_targets} targets, {n_decoys} decoys, {len(feature_cols)} features")
+
     try:
         psms = mokapot.LinearPsmDataset(
             psm_df,
@@ -4646,35 +4670,23 @@ def run_mokapot(results_df: pd.DataFrame, library_mode: bool = True, n_workers: 
             peptide_column='Peptide',
             feature_columns=feature_cols
         )
-        
-        # Run Mokapot
-        n_targets = (psm_df['Label'] == 1).sum()
-        n_decoys = (psm_df['Label'] == -1).sum()
-        print(f"  Training Mokapot model: {n_targets} targets, {n_decoys} decoys, {len(feature_cols)} features")
-        
+
         results, models = mokapot.brew(psms, max_workers=n_workers, test_fdr=0.01)
-        
-        # Get results
+
         psm_results_df = results.psms
         peptide_df = results.peptides
-        
-        num_precursors_01fdr = len(psm_results_df[psm_results_df['mokapot q-value'] <= 0.01])
-        num_peptides_01fdr = len(peptide_df[peptide_df['mokapot q-value'] <= 0.01])
-        print(f"  Mokapot complete: {num_precursors_01fdr} precursors, {num_peptides_01fdr} peptides at 1% FDR")
-        
-        # Merge Mokapot precursor-level scores back (use 'PrecursorId' to map)
+
+        # Aggregate precursor-level q-values (best across target/decoy PSMs)
         precursor_qvalues = {}
         precursor_scores = {}
         for _, psm_row in psm_results_df.iterrows():
-            prec_id = psm_row['PSMId'].rsplit('_', 1)[0]  # Remove _target or _decoy suffix
+            prec_id = psm_row['PSMId'].rsplit('_', 1)[0]
             qval = psm_row['mokapot q-value']
             score = psm_row['mokapot score']
-            
-            # Keep best (lowest q-value) for each precursor
             if prec_id not in precursor_qvalues or qval < precursor_qvalues[prec_id]:
                 precursor_qvalues[prec_id] = qval
                 precursor_scores[prec_id] = score
-        
+
         results_df['mokapot_precursor_qvalue'] = results_df.apply(
             lambda row: precursor_qvalues.get(f"{row['Peptide']}_{row['Charge']}", None),
             axis=1
@@ -4683,16 +4695,16 @@ def run_mokapot(results_df: pd.DataFrame, library_mode: bool = True, n_workers: 
             lambda row: precursor_scores.get(f"{row['Peptide']}_{row['Charge']}", None),
             axis=1
         )
-        
+
         # Map peptide-level scores
         peptide_qvalues = peptide_df.set_index('mokapot peptide')['mokapot q-value'].to_dict()
         peptide_scores = peptide_df.set_index('mokapot peptide')['mokapot score'].to_dict()
-        
+
         results_df['mokapot_peptide_qvalue'] = results_df['Peptide'].map(peptide_qvalues)
         results_df['mokapot_peptide_score'] = results_df['Peptide'].map(peptide_scores)
-        
+
         return results_df
-        
+
     except Exception as e:
         print(f"ERROR running Mokapot: {e}")
         print("Returning results without Mokapot scores.")
