@@ -11,7 +11,6 @@ This module tests the paired reporting format where:
 """
 
 import pytest
-import numpy as np
 import pandas as pd
 import tempfile
 import os
@@ -22,8 +21,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pyXcorrDIA import (
-    FastXCorr, SpectrumLibrary, MS1Spectrum, MassSpectrum,
-    PeptideCandidate, DIAResultsWriter
+    FastXCorr, PeptideCandidate, DIAResultsWriter
 )
 
 
@@ -42,13 +40,8 @@ class TestTargetDecoyCompetition:
         - Returns XCorr at LibCosine peak
         - Does not calculate e-value
         """
-        # Create mock peptide pairs (target + decoy)
-        target_peptide = PeptideCandidate("PEPTIDE", "P12345", mass=799.359954)
-        decoy_peptide = PeptideCandidate("EDPTIEP", "DECOY_P12345", mass=799.359954)
-        
         # Simulate XCorr chromatograms (5 spectra)
         target_xcorr = [0.5, 0.8, 1.2, 0.9, 0.6]
-        decoy_xcorr = [0.4, 0.6, 0.9, 0.7, 0.5]
         
         # Simulate LibCosine chromatograms
         # Target has best LibCosine at spectrum 2 (index 2)
@@ -67,7 +60,7 @@ class TestTargetDecoyCompetition:
         winner_lib_idx = target_libcosine.index(target_best_lib)
         winner_xcorr_at_peak = target_xcorr[winner_lib_idx]
         
-        assert winner_is_target == True
+        assert winner_is_target
         assert winner_lib_idx == 2
         assert winner_xcorr_at_peak == 1.2  # XCorr at LibCosine peak, not best XCorr
         
@@ -84,10 +77,6 @@ class TestTargetDecoyCompetition:
         - Reports only winner (target or decoy)
         - Calculates e-value from XCorr distribution
         """
-        # Create mock peptide pairs
-        target_peptide = PeptideCandidate("PEPTIDE", "P12345", mass=799.359954)
-        decoy_peptide = PeptideCandidate("EDPTIEP", "DECOY_P12345", mass=799.359954)
-        
         # Simulate XCorr chromatograms (5 spectra)
         target_xcorr = [0.5, 0.8, 1.5, 0.9, 0.6]  # Best: 1.5 at index 2
         decoy_xcorr = [0.4, 0.6, 1.2, 0.7, 0.5]   # Best: 1.2 at index 2
@@ -106,7 +95,7 @@ class TestTargetDecoyCompetition:
         temp_engine = FastXCorr()
         e_value = temp_engine.calculate_e_value(target_xcorr, target_best_xcorr)
         
-        assert winner_is_target == True
+        assert winner_is_target
         assert winner_xcorr_idx == 2
         assert e_value >= 0, "E-value should be non-negative"
         
@@ -138,12 +127,12 @@ class TestTargetDecoyCompetition:
         else:
             winner_is_target = False  # Tie: decoy wins
             
-        assert winner_is_target == False, "Decoy should win in tie"
+        assert not winner_is_target, "Decoy should win in tie"
         
         print("✓ Tie-breaking:")
         print(f"  Target score: {target_best:.2f}")
         print(f"  Decoy score: {decoy_best:.2f}")
-        print(f"  Winner: Decoy (conservative)")
+        print("  Winner: Decoy (conservative)")
 
 
 class TestDIAResultsWriter:
@@ -398,8 +387,8 @@ class TestPairProcessing:
             decoy = peptides[pair_idx + 1]
             
             # Verify pairing
-            assert target[2] == True, "Even index should be target"
-            assert decoy[2] == False, "Odd index should be decoy"
+            assert target[2], "Even index should be target"
+            assert not decoy[2], "Odd index should be decoy"
             assert target[3] == decoy[3], "Pair IDs should match"
             
             # Simulate competition (target wins if score > decoy score)
@@ -411,8 +400,8 @@ class TestPairProcessing:
         
         # Verify we got one winner per pair
         assert len(winners) == 2, "Should have one winner per pair"
-        assert winners[0][2] == True, "First winner should be target"
-        assert winners[1][2] == False, "Second winner should be decoy"
+        assert winners[0][2], "First winner should be target"
+        assert not winners[1][2], "Second winner should be decoy"
         
         print("✓ Pair processing:")
         print(f"  Input peptides: {len(peptides)} (2 pairs)")

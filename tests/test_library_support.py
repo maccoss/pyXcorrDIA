@@ -23,8 +23,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pyXcorrDIA import (
-    FastXCorr, SpectrumLibrary, MS1Spectrum, MassSpectrum,
-    PeptideCandidate
+    FastXCorr, SpectrumLibrary, MS1Spectrum
 )
 
 
@@ -110,7 +109,7 @@ class TestSpectrumLibrary:
 
         try:
             with pytest.raises(ValueError, match="parquet format"):
-                library = SpectrumLibrary(tmp_path)
+                SpectrumLibrary(tmp_path)
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)

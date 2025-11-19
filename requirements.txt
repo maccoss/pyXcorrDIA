@@ -8,7 +8,6 @@ statsmodels>=0.13.0  # For LOESS regression in RT calibration
 mokapot>=0.9.0  # For peptide-level FDR estimation (optional)
 
 # Mass spectrometry data processing
-pymzml>=2.4.0
 pyteomics>=4.5.0
 
 # Pyteomics dependencies

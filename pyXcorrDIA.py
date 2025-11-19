@@ -22,7 +22,6 @@ from collections import defaultdict
 import re
 from typing import List, Tuple, Dict, Optional, Union
 import argparse
-import pymzml
 from pyteomics import mgf
 import os
 import bisect
@@ -36,6 +35,40 @@ try:
     from statsmodels.nonparametric.smoothers_lowess import lowess
 except ImportError:
     lowess = None  # Will fall back to linear regression if statsmodels not available
+
+
+def extract_scan_number(scan_id_str):
+    """
+    Extract numeric scan number from scan ID string.
+    
+    Handles formats like:
+    - 'controllerType=0 controllerNumber=1 scan=12345' -> 12345
+    - 'scan=12345' -> 12345
+    - '12345' -> 12345
+    
+    Args:
+        scan_id_str: Scan ID string from mzML
+        
+    Returns:
+        Integer scan number, or 0 if cannot be extracted
+    """
+    scan_id_str = str(scan_id_str)
+    
+    # Try to extract from 'scan=' format
+    if 'scan=' in scan_id_str:
+        try:
+            return int(scan_id_str.split('scan=')[-1].split()[0])
+        except (ValueError, IndexError):
+            pass
+    
+    # Try to find any number in the string
+    import re
+    match = re.search(r'\d+', scan_id_str)
+    if match:
+        return int(match.group())
+    
+    # Fallback
+    return 0
 
 
 class MassSpectrum:
@@ -677,6 +710,8 @@ class FastXCorr:
     def read_mzml_combined(self, mzml_file: str, max_spectra: int = 0, preprocess_smz: bool = False) -> Tuple[List[MassSpectrum], List[MS1Spectrum]]:
         """Read MS1 and MS2 spectra from mzML file in a single pass.
         
+        Supports mzML, mzMLb (binary/indexed), and mzXML formats.
+        
         Args:
             mzml_file: Path to mzML file
             max_spectra: Maximum number of MS2 spectra to read (0 = all)
@@ -685,93 +720,77 @@ class FastXCorr:
         Returns:
             Tuple of (ms2_spectra, ms1_spectra)
         """
+        from pyteomics import mzml
+        
         ms2_spectra = []
         ms1_spectra = []
+        ms2_count = 0
         
-        # Open the mzML file with pymzml
-        run = pymzml.run.Reader(mzml_file)
-        
-        for spectrum_idx, spectrum in enumerate(run):
-            if spectrum.ms_level == 2:
-                # Process MS2 spectrum
-                # Get precursor information
-                precursor_mz = 0.0
-                charge = 0
-                isolation_window_lower = 0.0
-                isolation_window_upper = 0.0
+        with mzml.MzML(mzml_file) as reader:
+            for spectrum in reader:
+                ms_level = spectrum.get('ms level', 0)
                 
-                # Get precursor m/z and charge using pymzml API
-                if hasattr(spectrum, 'selected_precursors') and spectrum.selected_precursors:
-                    precursor = spectrum.selected_precursors[0]
-                    if 'mz' in precursor:
-                        precursor_mz = float(precursor['mz'])
+                if ms_level == 2:
+                    # Process MS2 spectrum
+                    if max_spectra > 0 and ms2_count >= max_spectra:
+                        break
                     
-                    # Try to get charge from the precursor element
-                    if 'element' in precursor:
-                        element = precursor['element']
-                        
-                        # Look for charge state in selectedIonList/selectedIon/cvParam elements
-                        for child in element:
-                            if 'selectedIonList' in child.tag:
-                                for selected_ion in child:
-                                    if 'selectedIon' in selected_ion.tag:
-                                        for cv_param in selected_ion:
-                                            if 'cvParam' in cv_param.tag:
-                                                # MS:1000633 = possible charge state
-                                                # MS:1000041 = charge state
-                                                accession = cv_param.attrib.get('accession', '')
-                                                if accession in ['MS:1000633', 'MS:1000041']:
-                                                    value = cv_param.attrib.get('value', '')
-                                                    if value:
-                                                        charge = int(float(value))
-                                                        break
-                        
-                        # Look for isolation window information in the precursor element
-                        for child in element:
-                            if 'isolationWindow' in child.tag:
-                                for iso_child in child:
-                                    if 'lowerOffset' in iso_child.attrib:
-                                        isolation_window_lower = precursor_mz - float(iso_child.attrib['lowerOffset'])
-                                    elif 'upperOffset' in iso_child.attrib:
-                                        isolation_window_upper = precursor_mz + float(iso_child.attrib['upperOffset'])
-                                    elif iso_child.get('name') == 'isolation window lower offset':
-                                        isolation_window_lower = precursor_mz - float(iso_child.get('value', 0))
-                                    elif iso_child.get('name') == 'isolation window upper offset':
-                                        isolation_window_upper = precursor_mz + float(iso_child.get('value', 0))
+                    # Get peaks
+                    mz_array = spectrum['m/z array']
+                    intensity_array = spectrum['intensity array']
                     
-                    # Default charge if still not found (we'll use configurable charge states anyway)
-                    if charge == 0:
-                        charge = 2  # Common default for MS/MS
+                    if len(mz_array) == 0:
+                        continue
                     
-                    # If isolation window not found, use default 3 m/z window
+                    # Get scan ID
+                    scan_id = spectrum.get('id', f"scan_{ms2_count}")
+                    
+                    # Get retention time (convert seconds to minutes)
+                    rt_seconds = spectrum['scanList']['scan'][0].get('scan start time', 0.0)
+                    retention_time = rt_seconds / 60.0 if rt_seconds > 100 else rt_seconds  # Handle both seconds and minutes
+                    
+                    # Get precursor information
+                    precursor_mz = 0.0
+                    charge = 2  # default
+                    isolation_window_lower = 0.0
+                    isolation_window_upper = 0.0
+                    
+                    if 'precursorList' in spectrum:
+                        precursor_list = spectrum['precursorList']['precursor']
+                        if precursor_list:
+                            precursor = precursor_list[0]
+                            
+                            # Get selected ion info
+                            if 'selectedIonList' in precursor:
+                                selected_ion = precursor['selectedIonList']['selectedIon'][0]
+                                precursor_mz = selected_ion.get('selected ion m/z', 0.0)
+                                
+                                # Get charge if available
+                                if 'charge state' in selected_ion:
+                                    charge = int(selected_ion['charge state'])
+                                elif 'possible charge state' in selected_ion:
+                                    charge = int(selected_ion['possible charge state'])
+                            
+                            # Get isolation window
+                            if 'isolationWindow' in precursor:
+                                iso_window = precursor['isolationWindow']
+                                target_mz = iso_window.get('isolation window target m/z', precursor_mz)
+                                lower_offset = iso_window.get('isolation window lower offset', 1.5)
+                                upper_offset = iso_window.get('isolation window upper offset', 1.5)
+                                isolation_window_lower = target_mz - lower_offset
+                                isolation_window_upper = target_mz + upper_offset
+                    
+                    # Default isolation window if not found
                     if isolation_window_lower == 0.0 and isolation_window_upper == 0.0:
                         isolation_window_lower = precursor_mz - 1.5
                         isolation_window_upper = precursor_mz + 1.5
-                
-                # Get scan ID and retention time
-                scan_id = spectrum.ID
-                
-                # Try to get retention time, fallback to scan index if not available
-                try:
-                    retention_time_minutes = spectrum.scan_time_in_minutes()
-                except (AttributeError, TypeError):
-                    # If RT not available, use scan index as a proxy
-                    retention_time_minutes = float(spectrum_idx)
-                
-                if not scan_id:
-                    scan_id = f"scan_{retention_time_minutes:.4f}"
-                
-                # Get m/z and intensity arrays
-                if len(spectrum.peaks('centroided')) > 0:
-                    peaks = spectrum.peaks('centroided')
-                    mz_array = np.array([peak[0] for peak in peaks])
-                    intensity_array = np.array([peak[1] for peak in peaks])
                     
-                    # Step 4: Apply SMZ preprocessing if requested
+                    # Apply SMZ preprocessing if requested
                     if preprocess_smz:
                         intensity_array = np.sqrt(intensity_array) * (mz_array ** 2)
                     
-                    mass_spectrum = MassSpectrum(
+                    # Create MassSpectrum object
+                    ms2_spec = MassSpectrum(
                         mz_array=mz_array,
                         intensity_array=intensity_array,
                         scan_id=scan_id,
@@ -779,132 +798,115 @@ class FastXCorr:
                         charge=charge,
                         isolation_window_lower=isolation_window_lower,
                         isolation_window_upper=isolation_window_upper,
-                        retention_time=retention_time_minutes
+                        retention_time=retention_time
                     )
-                    ms2_spectra.append(mass_spectrum)
+                    ms2_spectra.append(ms2_spec)
+                    ms2_count += 1
                     
-                    # Stop reading if we've reached the maximum number of MS2 spectra
-                    if max_spectra > 0 and len(ms2_spectra) >= max_spectra:
-                        break
-                        
-            elif spectrum.ms_level == 1:
-                # Process MS1 spectrum
-                # Get scan ID
-                scan_id = spectrum.ID
-                if not scan_id:
-                    scan_id = f"ms1_scan_{spectrum_idx}"
-
-                # Try to get retention time
-                try:
-                    retention_time_minutes = spectrum.scan_time_in_minutes()
-                except (AttributeError, TypeError):
-                    retention_time_minutes = float(spectrum_idx)
-
-                # Get m/z and intensity arrays
-                if len(spectrum.peaks('centroided')) > 0:
-                    peaks = spectrum.peaks('centroided')
-                    mz_array = np.array([peak[0] for peak in peaks])
-                    intensity_array = np.array([peak[1] for peak in peaks])
-
-                    ms1_spectrum = MS1Spectrum(
+                elif ms_level == 1:
+                    # Process MS1 spectrum for precursor isotope scoring
+                    mz_array = spectrum['m/z array']
+                    intensity_array = spectrum['intensity array']
+                    
+                    if len(mz_array) == 0:
+                        continue
+                    
+                    scan_id = spectrum.get('id', f"ms1_scan_{len(ms1_spectra)}")
+                    
+                    # Get retention time
+                    rt_seconds = spectrum['scanList']['scan'][0].get('scan start time', 0.0)
+                    retention_time = rt_seconds / 60.0 if rt_seconds > 100 else rt_seconds
+                    
+                    ms1_spec = MS1Spectrum(
                         mz_array=mz_array,
                         intensity_array=intensity_array,
                         scan_id=scan_id,
-                        retention_time=retention_time_minutes
+                        retention_time=retention_time
                     )
-                    ms1_spectra.append(ms1_spectrum)
-        
-        # Sort MS1 spectra by retention time for efficient lookup
-        ms1_spectra.sort(key=lambda x: x.retention_time)
+                    ms1_spectra.append(ms1_spec)
         
         return ms2_spectra, ms1_spectra
-
+    
     def read_mzml(self, mzml_file: str, max_spectra: int = 0) -> List[MassSpectrum]:
-        """Read mass spectra from mzML file using pymzml."""
+        """Read MS2 spectra from mzML file.
+        
+        Supports mzML, mzMLb (binary/indexed), and mzXML formats.
+        
+        Args:
+            mzml_file: Path to mzML file
+            max_spectra: Maximum number of MS2 spectra to read (0 = all)
+            
+        Returns:
+            List of MassSpectrum objects
+        """
+        from pyteomics import mzml
+        
         spectra = []
+        ms2_count = 0
         
-        # Open the mzML file with pymzml
-        run = pymzml.run.Reader(mzml_file)
-        
-        for spectrum_idx, spectrum in enumerate(run):
-            # Only process MS2 spectra
-            if spectrum.ms_level != 2:
-                continue
-            
-            # Get precursor information
-            precursor_mz = 0.0
-            charge = 0
-            isolation_window_lower = 0.0
-            isolation_window_upper = 0.0
-            
-            # Get precursor m/z and charge using pymzml API
-            if hasattr(spectrum, 'selected_precursors') and spectrum.selected_precursors:
-                precursor = spectrum.selected_precursors[0]
-                if 'mz' in precursor:
-                    precursor_mz = float(precursor['mz'])
+        with mzml.MzML(mzml_file) as reader:
+            for spectrum in reader:
+                ms_level = spectrum.get('ms level', 0)
                 
-                # Try to get charge from the precursor element
-                if 'element' in precursor:
-                    element = precursor['element']
-                    
-                    # Look for charge state in selectedIonList/selectedIon/cvParam elements
-                    for child in element:
-                        if 'selectedIonList' in child.tag:
-                            for selected_ion in child:
-                                if 'selectedIon' in selected_ion.tag:
-                                    for cv_param in selected_ion:
-                                        if 'cvParam' in cv_param.tag:
-                                            # MS:1000633 = possible charge state
-                                            # MS:1000041 = charge state
-                                            accession = cv_param.attrib.get('accession', '')
-                                            if accession in ['MS:1000633', 'MS:1000041']:
-                                                value = cv_param.attrib.get('value', '')
-                                                if value:
-                                                    charge = int(float(value))
-                                                    break
-                    
-                    # Look for isolation window information in the precursor element
-                    for child in element:
-                        if 'isolationWindow' in child.tag:
-                            for iso_child in child:
-                                if 'lowerOffset' in iso_child.attrib:
-                                    isolation_window_lower = precursor_mz - float(iso_child.attrib['lowerOffset'])
-                                elif 'upperOffset' in iso_child.attrib:
-                                    isolation_window_upper = precursor_mz + float(iso_child.attrib['upperOffset'])
-                                elif iso_child.get('name') == 'isolation window lower offset':
-                                    isolation_window_lower = precursor_mz - float(iso_child.get('value', 0))
-                                elif iso_child.get('name') == 'isolation window upper offset':
-                                    isolation_window_upper = precursor_mz + float(iso_child.get('value', 0))
+                # Only process MS2 spectra
+                if ms_level != 2:
+                    continue
                 
-                # Default charge if still not found (we'll use configurable charge states anyway)
-                if charge == 0:
-                    charge = 2  # Common default for MS/MS
+                if max_spectra > 0 and ms2_count >= max_spectra:
+                    break
                 
-                # If isolation window not found, use default 3 m/z window
+                # Get peaks
+                mz_array = spectrum['m/z array']
+                intensity_array = spectrum['intensity array']
+                
+                if len(mz_array) == 0:
+                    continue
+                
+                # Get scan ID
+                scan_id = spectrum.get('id', f"scan_{ms2_count}")
+                
+                # Get retention time (convert seconds to minutes)
+                rt_seconds = spectrum['scanList']['scan'][0].get('scan start time', 0.0)
+                retention_time = rt_seconds / 60.0 if rt_seconds > 100 else rt_seconds
+                
+                # Get precursor information
+                precursor_mz = 0.0
+                charge = 2  # default
+                isolation_window_lower = 0.0
+                isolation_window_upper = 0.0
+                
+                if 'precursorList' in spectrum:
+                    precursor_list = spectrum['precursorList']['precursor']
+                    if precursor_list:
+                        precursor = precursor_list[0]
+                        
+                        # Get selected ion info
+                        if 'selectedIonList' in precursor:
+                            selected_ion = precursor['selectedIonList']['selectedIon'][0]
+                            precursor_mz = selected_ion.get('selected ion m/z', 0.0)
+                            
+                            # Get charge if available
+                            if 'charge state' in selected_ion:
+                                charge = int(selected_ion['charge state'])
+                            elif 'possible charge state' in selected_ion:
+                                charge = int(selected_ion['possible charge state'])
+                        
+                        # Get isolation window
+                        if 'isolationWindow' in precursor:
+                            iso_window = precursor['isolationWindow']
+                            target_mz = iso_window.get('isolation window target m/z', precursor_mz)
+                            lower_offset = iso_window.get('isolation window lower offset', 1.5)
+                            upper_offset = iso_window.get('isolation window upper offset', 1.5)
+                            isolation_window_lower = target_mz - lower_offset
+                            isolation_window_upper = target_mz + upper_offset
+                
+                # Default isolation window if not found
                 if isolation_window_lower == 0.0 and isolation_window_upper == 0.0:
                     isolation_window_lower = precursor_mz - 1.5
                     isolation_window_upper = precursor_mz + 1.5
-            
-            # Get scan ID and retention time
-            scan_id = spectrum.ID
-            
-            # Try to get retention time, fallback to scan index if not available
-            try:
-                retention_time_minutes = spectrum.scan_time_in_minutes()
-            except (AttributeError, TypeError):
-                # If RT not available, use scan index as a proxy
-                retention_time_minutes = float(spectrum_idx)
-            
-            if not scan_id:
-                scan_id = f"scan_{retention_time_minutes:.4f}"
-            
-            # Get m/z and intensity arrays
-            if len(spectrum.peaks('centroided')) > 0:
-                peaks = spectrum.peaks('centroided')
-                mz_array = np.array([peak[0] for peak in peaks])
-                intensity_array = np.array([peak[1] for peak in peaks])
                 
-                mass_spectrum = MassSpectrum(
+                # Create MassSpectrum object
+                ms_spec = MassSpectrum(
                     mz_array=mz_array,
                     intensity_array=intensity_array,
                     scan_id=scan_id,
@@ -912,13 +914,10 @@ class FastXCorr:
                     charge=charge,
                     isolation_window_lower=isolation_window_lower,
                     isolation_window_upper=isolation_window_upper,
-                    retention_time=retention_time_minutes
+                    retention_time=retention_time
                 )
-                spectra.append(mass_spectrum)
-                
-                # Stop reading if we've reached the maximum number of spectra
-                if max_spectra > 0 and len(spectra) >= max_spectra:
-                    break
+                spectra.append(ms_spec)
+                ms2_count += 1
         
         return spectra
 
@@ -2113,6 +2112,126 @@ class FastXCorr:
         # Use the existing calculate_e_value method with charge-specific scores
         return self.calculate_e_value(xcorr_scores, xcorr_score)
 
+    def calculate_hyperscore(self, spectrum: MassSpectrum, peptide: PeptideCandidate, charge: int,
+                            fragment_tol_ppm: float = 20.0) -> Tuple[float, int, int, float]:
+        """
+        Calculate X!Tandem Hyperscore for peptide-spectrum match.
+        
+        Hyperscore = (product of matched intensities) / (b_factorial * y_factorial)
+        
+        Where:
+        - b_factorial = factorial of number of matched b-ions
+        - y_factorial = factorial of number of matched y-ions
+        
+        Uses same m/z matching strategy as LibCosine scoring.
+        
+        Reference: Craig & Beavis (2003) Rapid Commun. Mass Spectrom., 17, 2310–2316
+        
+        Args:
+            spectrum: Experimental spectrum
+            peptide: Peptide candidate
+            charge: Precursor charge state
+            fragment_tol_ppm: Fragment mass tolerance in PPM
+            
+        Returns:
+            Tuple of (hyperscore, num_b_matched, num_y_matched, percent_matched_ions)
+        """
+        import math
+        
+        sequence = peptide.sequence
+        
+        # Precalculated masses (same as theoretical spectrum generation)
+        nterm_proton = self.proton_mass  # 1.007276
+        cterm_oh2_proton = self.h2o_mass + self.proton_mass  # 19.017841
+        
+        # Create sorted experimental spectrum for efficient matching
+        exp_mz = spectrum.mz_array
+        exp_intensity = spectrum.intensity_array
+        
+        # Track matched ions
+        b_matched_intensities = []
+        y_matched_intensities = []
+        
+        # Maximum fragment charge (same logic as theoretical spectrum)
+        max_frag_charge = min(charge - 1, 3)
+        max_frag_charge = max(max_frag_charge, 1)
+        
+        # Generate and match b ions
+        b_mass = nterm_proton
+        for i in range(len(sequence) - 1):  # Exclude last residue
+            b_mass += self.aa_masses.get(sequence[i], 100.0)
+            
+            # Check all fragment charges
+            for frag_charge in range(1, max_frag_charge + 1):
+                theo_mz = (b_mass + (frag_charge - 1) * self.proton_mass) / frag_charge
+                
+                # Match to experimental spectrum
+                tol_da = theo_mz * fragment_tol_ppm / 1e6
+                
+                # Find peaks within tolerance
+                for j in range(len(exp_mz)):
+                    if abs(exp_mz[j] - theo_mz) <= tol_da:
+                        b_matched_intensities.append(exp_intensity[j])
+                        break  # Take first match only
+        
+        # Generate and match y ions
+        y_mass = cterm_oh2_proton
+        for i in range(len(sequence) - 1, 0, -1):  # Exclude first residue
+            y_mass += self.aa_masses.get(sequence[i], 100.0)
+            
+            # Check all fragment charges
+            for frag_charge in range(1, max_frag_charge + 1):
+                theo_mz = (y_mass + (frag_charge - 1) * self.proton_mass) / frag_charge
+                
+                # Match to experimental spectrum
+                tol_da = theo_mz * fragment_tol_ppm / 1e6
+                
+                # Find peaks within tolerance
+                for j in range(len(exp_mz)):
+                    if abs(exp_mz[j] - theo_mz) <= tol_da:
+                        y_matched_intensities.append(exp_intensity[j])
+                        break  # Take first match only
+        
+        # Count matches
+        num_b_matched = len(b_matched_intensities)
+        num_y_matched = len(y_matched_intensities)
+        
+        # Calculate total expected ions (all charges for all fragments)
+        num_b_expected = (len(sequence) - 1) * max_frag_charge
+        num_y_expected = (len(sequence) - 1) * max_frag_charge
+        total_expected = num_b_expected + num_y_expected
+        total_matched = num_b_matched + num_y_matched
+        
+        # Calculate percent matched
+        percent_matched_ions = (total_matched / total_expected * 100.0) if total_expected > 0 else 0.0
+        
+        # Calculate Hyperscore
+        if num_b_matched == 0 or num_y_matched == 0:
+            return 0.0, num_b_matched, num_y_matched, percent_matched_ions
+        
+        # Use log-space to avoid overflow with large intensity products
+        # Hyperscore = product(intensities) / (b_factorial * y_factorial)
+        # log(Hyperscore) = sum(log(intensities)) - log(b_factorial) - log(y_factorial)
+        
+        log_intensity_sum = 0.0
+        for intensity in b_matched_intensities:
+            if intensity > 0:
+                log_intensity_sum += math.log(intensity)
+        for intensity in y_matched_intensities:
+            if intensity > 0:
+                log_intensity_sum += math.log(intensity)
+        
+        # Use lgamma for log(factorial) to avoid overflow
+        # lgamma(n+1) = log(n!)
+        log_b_factorial = math.lgamma(num_b_matched + 1)
+        log_y_factorial = math.lgamma(num_y_matched + 1)
+        
+        # Final Hyperscore in log space, then convert back
+        log_hyperscore = log_intensity_sum - log_b_factorial - log_y_factorial
+        hyperscore = math.exp(log_hyperscore)
+        
+        return hyperscore, num_b_matched, num_y_matched, percent_matched_ions
+
     def search_spectrum_target_decoy(self, spectrum: MassSpectrum, target_decoy_pairs: List[Tuple[PeptideCandidate, PeptideCandidate]],
                                     charge_states: List[int] = [2, 3]) -> List[Tuple[PeptideCandidate, float, float, int]]:
         """
@@ -2226,61 +2345,29 @@ class FastXCorr:
         
         return dict(window_groups)
     
-    def preprocess_theoretical_spectrum(self, theoretical_binned: np.ndarray) -> np.ndarray:
+    def calculate_peptide_centric_xcorr(self, experimental_preprocessed: np.ndarray, 
+                                       theoretical_windowed: np.ndarray) -> float:
         """
-        Preprocess a theoretical spectrum for peptide-centric DIA search.
+        Calculate XCorr for peptide-centric DIA search using spectrum-centric preprocessing.
         
-        In peptide-centric mode, we preprocess the THEORETICAL spectrum instead
-        of the experimental spectrum. The experimental spectra are only binned,
-        sqrt-transformed, and windowed before scoring.
+        This is a convenience wrapper around calculate_xcorr() that uses:
+        - Experimental spectrum: fully preprocessed (windowed + Fast XCorr background subtraction)
+        - Theoretical spectrum: windowed only (no Fast XCorr preprocessing)
+        - Scaling: 0.005 (standard spectrum-centric scaling)
+        
+        This approach preprocesses the experimental spectra (like traditional spectrum-centric search)
+        rather than the theoretical spectra, which is faster especially when the library is large
+        relative to the number of spectra per window.
         
         Args:
-            theoretical_binned: Binned theoretical spectrum (binary: 0 or 1)
-            
-        Returns:
-            Preprocessed theoretical spectrum ready for scoring
-        """
-        # Find highest bin with data
-        highest_ion_bin = 0
-        for i in range(len(theoretical_binned) - 1, -1, -1):
-            if theoretical_binned[i] > 0:
-                highest_ion_bin = i
-                break
-        
-        # For theoretical spectra, treat as having intensity 1.0 at fragment positions
-        highest_intensity = 1.0
-        
-        # Apply MakeCorrData windowing (though for binary theoretical, this is simpler)
-        windowed = self._make_corr_data(theoretical_binned, highest_ion_bin, highest_intensity)
-        
-        # Apply Fast XCorr preprocessing
-        preprocessed = self.preprocess_for_xcorr(windowed)
-        
-        return preprocessed
-    
-    def calculate_peptide_centric_xcorr(self, experimental_windowed: np.ndarray, 
-                                       theoretical_preprocessed: np.ndarray) -> float:
-        """
-        Calculate XCorr for peptide-centric search.
-        
-        This is a convenience wrapper around calculate_xcorr() for peptide-centric mode:
-        - Experimental spectrum: windowed only (NOT preprocessed with Fast XCorr)
-        - Theoretical spectrum: fully preprocessed (windowed + Fast XCorr)
-        - Scaling: 0.0001 (50x smaller than spectrum-centric due to preprocessing asymmetry)
-        
-        IMPORTANT: The scaling factor is different from spectrum-centric search!
-        In peptide-centric mode, preprocessing the theoretical spectrum (instead of experimental)
-        produces dot products that are ~50x larger. Therefore we use 0.0001 instead of 0.005.
-        
-        Args:
-            experimental_windowed: Experimental spectrum after MakeCorrData windowing
-            theoretical_preprocessed: Theoretical spectrum after full preprocessing
+            experimental_preprocessed: Experimental spectrum after full preprocessing (windowed + Fast XCorr)
+            theoretical_windowed: Theoretical spectrum after windowing only
             
         Returns:
             XCorr score (scaled to match typical 0-10 range)
         """
-        result = self.calculate_xcorr(experimental_windowed, theoretical_preprocessed, 
-                                      scaling_factor=0.0001)
+        result = self.calculate_xcorr(experimental_preprocessed, theoretical_windowed, 
+                                      scaling_factor=0.005)
         return float(result)  # Guaranteed to be float for 1D inputs
     
     def search_dia_peptide_centric(self,
@@ -2298,7 +2385,7 @@ class FastXCorr:
                                    skip_xcorr_matrix: bool = False,
                                    verbose: int = 0) -> Dict:
         """
-        Perform comprehensive peptide-centric DIA search.
+        Perform comprehensive peptide-centric DIA search using spectrum-centric preprocessing.
         
         Key improvements:
         1. Score ALL spectra against ALL peptides in the isolation window
@@ -2308,6 +2395,11 @@ class FastXCorr:
         5. If library provided: LibCosine-centric scoring with target/decoy competition (report winner only)
         6. If no library: Track target/decoy pairs for downstream competition analysis
         7. If calibration provided: Apply RT filtering and adjusted m/z tolerances, calculate delta columns
+        
+        Preprocessing approach (spectrum-centric):
+        - Experimental spectra: Fully preprocessed (windowed + Fast XCorr background subtraction)
+        - Theoretical spectra: Windowed only (no Fast XCorr preprocessing)
+        - Scaling: 0.005 (standard spectrum-centric scaling)
         
         Args:
             spectra: List of spectra (should be from same isolation window)
@@ -2404,32 +2496,39 @@ class FastXCorr:
                         unique_peptide_sequences.add(target_peptide.sequence)
                         pair_id += 1
         
-        # Preprocess all theoretical spectra once
+        # Preprocess all theoretical spectra once (windowing only, no Fast XCorr preprocessing)
         # Count targets and decoys
-        n_targets = sum(1 for _, _, is_target, _, _ in peptides_in_window if is_target)
-        n_decoys = len(peptides_in_window) - n_targets
         window_str = f"{isolation_window[0]:.1f}-{isolation_window[1]:.1f}"
         if verbose >= 1:
             n_unique_seqs = len(unique_peptide_sequences)
             n_precursors = pair_id
             rt_filter_msg = f" ({peptides_filtered_by_rt} filtered by RT)" if peptides_filtered_by_rt > 0 else ""
-            print(f"  DIA: Preprocessing {len(peptides_in_window)} theoretical spectra from {n_unique_seqs} unique peptides ({n_precursors} precursors = peptide+charge combinations) for isolation window {window_str}{rt_filter_msg}")
-        peptide_theoretical_preprocessed = {}
+            print(f"  DIA: Preprocessing {len(peptides_in_window)} theoretical spectra (spectrum-centric mode) from {n_unique_seqs} unique peptides ({n_precursors} precursors = peptide+charge combinations) for isolation window {window_str}{rt_filter_msg}")
+        peptide_theoretical_windowed = {}
         
         for peptide, charge, is_target, pair_id, lib_rt in peptides_in_window:
             theoretical = self.generate_theoretical_spectrum(peptide, charge)
-            preprocessed = self.preprocess_theoretical_spectrum(theoretical)
-            peptide_theoretical_preprocessed[(peptide, charge)] = preprocessed
+            # Spectrum-centric mode: only window theoretical spectrum (don't apply Fast XCorr preprocessing)
+            highest_ion_bin = 0
+            for i in range(len(theoretical) - 1, -1, -1):
+                if theoretical[i] > 0:
+                    highest_ion_bin = i
+                    break
+            highest_intensity = 1.0
+            windowed = self._make_corr_data(theoretical, highest_ion_bin, highest_intensity)
+            peptide_theoretical_windowed[(peptide, charge)] = windowed
         
-        # Preprocess all experimental spectra
+        # Preprocess all experimental spectra (full preprocessing: windowing + Fast XCorr)
         if verbose >= 1:
-            print(f"  DIA: Preprocessing {len(spectra)} experimental spectra for isolation window {window_str}")
+            print(f"  DIA: Preprocessing {len(spectra)} experimental spectra (spectrum-centric mode) for isolation window {window_str}")
         experimental_preprocessed = []
         spectrum_metadata = []  # (scan_id, rt_minutes, spectrum_idx)
         
         for spectrum_idx, spectrum in enumerate(spectra):
+            # Spectrum-centric mode: fully preprocess experimental spectrum (windowed + Fast XCorr)
             windowed = self.preprocess_spectrum(spectrum)
-            experimental_preprocessed.append(windowed)
+            fully_preprocessed = self.preprocess_for_xcorr(windowed)
+            experimental_preprocessed.append(fully_preprocessed)
             
             # Extract RT in minutes from spectrum object
             rt_minutes = spectrum.retention_time if hasattr(spectrum, 'retention_time') else float(spectrum_idx)
@@ -2454,7 +2553,7 @@ class FastXCorr:
         xcorr_matrix_raw = None
         if library is None or not skip_xcorr_matrix:
             # Stack all theoretical spectra into a matrix: (n_peptides, n_bins)
-            theoretical_matrix = np.vstack([peptide_theoretical_preprocessed[(p, c)] 
+            theoretical_matrix = np.vstack([peptide_theoretical_windowed[(p, c)] 
                                             for p, c, t, pair_id, lib_rt in peptides_in_window])
             
             # Stack all experimental spectra into a matrix: (n_spectra, n_bins)
@@ -2462,9 +2561,9 @@ class FastXCorr:
             
             # Matrix multiply: (n_peptides, n_spectra) in one operation using unified calculate_xcorr()
             # This replaces the nested loops with a single optimized BLAS call
-            # Use peptide-centric scaling factor (0.0001 instead of 0.005)
+            # Use spectrum-centric scaling (0.005)
             xcorr_result = self.calculate_xcorr(theoretical_matrix, experimental_matrix, 
-                                                 scaling_factor=0.0001)
+                                                 scaling_factor=0.005)
             # Type assertion: matrix inputs always return ndarray
             assert isinstance(xcorr_result, np.ndarray), "Matrix scoring should return ndarray"
             xcorr_matrix_raw: np.ndarray = xcorr_result
@@ -2748,6 +2847,15 @@ class FastXCorr:
                     if target_spec_idx in temp_errors:
                         qc_data['ms2_mass_errors'].extend(temp_errors[target_spec_idx])
             
+            # Calculate target Hyperscore at best spectrum
+            target_spectrum = spectra[target_spec_idx]
+            target_hyperscore, target_num_b, target_num_y, target_pct_matched = self.calculate_hyperscore(
+                target_spectrum,
+                target_peptide,
+                target_charge,
+                adjusted_fragment_tol_ppm
+            )
+            
             # Calculate target e-value (non-library mode only)
             if library is None:
                 temp_engine = FastXCorr()
@@ -2840,6 +2948,15 @@ class FastXCorr:
                     temp_errors = self._temp_ms2_errors_decoy[pair_idx + 1]
                     if decoy_spec_idx in temp_errors:
                         qc_data['ms2_mass_errors'].extend(temp_errors[decoy_spec_idx])
+            
+            # Calculate decoy Hyperscore at best spectrum
+            decoy_spectrum = spectra[decoy_spec_idx]
+            decoy_hyperscore, decoy_num_b, decoy_num_y, decoy_pct_matched = self.calculate_hyperscore(
+                decoy_spectrum,
+                decoy_peptide,
+                target_charge,
+                adjusted_fragment_tol_ppm
+            )
             
             # Calculate decoy e-value (non-library mode only)
             if library is None:
@@ -2952,6 +3069,10 @@ class FastXCorr:
                 'delta_rt': target_delta_rt,
                 'delta_mz_ppm_precursor': target_delta_mz_ppm_precursor,
                 'delta_mz_ppm_fragments': target_delta_mz_ppm_fragments,
+                'hyperscore': target_hyperscore,
+                'num_b_ions': target_num_b,
+                'num_y_ions': target_num_y,
+                'percent_matched_ions': target_pct_matched,
             }
             
             decoy_result_dict = {
@@ -2967,6 +3088,10 @@ class FastXCorr:
                 'delta_rt': decoy_delta_rt,
                 'delta_mz_ppm_precursor': decoy_delta_mz_ppm_precursor,
                 'delta_mz_ppm_fragments': decoy_delta_mz_ppm_fragments,
+                'hyperscore': decoy_hyperscore,
+                'num_b_ions': decoy_num_b,
+                'num_y_ions': decoy_num_y,
+                'percent_matched_ions': decoy_pct_matched,
             }
             
             # Add library-specific fields
@@ -3118,7 +3243,6 @@ class FastXCorr:
         # Extract intensities
         extracted_intensities = np.zeros(5)
         m0_mass_error = None
-        m0_best_mz = None
         m0_best_intensity = 0.0
 
         for i, target_mz in enumerate(expected_mz):
@@ -3141,7 +3265,6 @@ class FastXCorr:
             # Track M+0 peak (index 1) for QC
             if collect_qc and i == 1 and matched_mz is not None and matched_intensity > m0_best_intensity:
                 m0_best_intensity = matched_intensity
-                m0_best_mz = matched_mz
                 m0_mass_error = matched_mz - target_mz  # Delta m/z
 
         if collect_qc:
@@ -3729,14 +3852,18 @@ class DIAResultsWriter:
             # Library mode: paired target/decoy output with delta columns
             header = "Peptide\tCharge\tProteinID\tMass\tIsolationWindow\tNumSpectraScored\t"
             header += "LibCosine\tLibCosineZScore\tXCorr\tRT\tScanID\tPrecursorCosine\t"
+            header += "Hyperscore\tNumBIons\tNumYIons\tPercentMatchedIons\t"
             header += "delta_rt\tdelta_mz_ppm_precursor\tdelta_mz_ppm_fragments\t"
             header += "decoy_Peptide\tdecoy_LibCosine\tdecoy_LibCosineZScore\tdecoy_XCorr\tdecoy_RT\tdecoy_ScanID\tdecoy_PrecursorCosine\t"
+            header += "decoy_Hyperscore\tdecoy_NumBIons\tdecoy_NumYIons\tdecoy_PercentMatchedIons\t"
             header += "decoy_delta_rt\tdecoy_delta_mz_ppm_precursor\tdecoy_delta_mz_ppm_fragments\n"
         else:
             # Non-library mode: paired target/decoy output with XCorr (no delta columns without library)
             header = "Peptide\tCharge\tProteinID\tMass\tIsolationWindow\tNumSpectraScored\t"
             header += "BestXCorr\tBestRT\tBestScan\tEValue\tXCorrZScore\t"
-            header += "decoy_Peptide\tdecoy_BestXCorr\tdecoy_BestRT\tdecoy_BestScan\tdecoy_EValue\tdecoy_XCorrZScore\n"
+            header += "Hyperscore\tNumBIons\tNumYIons\tPercentMatchedIons\t"
+            header += "decoy_Peptide\tdecoy_BestXCorr\tdecoy_BestRT\tdecoy_BestScan\tdecoy_EValue\tdecoy_XCorrZScore\t"
+            header += "decoy_Hyperscore\tdecoy_NumBIons\tdecoy_NumYIons\tdecoy_PercentMatchedIons\n"
         
         self.file_handle.write(header)
     
@@ -3776,6 +3903,10 @@ class DIAResultsWriter:
                 target_rt = target_result['best_rt']
                 target_scan = target_result['best_scan']
                 target_precursor_cosine = target_result['precursor_cosine_target']
+                target_hyperscore = target_result['hyperscore']
+                target_num_b = target_result['num_b_ions']
+                target_num_y = target_result['num_y_ions']
+                target_pct_matched = target_result['percent_matched_ions']
                 target_delta_rt = target_result.get('delta_rt')
                 target_delta_mz_precursor = target_result.get('delta_mz_ppm_precursor')
                 target_delta_mz_fragments = target_result.get('delta_mz_ppm_fragments')
@@ -3786,9 +3917,17 @@ class DIAResultsWriter:
                 decoy_rt = decoy_result['best_rt']
                 decoy_scan = decoy_result['best_scan']
                 decoy_precursor_cosine = decoy_result['precursor_cosine_decoy']
+                decoy_hyperscore = decoy_result['hyperscore']
+                decoy_num_b = decoy_result['num_b_ions']
+                decoy_num_y = decoy_result['num_y_ions']
+                decoy_pct_matched = decoy_result['percent_matched_ions']
                 decoy_delta_rt = decoy_result.get('delta_rt')
                 decoy_delta_mz_precursor = decoy_result.get('delta_mz_ppm_precursor')
                 decoy_delta_mz_fragments = decoy_result.get('delta_mz_ppm_fragments')
+                
+                # Extract numeric scan numbers for output
+                target_scan_num = extract_scan_number(target_scan)
+                decoy_scan_num = extract_scan_number(decoy_scan)
                 
                 # Format delta columns (use empty string if None)
                 target_delta_rt_str = f"{target_delta_rt:.4f}" if target_delta_rt is not None else ""
@@ -3799,9 +3938,11 @@ class DIAResultsWriter:
                 decoy_delta_mz_fragments_str = f"{decoy_delta_mz_fragments:.4f}" if decoy_delta_mz_fragments is not None else ""
                 
                 line = f"{target_peptide.sequence}\t{charge}\t{target_peptide.protein_id}\t{target_peptide.mass:.6f}\t{window_str}\t{num_spectra}\t"
-                line += f"{target_lib_cosine:.4f}\t{target_lib_zscore:.4f}\t{target_xcorr:.4f}\t{target_rt:.2f}\t{target_scan}\t{target_precursor_cosine:.4f}\t"
+                line += f"{target_lib_cosine:.4f}\t{target_lib_zscore:.4f}\t{target_xcorr:.4f}\t{target_rt:.2f}\t{target_scan_num}\t{target_precursor_cosine:.4f}\t"
+                line += f"{target_hyperscore:.4f}\t{target_num_b}\t{target_num_y}\t{target_pct_matched:.2f}\t"
                 line += f"{target_delta_rt_str}\t{target_delta_mz_precursor_str}\t{target_delta_mz_fragments_str}\t"
-                line += f"{decoy_peptide.sequence}\t{decoy_lib_cosine:.4f}\t{decoy_lib_zscore:.4f}\t{decoy_xcorr:.4f}\t{decoy_rt:.2f}\t{decoy_scan}\t{decoy_precursor_cosine:.4f}\t"
+                line += f"{decoy_peptide.sequence}\t{decoy_lib_cosine:.4f}\t{decoy_lib_zscore:.4f}\t{decoy_xcorr:.4f}\t{decoy_rt:.2f}\t{decoy_scan_num}\t{decoy_precursor_cosine:.4f}\t"
+                line += f"{decoy_hyperscore:.4f}\t{decoy_num_b}\t{decoy_num_y}\t{decoy_pct_matched:.2f}\t"
                 line += f"{decoy_delta_rt_str}\t{decoy_delta_mz_precursor_str}\t{decoy_delta_mz_fragments_str}\n"
                 
             else:
@@ -3811,16 +3952,30 @@ class DIAResultsWriter:
                 target_scan = target_result['best_scan']
                 target_evalue = target_result['e_value']
                 target_zscore = target_result['xcorr_zscore']
+                target_hyperscore = target_result['hyperscore']
+                target_num_b = target_result['num_b_ions']
+                target_num_y = target_result['num_y_ions']
+                target_pct_matched = target_result['percent_matched_ions']
                 
                 decoy_xcorr = decoy_result['best_xcorr']
                 decoy_rt = decoy_result['best_rt']
                 decoy_scan = decoy_result['best_scan']
                 decoy_evalue = decoy_result['e_value']
                 decoy_zscore = decoy_result['xcorr_zscore']
+                decoy_hyperscore = decoy_result['hyperscore']
+                decoy_num_b = decoy_result['num_b_ions']
+                decoy_num_y = decoy_result['num_y_ions']
+                decoy_pct_matched = decoy_result['percent_matched_ions']
+                
+                # Extract numeric scan numbers for output
+                target_scan_num = extract_scan_number(target_scan)
+                decoy_scan_num = extract_scan_number(decoy_scan)
                 
                 line = f"{target_peptide.sequence}\t{charge}\t{target_peptide.protein_id}\t{target_peptide.mass:.6f}\t{window_str}\t{num_spectra}\t"
-                line += f"{target_xcorr:.4f}\t{target_rt:.2f}\t{target_scan}\t{target_evalue:.6e}\t{target_zscore:.4f}\t"
-                line += f"{decoy_peptide.sequence}\t{decoy_xcorr:.4f}\t{decoy_rt:.2f}\t{decoy_scan}\t{decoy_evalue:.6e}\t{decoy_zscore:.4f}\n"
+                line += f"{target_xcorr:.4f}\t{target_rt:.2f}\t{target_scan_num}\t{target_evalue:.6e}\t{target_zscore:.4f}\t"
+                line += f"{target_hyperscore:.4f}\t{target_num_b}\t{target_num_y}\t{target_pct_matched:.2f}\t"
+                line += f"{decoy_peptide.sequence}\t{decoy_xcorr:.4f}\t{decoy_rt:.2f}\t{decoy_scan_num}\t{decoy_evalue:.6e}\t{decoy_zscore:.4f}\t"
+                line += f"{decoy_hyperscore:.4f}\t{decoy_num_b}\t{decoy_num_y}\t{decoy_pct_matched:.2f}\n"
 
             self.file_handle.write(line)
     
@@ -4232,8 +4387,8 @@ def run_calibration_workflow(xcorr_engine, library, spectra, ms1_spectra, charge
                 for window_idx, search_result in enumerate(pool.imap_unordered(process_isolation_window_worker, work_items)):
                     # Progress indicator with timing
                     if verbose >= 1 or (window_idx + 1) % 10 == 0:
-                        elapsed = time.time() - calibration_start
-                        print(f"  Calibration: {window_idx + 1}/{len(window_groups)} windows processed ({elapsed:.1f}s elapsed)")
+                        elapsed = (time.time() - calibration_start) / 60
+                        print(f"  Calibration: {window_idx + 1}/{len(window_groups)} windows processed ({elapsed:.1f} min elapsed)")
                     
                     # Collect QC data
                     qc_data = search_result.get('qc_data', {})
@@ -4246,7 +4401,7 @@ def run_calibration_workflow(xcorr_engine, library, spectra, ms1_spectra, charge
                         all_results.append(pair_data)
         
         calibration_search_time = time.time() - calibration_start
-        print(f"\n  Calibration search complete in {calibration_search_time:.1f}s: Collected QC data")
+        print(f"\n  Calibration search complete in {calibration_search_time/60:.1f} min: Collected QC data")
         print(f"    MS1 mass errors: {len(all_qc_data['ms1_mass_errors'])}")
         print(f"    MS2 mass errors: {len(all_qc_data['ms2_mass_errors'])}")
         print(f"    RT pairs: {len(all_qc_data['rt_pairs'])}")
@@ -4287,7 +4442,7 @@ def run_calibration_workflow(xcorr_engine, library, spectra, ms1_spectra, charge
         
         if num_confident >= 100:
             total_calibration_time = time.time() - calibration_start
-            print(f"✓ Calibration successful: {num_confident} confident peptides ({total_calibration_time:.1f}s total)")
+            print(f"✓ Calibration successful: {num_confident} confident peptides ({total_calibration_time/60:.1f} min total)")
             
             # Calculate calibration parameters
             print("\n  Calculating m/z calibration...")
@@ -4525,7 +4680,7 @@ def write_pin_file(results_df: pd.DataFrame, output_path: str, library_mode: boo
     print(f"  Wrote {len(pin_df)} PSMs to PIN file")
 
 
-def run_mokapot(results_df: pd.DataFrame, library_mode: bool = True, n_workers: int = 4) -> pd.DataFrame:
+def run_mokapot(results_df: pd.DataFrame, library_mode: bool = True, n_workers: int = 4, output_path: str = None) -> pd.DataFrame:
     """
     Run Mokapot rescoring on search results.
     
@@ -4533,6 +4688,7 @@ def run_mokapot(results_df: pd.DataFrame, library_mode: bool = True, n_workers: 
         results_df: DataFrame with DIA search results (paired target/decoy format)
         library_mode: Whether this is library-based search
         n_workers: Number of parallel workers for Mokapot
+        output_path: Path for output TSV file (used to generate PIN filename)
         
     Returns:
         DataFrame with added Mokapot q-value columns
@@ -4551,17 +4707,23 @@ def run_mokapot(results_df: pd.DataFrame, library_mode: bool = True, n_workers: 
     # Note: LibCosineZScore removed - doesn't make sense with narrow RT window scoring
     lib_base = ['LibCosine', 'XCorr', 'PrecursorCosine']
     nonlib_base = ['XCorr', 'XCorrZScore']
+    
+    # Hyperscore and ion matching features (always included)
+    hyperscore_features = ['Hyperscore', 'NumBIons', 'NumYIons', 'PercentMatchedIons']
 
     # Delta features - these are ALWAYS present (not optional)
     # They measure deviation from predicted values, regardless of calibration
     # Using SIGNED deltas to distinguish systematic bias from random error
     delta_features = ['DeltaRT', 'DeltaMzPpmPrecursor', 'DeltaMzPpmFragments']
+    
+    # Peptide-level features (always included)
+    peptide_features = ['PeptideLength', 'Charge1', 'Charge2', 'Charge3', 'Charge4', 'Charge5']
 
     # Choose candidate columns depending on library_mode
     if library_mode:
-        candidate_features = lib_base + delta_features
+        candidate_features = lib_base + hyperscore_features + delta_features + peptide_features
     else:
-        candidate_features = list(nonlib_base)
+        candidate_features = nonlib_base + hyperscore_features + peptide_features
 
     # Print planned feature set
     print("Planned Mokapot features:")
@@ -4576,69 +4738,137 @@ def run_mokapot(results_df: pd.DataFrame, library_mode: bool = True, n_workers: 
     decoy_cols = [col for col in results_df.columns if col.startswith('decoy_')]
     print(f"Found {len(decoy_cols)} decoy-prefixed columns in paired format")
 
-    # Unroll paired target/decoy format into separate rows for Mokapot
+    # Perform target-decoy competition and create PSM rows for Mokapot
+    # Following PIN format: PSMId Label ScanNr features... Peptide Proteins
+    # In DIA, PSM = Precursor, so PSMId format: peptide_charge
+    # Helper function to extract numeric scan number from scan ID string
+    def extract_scan_number(scan_str, fallback_idx):
+        """Extract numeric scan number from scan ID like 'controllerType=0 controllerNumber=1 scan=12345'"""
+        scan_str = str(scan_str)
+        if 'scan=' in scan_str:
+            try:
+                return int(scan_str.split('scan=')[-1].split()[0])
+            except (ValueError, IndexError):
+                pass
+        # Try to find any number in the string
+        import re
+        match = re.search(r'\d+', scan_str)
+        if match:
+            return int(match.group())
+        # Fallback to row index
+        return int(fallback_idx)
+    
     psm_rows = []
     for idx, row in results_df.iterrows():
-        precursor_id = f"{row['Peptide']}_{row['Charge']}"
-
-        # target
-        t = {
-            'PSMId': f"{precursor_id}_target",
-            'PrecursorId': precursor_id,
+        peptide_seq = row['Peptide']
+        charge = int(row['Charge'])
+        scan_id_str = row.get('ScanID', idx)
+        decoy_scan_id_str = row.get('decoy_ScanID', scan_id_str)
+        
+        # Extract numeric scan numbers
+        scan_nr = extract_scan_number(scan_id_str, idx)
+        decoy_scan_nr = extract_scan_number(decoy_scan_id_str, idx)
+        
+        # PSMId is the Precursor ID: peptide_charge
+        target_psm_id = f"{peptide_seq}_{charge}"
+        
+        # Build target PSM data
+        target_data = {
+            'PSMId': target_psm_id,
             'Label': 1,
-            'ScanNr': row.get('ScanID'),
-            'Peptide': row['Peptide'],
-            'Proteins': row.get('ProteinID', None),
+            'ScanNr': scan_nr,
+            'Peptide': peptide_seq,
+            'Proteins': row.get('ProteinID', ''),
+            'PeptideLength': len(peptide_seq),
+            'Charge1': 1 if charge == 1 else 0,
+            'Charge2': 1 if charge == 2 else 0,
+            'Charge3': 1 if charge == 3 else 0,
+            'Charge4': 1 if charge == 4 else 0,
+            'Charge5': 1 if charge == 5 else 0,
         }
-        # decoy
-        d = {
-            'PSMId': f"{precursor_id}_decoy",
-            'PrecursorId': precursor_id,
-            'Label': -1,
-            'ScanNr': row.get('DecoyScanID', row.get('ScanID')),
-            'Peptide': row.get('DecoyPeptide', f"DECOY_{row['Peptide']}"),
-            'Proteins': row.get('ProteinID', None),
+        
+        # Build decoy PSM data
+        decoy_peptide_seq = row.get('decoy_Peptide', f"DECOY_{peptide_seq}")
+        decoy_psm_id = f"{decoy_peptide_seq}_{charge}"
+        
+        decoy_data = {
+            'PSMId': decoy_psm_id,
+            'Label': 0,
+            'ScanNr': decoy_scan_nr,
+            'Peptide': decoy_peptide_seq,
+            'Proteins': row.get('ProteinID', ''),
+            'PeptideLength': len(decoy_peptide_seq),
+            'Charge1': 1 if charge == 1 else 0,
+            'Charge2': 1 if charge == 2 else 0,
+            'Charge3': 1 if charge == 3 else 0,
+            'Charge4': 1 if charge == 4 else 0,
+            'Charge5': 1 if charge == 5 else 0,
         }
 
-        # Fill feature values (use 0/default when missing for decoys)
+        # Fill feature values for both target and decoy
         if library_mode:
-            t['LibCosine'] = row.get('LibCosine', 0.0)
-            t['XCorr'] = row.get('XCorr', 0.0)
-            t['PrecursorCosine'] = row.get('PrecursorCosine', 0.0)
+            # Use LibCosine as primary score for competition
+            target_data['LibCosine'] = row.get('LibCosine', 0.0)
+            target_data['XCorr'] = row.get('XCorr', 0.0)
+            target_data['PrecursorCosine'] = row.get('PrecursorCosine', 0.0)
+            target_data['Hyperscore'] = row.get('Hyperscore', 0.0)
+            target_data['NumBIons'] = row.get('NumBIons', 0)
+            target_data['NumYIons'] = row.get('NumYIons', 0)
+            target_data['PercentMatchedIons'] = row.get('PercentMatchedIons', 0.0)
 
-            d['LibCosine'] = row.get('decoy_LibCosine', 0.0)
-            d['XCorr'] = row.get('decoy_XCorr', 0.0)
-            d['PrecursorCosine'] = row.get('decoy_PrecursorCosine', 0.0)
+            decoy_data['LibCosine'] = row.get('decoy_LibCosine', 0.0)
+            decoy_data['XCorr'] = row.get('decoy_XCorr', 0.0)
+            decoy_data['PrecursorCosine'] = row.get('decoy_PrecursorCosine', 0.0)
+            decoy_data['Hyperscore'] = row.get('decoy_Hyperscore', 0.0)
+            decoy_data['NumBIons'] = row.get('decoy_NumBIons', 0)
+            decoy_data['NumYIons'] = row.get('decoy_NumYIons', 0)
+            decoy_data['PercentMatchedIons'] = row.get('decoy_PercentMatchedIons', 0.0)
+            
+            # Delta features for target
+            target_data['DeltaRT'] = row.get('delta_rt', 0.0) if pd.notna(row.get('delta_rt')) else 0.0
+            target_data['DeltaMzPpmPrecursor'] = row.get('delta_mz_ppm_precursor', 0.0) if pd.notna(row.get('delta_mz_ppm_precursor')) else 0.0
+            target_data['DeltaMzPpmFragments'] = row.get('delta_mz_ppm_fragments', 0.0) if pd.notna(row.get('delta_mz_ppm_fragments')) else 0.0
+            
+            # Delta features for decoy
+            decoy_data['DeltaRT'] = row.get('decoy_delta_rt', target_data['DeltaRT']) if pd.notna(row.get('decoy_delta_rt')) else target_data['DeltaRT']
+            decoy_data['DeltaMzPpmPrecursor'] = row.get('decoy_delta_mz_ppm_precursor', target_data['DeltaMzPpmPrecursor']) if pd.notna(row.get('decoy_delta_mz_ppm_precursor')) else target_data['DeltaMzPpmPrecursor']
+            decoy_data['DeltaMzPpmFragments'] = row.get('decoy_delta_mz_ppm_fragments', target_data['DeltaMzPpmFragments']) if pd.notna(row.get('decoy_delta_mz_ppm_fragments')) else target_data['DeltaMzPpmFragments']
+            
+            # Competition: choose winner based on LibCosine
+            target_score = target_data['LibCosine']
+            decoy_score = decoy_data['LibCosine']
         else:
-            t['XCorr'] = row.get('BestXCorr', 0.0)
-            t['XCorrZScore'] = row.get('XCorrZScore', 0.0)
-            d['XCorr'] = row.get('decoy_XCorr', 0.0)
-            d['XCorrZScore'] = row.get('decoy_XCorrZScore', 0.0)
-
-        # Add delta (SIGNED) features - these are ALWAYS present in library mode
-        # Using signed values to distinguish positive vs negative systematic bias
-        # For decoys: use decoy-specific delta if available, otherwise use target delta
-        # (Decoys are matched in same scan/window, so calibration errors should be similar)
-        if library_mode:
-            # Delta RT (signed)
-            t['DeltaRT'] = row.get('delta_rt', 0.0) if pd.notna(row.get('delta_rt')) else 0.0
-            decoy_delta = row.get('decoy_delta_rt')
-            d['DeltaRT'] = decoy_delta if pd.notna(decoy_delta) else t['DeltaRT']
+            # Use XCorr as primary score for competition
+            target_data['XCorr'] = row.get('BestXCorr', 0.0)
+            target_data['XCorrZScore'] = row.get('XCorrZScore', 0.0)
+            target_data['Hyperscore'] = row.get('Hyperscore', 0.0)
+            target_data['NumBIons'] = row.get('NumBIons', 0)
+            target_data['NumYIons'] = row.get('NumYIons', 0)
+            target_data['PercentMatchedIons'] = row.get('PercentMatchedIons', 0.0)
             
-            # Delta precursor m/z (PPM, signed)
-            t['DeltaMzPpmPrecursor'] = row.get('delta_mz_ppm_precursor', 0.0) if pd.notna(row.get('delta_mz_ppm_precursor')) else 0.0
-            decoy_delta = row.get('decoy_delta_mz_ppm_precursor')
-            d['DeltaMzPpmPrecursor'] = decoy_delta if pd.notna(decoy_delta) else t['DeltaMzPpmPrecursor']
+            decoy_data['XCorr'] = row.get('decoy_BestXCorr', 0.0)
+            decoy_data['XCorrZScore'] = row.get('decoy_XCorrZScore', 0.0)
+            decoy_data['Hyperscore'] = row.get('decoy_Hyperscore', 0.0)
+            decoy_data['NumBIons'] = row.get('decoy_NumBIons', 0)
+            decoy_data['NumYIons'] = row.get('decoy_NumYIons', 0)
+            decoy_data['PercentMatchedIons'] = row.get('decoy_PercentMatchedIons', 0.0)
             
-            # Delta fragments m/z (PPM, signed)
-            t['DeltaMzPpmFragments'] = row.get('delta_mz_ppm_fragments', 0.0) if pd.notna(row.get('delta_mz_ppm_fragments')) else 0.0
-            decoy_delta = row.get('decoy_delta_mz_ppm_fragments')
-            d['DeltaMzPpmFragments'] = decoy_delta if pd.notna(decoy_delta) else t['DeltaMzPpmFragments']
+            # Competition: choose winner based on XCorr
+            target_score = target_data['XCorr']
+            decoy_score = decoy_data['XCorr']
 
-        psm_rows.append(t)
-        psm_rows.append(d)
+        # Target-decoy competition: pass only the winner to Mokapot
+        if target_score >= decoy_score:
+            psm_rows.append(target_data)
+        else:
+            psm_rows.append(decoy_data)
 
     psm_df = pd.DataFrame(psm_rows)
+    
+    # Debug: Check competition results
+    n_targets_after_competition = (psm_df['Label'] == 1).sum()
+    n_decoys_after_competition = (psm_df['Label'] == 0).sum()
+    print(f"  After competition: {n_targets_after_competition} targets, {n_decoys_after_competition} decoys (total: {len(psm_df)} PSMs)")
 
     # Determine final feature columns present in psm_df
     feature_cols = [c for c in candidate_features if c in psm_df.columns]
@@ -4659,8 +4889,56 @@ def run_mokapot(results_df: pd.DataFrame, library_mode: bool = True, n_workers: 
 
     # Report counts before running mokapot
     n_targets = (psm_df['Label'] == 1).sum()
-    n_decoys = (psm_df['Label'] == -1).sum()
+    n_decoys = (psm_df['Label'] == 0).sum()
     print(f"  Training Mokapot model: {n_targets} targets, {n_decoys} decoys, {len(feature_cols)} features")
+
+    # Write PIN file for inspection (before Mokapot processing)
+    if output_path:
+        pin_output = output_path.replace('.tsv', '.pin')
+    else:
+        pin_output = 'mokapot_input.pin'
+    print(f"  Writing PIN file: {pin_output}")
+    
+    # Create PIN format: PSMId Label ScanNr features... Peptide Proteins
+    pin_cols = ['PSMId', 'Label', 'ScanNr'] + feature_cols + ['Peptide', 'Proteins']
+    pin_df = psm_df[pin_cols].copy()
+    
+    # Ensure all feature columns are numeric and handle overflow/NaN
+    for col in feature_cols:
+        pin_df[col] = pd.to_numeric(pin_df[col], errors='coerce')
+        # Replace inf values with large finite number
+        pin_df[col] = pin_df[col].replace([np.inf, -np.inf], [1e100, -1e100])
+    
+    # Check for any NaN values introduced by coercion
+    nan_counts = pin_df[feature_cols].isna().sum()
+    if nan_counts.any():
+        print("  Warning: Non-numeric values found and converted to NaN:")
+        for col in nan_counts[nan_counts > 0].index:
+            print(f"    - {col}: {nan_counts[col]} NaN values")
+    
+    # Fill NaN with 0 for missing values
+    pin_df[feature_cols] = pin_df[feature_cols].fillna(0)
+    
+    # Check for overflow in Hyperscore and cap it
+    if 'Hyperscore' in pin_df.columns:
+        max_hyperscore = pin_df['Hyperscore'].max()
+        if max_hyperscore > 1e50:
+            print(f"  Warning: Hyperscore overflow detected (max={max_hyperscore:.2e}), capping at 1e50")
+            pin_df['Hyperscore'] = pin_df['Hyperscore'].clip(upper=1e50)
+    
+    # Write PIN file
+    pin_df.to_csv(pin_output, sep='\t', index=False)
+    print(f"  ✓ PIN file written with {len(pin_df)} PSMs")
+    
+    # Ensure psm_df features are also numeric and clean
+    for col in feature_cols:
+        psm_df[col] = pd.to_numeric(psm_df[col], errors='coerce')
+        psm_df[col] = psm_df[col].replace([np.inf, -np.inf], [1e100, -1e100])
+        psm_df[col] = psm_df[col].fillna(0)
+    
+    # Cap Hyperscore in psm_df as well
+    if 'Hyperscore' in psm_df.columns:
+        psm_df['Hyperscore'] = psm_df['Hyperscore'].clip(upper=1e50)
 
     try:
         psms = mokapot.LinearPsmDataset(
@@ -4676,29 +4954,35 @@ def run_mokapot(results_df: pd.DataFrame, library_mode: bool = True, n_workers: 
         psm_results_df = results.psms
         peptide_df = results.peptides
 
-        # Aggregate precursor-level q-values (best across target/decoy PSMs)
-        precursor_qvalues = {}
-        precursor_scores = {}
+        # Map PSM-level q-values back to original results
+        # Create PSMId (PrecursorId) in results_df to match what we sent to Mokapot
+        results_df['_temp_psm_id'] = results_df.apply(
+            lambda row: f"{row['Peptide']}_{int(row['Charge'])}",
+            axis=1
+        )
+        
+        # Create lookup dictionary from Mokapot results
+        psm_qvalues = {}
+        psm_scores = {}
         for _, psm_row in psm_results_df.iterrows():
-            prec_id = psm_row['PSMId'].rsplit('_', 1)[0]
-            qval = psm_row['mokapot q-value']
-            score = psm_row['mokapot score']
-            if prec_id not in precursor_qvalues or qval < precursor_qvalues[prec_id]:
-                precursor_qvalues[prec_id] = qval
-                precursor_scores[prec_id] = score
-
-        results_df['mokapot_precursor_qvalue'] = results_df.apply(
-            lambda row: precursor_qvalues.get(f"{row['Peptide']}_{row['Charge']}", None),
-            axis=1
-        )
-        results_df['mokapot_precursor_score'] = results_df.apply(
-            lambda row: precursor_scores.get(f"{row['Peptide']}_{row['Charge']}", None),
-            axis=1
-        )
+            psm_id = psm_row['PSMId']
+            psm_qvalues[psm_id] = psm_row['mokapot q-value']
+            psm_scores[psm_id] = psm_row['mokapot score']
+        
+        # Map back to original DataFrame
+        results_df['mokapot_precursor_qvalue'] = results_df['_temp_psm_id'].map(psm_qvalues)
+        results_df['mokapot_precursor_score'] = results_df['_temp_psm_id'].map(psm_scores)
+        results_df.drop(columns=['_temp_psm_id'], inplace=True)
 
         # Map peptide-level scores
-        peptide_qvalues = peptide_df.set_index('mokapot peptide')['mokapot q-value'].to_dict()
-        peptide_scores = peptide_df.set_index('mokapot peptide')['mokapot score'].to_dict()
+        # In Mokapot 0.10.0, peptide results use 'Peptide' column directly
+        peptide_id_col = 'Peptide'
+        if peptide_id_col not in peptide_df.columns:
+            # Fallback for older versions
+            peptide_id_col = 'peptide' if 'peptide' in peptide_df.columns else 'mokapot peptide'
+        
+        peptide_qvalues = peptide_df.set_index(peptide_id_col)['mokapot q-value'].to_dict()
+        peptide_scores = peptide_df.set_index(peptide_id_col)['mokapot score'].to_dict()
 
         results_df['mokapot_peptide_qvalue'] = results_df['Peptide'].map(peptide_qvalues)
         results_df['mokapot_peptide_score'] = results_df['Peptide'].map(peptide_scores)
@@ -4861,7 +5145,7 @@ def main():
         
         # Extract unique peptide sequences and metadata from library
         lib_elapsed = time.time() - lib_start
-        print(f"  Library loaded in {lib_elapsed:.1f}s")
+        print(f"  Library loaded in {lib_elapsed/60:.1f} min")
 
         print("Extracting peptides from spectrum library...")
         library_sequences = set()
@@ -4977,12 +5261,12 @@ def main():
         mzml_elapsed = time.time() - mzml_start
         print(f"  Loaded {len(spectra)} MS2 spectra")
         print(f"  Loaded {len(ms1_spectra)} MS1 spectra for precursor isotope scoring")
-        print(f"  mzML read completed in {mzml_elapsed:.1f}s (elapsed: {time.time()-workflow_start_time:.1f}s)")
+        print(f"  mzML read completed in {mzml_elapsed/60:.1f} min (elapsed: {(time.time()-workflow_start_time)/60:.1f} min)")
     else:
         # Standard MS2-only read
         spectra = xcorr_engine.read_mzml(args.mzml_file, args.max_spectra)
         mzml_elapsed = time.time() - mzml_start
-        print(f"  mzML read completed in {mzml_elapsed:.1f}s (elapsed: {time.time()-workflow_start_time:.1f}s)")
+        print(f"  mzML read completed in {mzml_elapsed/60:.1f} min (elapsed: {(time.time()-workflow_start_time)/60:.1f} min)")
         ms1_spectra = None
     
     print(f"Processing {len(spectra)} MS2 spectra with Target-Decoy Competition")
@@ -5110,6 +5394,7 @@ def main():
         
         all_dia_results = {}  # Keep for summary statistics
         completed_windows = 0
+        search_start_time = time.time()  # Track elapsed time for progress updates
         
         # QC data aggregation from all workers
         all_qc_data = {
@@ -5142,7 +5427,10 @@ def main():
                 dia_writer.close()
                 
                 completed_windows += 1
-                print(f"  Progress: {completed_windows}/{len(work_items)} windows completed")
+                # Print progress every 10 windows
+                if completed_windows % 10 == 0 or completed_windows == len(work_items):
+                    elapsed = (time.time() - search_start_time) / 60
+                    print(f"  Progress: {completed_windows}/{len(work_items)} windows completed ({elapsed:.1f} min elapsed)")
         else:
             # Parallel processing with incremental writing
             from multiprocessing import Manager
@@ -5172,10 +5460,13 @@ def main():
                     dia_writer_parallel.write_dia_results_synchronized(dia_results)
                     
                     completed_windows += 1
-                    print(f"  Progress: {completed_windows}/{len(work_items)} windows completed")
+                    # Print progress every 10 windows
+                    if completed_windows % 10 == 0 or completed_windows == len(work_items):
+                        elapsed = (time.time() - search_start_time) / 60
+                        print(f"  Progress: {completed_windows}/{len(work_items)} windows completed ({elapsed:.1f} min elapsed)")
         
         search_elapsed = time.time() - workflow_start_time
-        print(f"\nAll {len(work_items)} isolation windows processed! (total elapsed: {search_elapsed:.1f}s)")
+        print(f"\nAll {len(work_items)} isolation windows processed! (total elapsed: {search_elapsed/60:.1f} min)")
         
         # TSV results already written incrementally during processing
         
@@ -5384,12 +5675,23 @@ def main():
                 write_pin_file(tsv_df, args.output_pin, library_mode=True)
             
             # Run Mokapot on in-memory DataFrame
-            tsv_df = run_mokapot(tsv_df, library_mode=True, n_workers=n_workers)
+            tsv_df = run_mokapot(tsv_df, library_mode=True, n_workers=n_workers, output_path=args.dia_output)
             
             # Save updated results with Mokapot columns
             print(f"\nSaving results with Mokapot scores: {args.dia_output}")
             tsv_df.to_csv(args.dia_output, sep='\t', index=False)
             print("  Updated TSV file with mokapot_precursor_qvalue and mokapot_peptide_qvalue columns")
+            
+            # Count precursors and peptides at q-value <= 0.01
+            if 'mokapot_precursor_qvalue' in tsv_df.columns:
+                precursors_at_01 = (tsv_df['mokapot_precursor_qvalue'] <= 0.01).sum()
+                print(f"\nPrecursors at q-value ≤ 0.01: {precursors_at_01:,}")
+            
+            if 'mokapot_peptide_qvalue' in tsv_df.columns:
+                # Count unique peptides at q-value <= 0.01
+                peptides_at_01_df = tsv_df[tsv_df['mokapot_peptide_qvalue'] <= 0.01]
+                unique_peptides_at_01 = peptides_at_01_df['Peptide'].nunique()
+                print(f"Unique peptides at q-value ≤ 0.01: {unique_peptides_at_01:,}")
         
         # Print final summary
         print("\n=== DIA PEPTIDE-CENTRIC SEARCH COMPLETED ===")

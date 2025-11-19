@@ -23,8 +23,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pyXcorrDIA import (
-    FastXCorr, SpectrumLibrary, MS1Spectrum, MassSpectrum,
-    PeptideCandidate
+    FastXCorr, SpectrumLibrary
 )
 
 
@@ -408,8 +407,6 @@ class TestRegressionScores:
 
     def test_library_scoring_consistency(self):
         """Test that library scoring produces consistent results."""
-        xcorr_engine = FastXCorr()
-        
         # Create a simple library
         library_data = {
             'Precursor.Id': ['PEPTIDE2', 'PEPTIDE2', 'PEPTIDE2'],
