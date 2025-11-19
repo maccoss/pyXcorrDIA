@@ -46,18 +46,18 @@ def ot_centroid_mgf(test_data_dir):
 
 
 @pytest.fixture(scope="session")
-def dia_library_1000(test_data_dir):
-    """Path to DIA test library (1000 random precursors from report-lib.parquet)."""
-    lib_path = test_data_dir / "test_library_1000.parquet"
+def test_dia_library(test_data_dir):
+    """Path to DIA test library (768 precursors with q-value <= 0.01 in test mzML windows)."""
+    lib_path = test_data_dir / "test_library_768.parquet"
     if not lib_path.exists():
         pytest.skip(f"DIA test library not found: {lib_path}")
     return str(lib_path)
 
 
 @pytest.fixture(scope="session")
-def dia_fasta_1000(test_data_dir):
-    """Path to DIA test FASTA (proteins for 1000 library precursors)."""
-    fasta_path = test_data_dir / "test_proteins_1000.fasta"
+def test_dia_fasta(test_data_dir):
+    """Path to FASTA with proteins for test library."""
+    fasta_path = test_data_dir / "test_proteins_768.fasta"
     if not fasta_path.exists():
         pytest.skip(f"DIA test FASTA not found: {fasta_path}")
     return str(fasta_path)
@@ -66,19 +66,16 @@ def dia_fasta_1000(test_data_dir):
 @pytest.fixture(scope="session")
 def dia_mzml_small(test_data_dir):
     """Path to small DIA mzML file (60-70 kDa m/z window)."""
-    mzml_path = test_data_dir / "test_dia_60000-70000.mzML"
+    mzml_path = test_data_dir / "test_dia_5windows.mzML"
     if not mzml_path.exists():
         pytest.skip(f"DIA test mzML not found: {mzml_path}")
     return str(mzml_path)
 
 
 @pytest.fixture(scope="session")
-def dia_mzml_full(test_data_dir):
-    """Path to full DIA mzML file (15-minute gradient, complete RT coverage)."""
-    mzml_path = test_data_dir / "test_dia_full.mzML"
-    if not mzml_path.exists():
-        pytest.skip(f"DIA test mzML not found: {mzml_path}")
-    return str(mzml_path)
+def test_dia_mzml(test_data_dir):
+    """Path to DIA mzML file with 5 isolation windows for integration tests."""
+    mzml_path = test_data_dir / "test_dia_5windows.mzML"
 
 
 @pytest.fixture(scope="session")

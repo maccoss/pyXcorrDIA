@@ -1,22 +1,26 @@
 /.venv
 Ast*.dia.tsv
+uniprot_*.fasta
 *.raw
 *.pdf
 *.pepXML
 *.pin
 *.png
+*.log
 /__pycache__
 comet.params
 *.pyc
-__pycache__/pyXcorrDIA.cpython-312.pyc
-*.parquet
+report*.parquet
 *.dia.tsv
-__pycache__/pyXcorrDIA.cpython-312.pyc
-DIANN-Output/report-lib.predicted.speclib
+/.ruff_cache
+/.claude
+/.pytest_cache
 
 # Large test files - regenerate using scripts/subset_mzml_by_windows.py
+# Keep small test files (< 50 MB), exclude large ones
 tests/data/test_dia_60000-70000.mzML
 tests/data/test_dia_full.mzML
+tests/data/test_dia_10windows.mzML
 tests/data/*_full.mzML
 tests/data/*_subset.mzML
 

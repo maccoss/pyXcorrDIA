@@ -9,9 +9,9 @@ Tests the complete DIA peptide-centric search pipeline including:
 - Precursor-level data collection (not peptide-level)
 
 Uses realistic test data:
-- test_library_1000.parquet: 1000 randomly selected precursors
-- test_proteins_1000.fasta: Matching protein sequences  
-- test_dia_60000-70000.mzML: Small DIA window (~1 min RT range, scan IDs 60000-70000)
+- test_library_768.parquet: 768 precursors with q-value <= 0.01
+- test_proteins_768.fasta: Matching protein sequences  
+- test_dia_5windows.mzML: Small DIA file (5 isolation windows, 400-410 m/z)
 
 NOTE: The test mzML has a narrow RT window (~1 minute), so:
 - RT correlation plot will show limited spread (expected behavior)
@@ -32,15 +32,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 class TestDIATestDataAvailable:
     """Verify DIA test data files are present."""
     
-    def test_dia_library_exists(self, dia_library_1000):
-        """Verify DIA test library file exists."""
-        assert Path(dia_library_1000).exists()
-        print(f"\n✓ DIA library: {dia_library_1000}")
+    def test_dia_library_exists(self, test_dia_library):
+        """Test that the DIA library file exists."""
+        assert Path(test_dia_library).exists()
+        print(f"\n✓ DIA library: {test_dia_library}")
     
-    def test_dia_fasta_exists(self, dia_fasta_1000):
-        """Verify DIA test FASTA file exists."""
-        assert Path(dia_fasta_1000).exists()
-        print(f"✓ DIA FASTA: {dia_fasta_1000}")
+    def test_dia_fasta_exists(self, test_dia_fasta):
+        """Test that the DIA FASTA file exists."""
+        assert Path(test_dia_fasta).exists()
+        print(f"✓ DIA FASTA: {test_dia_fasta}")
     
     def test_dia_mzml_exists(self, dia_mzml_small):
         """Verify DIA test mzML file exists."""
@@ -52,11 +52,12 @@ class TestDIATestDataAvailable:
 class TestDIALibraryLoading:
     """Test DIA library loading and structure."""
     
-    def test_load_dia_library(self, dia_library_1000):
-        """Test loading DIA-NN parquet library."""
-        from pyXcorrDIA import SpectrumLibrary
+    def test_load_dia_library(self, test_dia_library):
+        """Test that we can load the DIA library.
         
-        library = SpectrumLibrary(dia_library_1000)
+        This validates the library file structure and basic content.
+        """
+        library = SpectrumLibrary(test_dia_library)
         
         # Verify library loaded
         assert len(library.precursors) > 0
@@ -74,12 +75,12 @@ class TestDIALibraryLoading:
         print(f"  Sample precursor: {first_key}")
         print(f"  Fragments: {len(first_precursor['fragments'])}")
     
-    def test_library_random_selection(self, dia_library_1000):
+    def test_library_random_selection(self, test_dia_library):
         """Test random precursor selection from library."""
         from pyXcorrDIA import SpectrumLibrary
         
         # Load with random selection
-        library = SpectrumLibrary(dia_library_1000, max_precursors=100)
+        library = SpectrumLibrary(test_dia_library, max_precursors=100)
         
         # Should have 100 precursors (or fewer if library is smaller)
         assert len(library.precursors) <= 100
@@ -179,8 +180,8 @@ class TestDIAQCDataStructure:
 # Note: Full DIA search integration test would go here, but requires significant runtime.
 # For CI/CD, use the --test_library_peptides flag to limit search scope:
 #
-# python pyXcorrDIA.py tests/data/test_proteins_1000.fasta tests/data/test_dia_60000-70000.mzML \
-#        --dia_mode --speclib tests/data/test_library_1000.parquet \
+# python pyXcorrDIA.py tests/data/test_proteins_768.fasta tests/data/test_dia_5windows.mzML \
+#        --dia_mode --speclib tests/data/test_library_768.parquet \
 #        --test_library_peptides 100
 #
 # Then validate:
