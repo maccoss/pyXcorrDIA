@@ -1,5 +1,4 @@
 /.venv
-Ast*.mzML
 Ast*.dia.tsv
 *.raw
 *.pdf
@@ -14,6 +13,14 @@ __pycache__/pyXcorrDIA.cpython-312.pyc
 *.dia.tsv
 __pycache__/pyXcorrDIA.cpython-312.pyc
 DIANN-Output/report-lib.predicted.speclib
+
+# Large test files - regenerate using scripts/subset_mzml_by_windows.py
 tests/data/test_dia_60000-70000.mzML
 tests/data/test_dia_full.mzML
-/data
+tests/data/*_full.mzML
+tests/data/*_subset.mzML
+
+data/mokapot_feature_weights.txt
+data/Ast-Neo-15min-2mz-4ms-200agc-10.dia.log
+data/Ast-Neo-15min-2mz-4ms-200agc-10.dia.calibration.json
+data/Ast-Neo-15min-2mz-4ms-200agc-10.mzML

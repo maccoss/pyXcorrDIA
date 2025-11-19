@@ -248,7 +248,7 @@ Total: 175+ tests (100% passing)
 
 ### ✓ Peptide-Centric Scoring (8 tests - Mock Data)
 
-- Validates 0.0001 scaling factor produces reasonable XCorr scores (0-10 range)
+- Validates 0.005 scaling factor produces reasonable XCorr scores (0-10 range)
 - Confirms preprocessing asymmetry (theoretical preprocessed, experimental windowed)
 - Tests E-value calculation from chromatogram distribution
 - Validates matrix scoring for batch processing
@@ -263,7 +263,7 @@ Total: 175+ tests (100% passing)
 - Validates E-value calculation with actual score distributions
 - Handles negative XCorr scores (anti-correlation)
 - Explains raw dot product magnitude (~50x difference)
-- Compares 0.005 vs 0.0001 scaling effects
+- Validates spectrum-centric preprocessing approach for DIA
 
 ## Current Status
 

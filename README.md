@@ -1,6 +1,6 @@
 # pyXcorrDIA
 
-A proteomics database search engine implementing the SEQUEST Cross-Correlation (XCorr) algorithm based on Comet's approach. Designed for peptide-spectrum matching with target-decoy competition for FDR estimation.
+A simple python DIA search tool for prototyping ideas.
 
 ## Features
 
@@ -8,19 +8,16 @@ A proteomics database search engine implementing the SEQUEST Cross-Correlation (
 - **Comet-compatible algorithm** - Faithful implementation matching Comet's preprocessing and scoring
 - **DIA peptide-centric mode** - Optimized search for data-independent acquisition with RT profiling
 - **Spectral library support** - Search against DIA-NN spectral libraries with cosine similarity scoring
-- **Performance optimized** - Library object passing, pre-vectorized preprocessing, combined mzML reading (20-40 min speedup)
-- **Quality filtering** - Automatic filtering of decoys and low Q-value entries from spectral libraries
 - **Unified target-decoy competition** - Winner-only reporting for both library and non-library modes
 - **Incremental TSV writing** - Real-time results output with thread-safe file access for memory efficiency
 - **Vectorized matrix scoring** - N×M peptide-spectrum scoring using optimized BLAS operations
 - **Multi-enzyme support** - 10 protease digestion options including Trypsin, Lys-C, Arg-C, and more
 - **Fast spectrum preprocessing** - Efficient binning, windowing normalization, and Fast XCorr calculation
 - **Target-decoy search** - Built-in decoy generation and target-decoy competition
-- **Multiple file formats** - Supports mzML (via pymzml) and MGF (via pyteomics) input
+- **Multiple file formats** - Supports mzML and MGF (via pyteomics) input
 - **Flexible modifications** - Configurable static modifications (default: Carbamidomethyl-C)
-- **Multiple output formats** - pepXML and Percolator Input (PIN) files for spectrum-centric; simplified TSV for DIA
-- **E-value calculation** - Comet's LinearRegression approach with proper statistical significance (non-library mode)
-- **Z-score reporting** - Signal-to-noise ratio for chromatographic peaks in DIA mode
+- **Multiple output formats** - pepXML and Percolator Input (PIN) files for spectrum-centric (needs testing); simplified TSV for DIA
+- **E-value calculation** - Comet's E-value approach for improved sensitivity (non-library mode)
 - **Comprehensive testing** - 175+ tests covering all major functionality including optimizations and library filtering
 
 ## Installation
@@ -137,7 +134,9 @@ pyXcorrDIA supports **DIA (Data-Independent Acquisition) peptide-centric search*
 | Mode | Preprocessing | Use Case | Output |
 |------|---------------|----------|--------|
 | **Spectrum-Centric** (default) | Experimental spectra preprocessed | DDA, single peptide/spectrum | Best peptides per spectrum |
-| **Peptide-Centric** (--dia_mode) | Theoretical spectra preprocessed | DIA, multiple spectra/window | Best XCorr per peptide across RT |
+| **DIA Mode** (--dia_mode) | Experimental spectra preprocessed | DIA, multiple spectra/window | Best XCorr per peptide across RT |
+
+**Note**: DIA mode uses spectrum-centric preprocessing (experimental spectra fully preprocessed, theoretical spectra windowed only) for efficiency when library size is large relative to spectra per window.
 
 ### DIA Usage
 

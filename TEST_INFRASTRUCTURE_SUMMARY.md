@@ -46,8 +46,8 @@ A comprehensive pytest-based test infrastructure has been created for pyXcorrDIA
    - Multi-charge testing (charge +2 and +3)
 
 6. **`tests/test_peptide_centric.py`** (8 tests) ✓
-   - Peptide-centric XCorr scoring with 0.0001 scaling
-   - Preprocessing asymmetry validation
+   - DIA XCorr scoring with spectrum-centric preprocessing (0.005 scaling)
+   - Preprocessing approach: experimental fully preprocessed, theoretical windowed only
    - E-value calculation from chromatogram distribution
    - Matrix scoring efficiency and correctness
 
@@ -75,8 +75,7 @@ A comprehensive pytest-based test infrastructure has been created for pyXcorrDIA
    - Single spectrum scoring with correct scaling
    - Matrix scoring (N peptides × M spectra) with vectorized operations
    - Consistency validation: matrix results match repeated single scoring
-   - Spectrum-centric (0.005) and peptide-centric (0.0001) scaling
-   - 50x scaling factor difference validation
+   - DIA mode uses spectrum-centric preprocessing with 0.005 scaling
    - Convenience wrappers: `calculate_fast_xcorr()` and `calculate_peptide_centric_xcorr()`
    - Edge cases: empty arrays, mismatched lengths, 1×1 matrices
    - Real data preprocessing and matrix scoring

@@ -90,8 +90,10 @@ This implementation closely follows Comet's algorithm to ensure reproducibility:
 - **MakeCorrData**: 10-window normalization to 50.0
 - **Fast XCorr**: Sliding window (offset=75) preprocessing
 - **XCorr scoring**: Unified `calculate_xcorr()` function supports both vector and matrix operations
-  - Spectrum-centric: 0.005 scaling factor (Comet standard)
-  - Peptide-centric: 0.0001 scaling factor (50x smaller due to preprocessing asymmetry)
+  - DIA mode uses spectrum-centric preprocessing: 0.005 scaling factor
+    - Experimental spectrum fully preprocessed (windowed + Fast XCorr background subtraction)
+    - Theoretical spectrum windowed only (no Fast XCorr preprocessing)
+    - More efficient when library size is large relative to spectra per window
   - Matrix multiplication: Scores N peptides × M spectra using optimized BLAS operations
 
 ### Unified XCorr Implementation
@@ -99,15 +101,11 @@ This implementation closely follows Comet's algorithm to ensure reproducibility:
 **Key Innovation**: Single `calculate_xcorr()` function eliminates duplicate code:
 
 - **Automatic mode detection**: Handles 1D (single) or 2D (matrix) inputs automatically
-- **Spectrum-centric**: `calculate_fast_xcorr(theoretical_raw, experimental_preprocessed, 0.005)`
-- **Peptide-centric**: `calculate_peptide_centric_xcorr(experimental_windowed, theoretical_preprocessed, 0.0001)`
+- **DIA Mode**: `calculate_peptide_centric_xcorr(experimental_preprocessed, theoretical_windowed)`
+  - Uses spectrum-centric preprocessing approach with 0.005 scaling
+  - Experimental spectra are fully preprocessed once, then scored against all theoretical spectra
 - **DIA batch scoring**: Matrix multiplication for vectorized N×M scoring
-- **Convenience wrappers**: Maintain backward compatibility with existing code
-
-**Why two scaling factors?**
-- Preprocessing the **experimental** spectrum (spectrum-centric): Lower signal amplification → 0.005 scaling
-- Preprocessing the **theoretical** spectrum (peptide-centric): ~50x higher raw scores → 0.0001 scaling
-- Both produce comparable final XCorr scores in the 0-10 range
+- **Convenience wrapper**: Maintains backward compatibility with existing code
 
 ### Critical Mass Calculations
 

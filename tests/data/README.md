@@ -31,6 +31,44 @@ MGF (Mascot Generic Format) file containing centroided MS/MS spectra. Used for t
 - `test_file_io.py::TestSingleSpectrumReading::test_read_single_spectrum_mgf`
 - `test_preprocessing.py::TestFullPreprocessingPipeline::test_mgf_spectrum_preprocessing`
 
+### DIA mzML Files
+
+Some DIA test files are too large to commit to git (>10 MB) and are excluded via `.gitignore`. 
+
+**Excluded files:**
+- `test_dia_60000-70000.mzML` - Subset of scans for DIA testing
+- `test_dia_full.mzML` - Full DIA file
+- `*_full.mzML`, `*_subset.mzML` - Other large DIA files
+
+**Regenerating subset files:**
+
+Use the `scripts/subset_mzml_by_windows.py` utility to create smaller test files from full DIA data:
+
+```bash
+# Create 3-window subset (~1-2 MB, suitable for git)
+python scripts/subset_mzml_by_windows.py \
+    path/to/full_data.mzML \
+    tests/data/test_dia_3windows.mzML \
+    --num_windows 3
+
+# Create 10-window subset (~4-5 MB, suitable for git)
+python scripts/subset_mzml_by_windows.py \
+    path/to/full_data.mzML \
+    tests/data/test_dia_10windows.mzML \
+    --num_windows 10
+
+# Create subset for specific m/z range
+python scripts/subset_mzml_by_windows.py \
+    path/to/full_data.mzML \
+    tests/data/test_dia_subset.mzML \
+    --window_range 500.0-600.0
+```
+
+**Recommended sizes for git commits:**
+- **3-5 windows** (~1-3 MB): Quick unit tests
+- **10 windows** (~4-5 MB): Integration tests
+- **50+ windows** (exclude from git): Performance/benchmark tests
+
 ## Purpose
 
 These test files serve several purposes:
