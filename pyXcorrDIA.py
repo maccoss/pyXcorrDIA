@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 
 import warnings
+import os
+
 # Silence all warnings from third-party libraries before they're imported
 warnings.filterwarnings('ignore', category=SyntaxWarning)
 warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
 # Specifically silence pytz invalid escape sequence warning
 warnings.filterwarnings('ignore', message='invalid escape sequence')
+# Silence Mono version warning from clr_loader (used by alpharaw)
+warnings.filterwarnings('ignore', message='Hosting Mono versions before')
+# Silence numpy longdouble signature warning
+warnings.filterwarnings('ignore', message='Signature.*does not match any known type')
+
+# Also suppress warnings via environment variable
+os.environ['PYTHONWARNINGS'] = 'ignore'
 
 """
-Fast SEQUEST Cross-Correlation Implementation
-Based on the paper by Eng et al. (2008): "A Fast SEQUEST Cross Correlation Algorithm"
+This is a simple DIA search tool that implements the Comet Xcorr algorithm, a
+library for cosine similarity scoring, and the X!tandem hyperscore.
 
-This implementation calculates the cross-correlation score without FFTs,
-enabling scoring of all candidate peptides and E-value calculation.
-
-CORRECTED VERSION - Fixed XCorr calculation to match Comet exactly
 """
 
 import numpy as np
@@ -35,6 +41,26 @@ try:
     from statsmodels.nonparametric.smoothers_lowess import lowess
 except ImportError:
     lowess = None  # Will fall back to linear regression if statsmodels not available
+
+# Try multiple import paths for alpharaw (API has changed across versions)
+ALPHARAW_AVAILABLE = False
+ThermoRawData = None
+try:
+    # Try current alpharaw API (v0.4.8+)
+    from alpharaw.thermo import ThermoRawData
+    ALPHARAW_AVAILABLE = True
+except ImportError:
+    try:
+        # Try older alpharaw API
+        from alpharaw.thermo.ThermoRawData import ThermoRawData
+        ALPHARAW_AVAILABLE = True
+    except ImportError:
+        try:
+            # Try even older API
+            from alpharaw.wrappers.thermo_raw_data import ThermoRawData
+            ALPHARAW_AVAILABLE = True
+        except ImportError:
+            pass  # alpharaw not available or incompatible version
 
 
 def extract_scan_number(scan_id_str):
@@ -707,6 +733,101 @@ class FastXCorr:
         
         return proteins
     
+    def read_raw_combined(self, raw_file: str, max_spectra: int = 0, preprocess_smz: bool = False) -> Tuple[List[MassSpectrum], List[MS1Spectrum]]:
+        """Read MS1 and MS2 spectra from Thermo RAW file using alpharaw.
+        
+        Args:
+            raw_file: Path to Thermo RAW file
+            max_spectra: Maximum number of MS2 spectra to read (0 = all)
+            preprocess_smz: Apply SMZ preprocessing during read (sqrt(intensity) * mz^2)
+            
+        Returns:
+            Tuple of (ms2_spectra, ms1_spectra)
+        """
+        if not ALPHARAW_AVAILABLE:
+            raise ImportError("alpharaw is not installed. Install with: pip install alpharaw")
+        
+        ms2_spectra = []
+        ms1_spectra = []
+        ms2_count = 0
+        
+        # Load RAW file using alpharaw ThermoRawData
+        raw_data = ThermoRawData()
+        raw_data.load_raw(raw_file)
+        
+        # Access spectrum metadata DataFrame
+        spec_df = raw_data.spectrum_df
+        
+        # Iterate through all spectra using DataFrame rows
+        for idx, row in spec_df.iterrows():
+            ms_level = row['ms_level']
+            
+            if ms_level == 2:
+                # Process MS2 spectrum
+                if max_spectra > 0 and ms2_count >= max_spectra:
+                    break
+                
+                # Get peaks for this spectrum (returns tuple: mz_array, intensity_array)
+                mz_array, intensity_array = raw_data.get_peaks(idx)
+                
+                if len(mz_array) == 0:
+                    continue
+                
+                # Use DataFrame index as scan number
+                scan_id = f"scan={idx}"
+                
+                # Get retention time (alpharaw provides RT in minutes)
+                retention_time = row['rt']
+                
+                # Get precursor information
+                precursor_mz = row['precursor_mz']
+                charge = int(row['precursor_charge']) if row['precursor_charge'] > 0 else 2
+                
+                # Get isolation window
+                isolation_window_lower = row['isolation_lower_mz']
+                isolation_window_upper = row['isolation_upper_mz']
+                
+                # Apply SMZ preprocessing if requested
+                if preprocess_smz:
+                    intensity_array = np.sqrt(intensity_array) * (mz_array ** 2)
+                
+                # Create MassSpectrum object
+                ms2_spec = MassSpectrum(
+                    mz_array=mz_array,
+                    intensity_array=intensity_array,
+                    scan_id=scan_id,
+                    precursor_mz=precursor_mz,
+                    charge=charge,
+                    isolation_window_lower=isolation_window_lower,
+                    isolation_window_upper=isolation_window_upper,
+                    retention_time=retention_time
+                )
+                ms2_spectra.append(ms2_spec)
+                ms2_count += 1
+                
+            elif ms_level == 1:
+                # Process MS1 spectrum for precursor isotope scoring
+                mz_array, intensity_array = raw_data.get_peaks(idx)
+                
+                if len(mz_array) == 0:
+                    continue
+                
+                # Use DataFrame index as scan number
+                scan_id = f"ms1_scan={idx}"
+                
+                # Get retention time
+                retention_time = row['rt']
+                
+                ms1_spec = MS1Spectrum(
+                    mz_array=mz_array,
+                    intensity_array=intensity_array,
+                    scan_id=scan_id,
+                    retention_time=retention_time
+                )
+                ms1_spectra.append(ms1_spec)
+        
+        return ms2_spectra, ms1_spectra
+
     def read_mzml_combined(self, mzml_file: str, max_spectra: int = 0, preprocess_smz: bool = False) -> Tuple[List[MassSpectrum], List[MS1Spectrum]]:
         """Read MS1 and MS2 spectra from mzML file in a single pass.
         
@@ -826,6 +947,41 @@ class FastXCorr:
                     ms1_spectra.append(ms1_spec)
         
         return ms2_spectra, ms1_spectra
+    
+    def read_spectra_combined(self, spectrum_file: str, max_spectra: int = 0, preprocess_smz: bool = False) -> Tuple[List[MassSpectrum], List[MS1Spectrum]]:
+        """Universal reader that auto-detects file format and reads MS1/MS2 spectra.
+        
+        Supports:
+        - Thermo RAW files (.raw) via alpharaw
+        - mzML files (.mzml, .mzml.gz) via pyteomics
+        - mzXML files (.mzxml) via pyteomics
+        
+        Args:
+            spectrum_file: Path to spectrum file
+            max_spectra: Maximum number of MS2 spectra to read (0 = all)
+            preprocess_smz: Apply SMZ preprocessing during read (sqrt(intensity) * mz^2)
+            
+        Returns:
+            Tuple of (ms2_spectra, ms1_spectra)
+        """
+        file_lower = spectrum_file.lower()
+        
+        if file_lower.endswith('.raw'):
+            # Thermo RAW file
+            if not ALPHARAW_AVAILABLE:
+                raise ImportError(
+                    "alpharaw is required to read Thermo RAW files. "
+                    "Install with: pip install alpharaw"
+                )
+            return self.read_raw_combined(spectrum_file, max_spectra, preprocess_smz)
+        elif file_lower.endswith(('.mzml', '.mzml.gz', '.mzxml')):
+            # mzML or mzXML file
+            return self.read_mzml_combined(spectrum_file, max_spectra, preprocess_smz)
+        else:
+            raise ValueError(
+                f"Unsupported file format: {spectrum_file}. "
+                "Supported formats: .raw (Thermo RAW), .mzml, .mzml.gz, .mzxml"
+            )
     
     def read_mzml(self, mzml_file: str, max_spectra: int = 0) -> List[MassSpectrum]:
         """Read MS2 spectra from mzML file.
@@ -2549,7 +2705,8 @@ class FastXCorr:
                 'num_results': 0
             }
         
-        # **XCORR MATRIX CALCULATION** (skip during calibration for speed)
+        # **XCORR MATRIX CALCULATION** (skip during PPM calibration only)
+        # When lib_fragment_tol_unit='mz', XCorr is needed for calibration FDR calculation
         xcorr_matrix_raw = None
         if library is None or not skip_xcorr_matrix:
             # Stack all theoretical spectra into a matrix: (n_peptides, n_bins)
@@ -2572,7 +2729,7 @@ class FastXCorr:
             if verbose >= 1:
                 print("  DIA: Matrix scoring complete, processing results...")
         elif verbose >= 1:
-            print("  DIA: Skipping XCorr matrix calculation (calibration mode)")
+            print("  DIA: Skipping XCorr matrix calculation (PPM calibration mode - LibCosine sufficient)")
 
         # **LIBRARY SCORING**: Score library fragments if library is provided
         lib_cosine_matrix_target = None
@@ -2611,10 +2768,14 @@ class FastXCorr:
                 ms1_cal = calibration.get('ms1_calibration', {})
                 ms2_cal = calibration.get('ms2_calibration', {})
                 # Expand tolerance to mean + 3σ for both precursor and fragments
-                if ms1_cal.get('mean_ppm') is not None and ms1_cal.get('sd_ppm') is not None:
-                    adjusted_precursor_tol_ppm = abs(ms1_cal['mean_ppm']) + 3 * ms1_cal['sd_ppm']
-                if ms2_cal.get('mean_ppm') is not None and ms2_cal.get('sd_ppm') is not None:
-                    adjusted_fragment_tol_ppm = abs(ms2_cal['mean_ppm']) + 3 * ms2_cal['sd_ppm']
+                # Skip if calibration is None (when tolerance unit was 'mz')
+                if ms1_cal is not None and ms1_cal.get('mean') is not None and ms1_cal.get('sd') is not None:
+                    # Calibration stores values in the same units as the original tolerance
+                    if ms1_cal.get('unit') == 'ppm':
+                        adjusted_precursor_tol_ppm = abs(ms1_cal['mean']) + 3 * ms1_cal['sd']
+                if ms2_cal is not None and ms2_cal.get('mean') is not None and ms2_cal.get('sd') is not None:
+                    if ms2_cal.get('unit') == 'ppm':
+                        adjusted_fragment_tol_ppm = abs(ms2_cal['mean']) + 3 * ms2_cal['sd']
             
             # Score each peptide's library fragments
             for pep_idx, (peptide, charge, is_target, pair_id, lib_rt) in enumerate(peptides_in_window):
@@ -2645,8 +2806,10 @@ class FastXCorr:
                                 corrected_lib_mz = lib_mz_val
                                 if calibration is not None:
                                     ms2_cal = calibration.get('ms2_calibration', {})
-                                    if ms2_cal.get('mean_ppm') is not None:
-                                        corrected_lib_mz = lib_mz_val * (1 + ms2_cal['mean_ppm'] / 1e6)
+                                    # Only apply correction if MS2 was calibrated (not None and has mean)
+                                    if ms2_cal is not None and ms2_cal.get('mean') is not None:
+                                        if ms2_cal.get('unit') == 'ppm':
+                                            corrected_lib_mz = lib_mz_val * (1 + ms2_cal['mean'] / 1e6)
                                 
                                 # Calculate tolerance window using adjusted tolerance
                                 tol_da = corrected_lib_mz * adjusted_fragment_tol_ppm / 1e6
@@ -2727,8 +2890,10 @@ class FastXCorr:
                                     corrected_lib_mz = lib_mz_val
                                     if calibration is not None:
                                         ms2_cal = calibration.get('ms2_calibration', {})
-                                        if ms2_cal.get('mean_ppm') is not None:
-                                            corrected_lib_mz = lib_mz_val * (1 + ms2_cal['mean_ppm'] / 1e6)
+                                        # Only apply correction if MS2 was calibrated (not None and has mean)
+                                        if ms2_cal is not None and ms2_cal.get('mean') is not None:
+                                            if ms2_cal.get('unit') == 'ppm':
+                                                corrected_lib_mz = lib_mz_val * (1 + ms2_cal['mean'] / 1e6)
                                     
                                     tol_da = corrected_lib_mz * adjusted_fragment_tol_ppm / 1e6
                                     mz_min = corrected_lib_mz - tol_da
@@ -2808,7 +2973,8 @@ class FastXCorr:
                 target_xcorr = xcorr_matrix_raw[pair_idx, :].tolist()
                 decoy_xcorr = xcorr_matrix_raw[pair_idx + 1, :].tolist()
             else:
-                # Library-only mode (calibration): no XCorr calculated
+                # PPM calibration mode: no XCorr calculated (LibCosine sufficient)
+                # MZ calibration mode: XCorr should be calculated above
                 target_xcorr = [0.0] * len(spectra)
                 decoy_xcorr = [0.0] * len(spectra)
             
@@ -2880,8 +3046,10 @@ class FastXCorr:
                         corrected_precursor_mz = lib_data['precursor_mz']
                         if calibration is not None:
                             ms1_cal = calibration.get('ms1_calibration', {})
-                            if ms1_cal.get('mean_ppm') is not None:
-                                corrected_precursor_mz = lib_data['precursor_mz'] * (1 + ms1_cal['mean_ppm'] / 1e6)
+                            # Only apply correction if MS1 was calibrated (not None and has mean)
+                            if ms1_cal is not None and ms1_cal.get('mean') is not None:
+                                if ms1_cal.get('unit') == 'ppm':
+                                    corrected_precursor_mz = lib_data['precursor_mz'] * (1 + ms1_cal['mean'] / 1e6)
                         
                         # Collect QC data: MS1 M+0 mass error
                         experimental_isotopes, m0_mass_error = FastXCorr.extract_isotope_envelope(
@@ -3939,10 +4107,10 @@ class DIAResultsWriter:
                 
                 line = f"{target_peptide.sequence}\t{charge}\t{target_peptide.protein_id}\t{target_peptide.mass:.6f}\t{window_str}\t{num_spectra}\t"
                 line += f"{target_lib_cosine:.4f}\t{target_lib_zscore:.4f}\t{target_xcorr:.4f}\t{target_rt:.2f}\t{target_scan_num}\t{target_precursor_cosine:.4f}\t"
-                line += f"{target_hyperscore:.4f}\t{target_num_b}\t{target_num_y}\t{target_pct_matched:.2f}\t"
+                line += f"{target_hyperscore:.4e}\t{target_num_b}\t{target_num_y}\t{target_pct_matched:.2f}\t"
                 line += f"{target_delta_rt_str}\t{target_delta_mz_precursor_str}\t{target_delta_mz_fragments_str}\t"
                 line += f"{decoy_peptide.sequence}\t{decoy_lib_cosine:.4f}\t{decoy_lib_zscore:.4f}\t{decoy_xcorr:.4f}\t{decoy_rt:.2f}\t{decoy_scan_num}\t{decoy_precursor_cosine:.4f}\t"
-                line += f"{decoy_hyperscore:.4f}\t{decoy_num_b}\t{decoy_num_y}\t{decoy_pct_matched:.2f}\t"
+                line += f"{decoy_hyperscore:.4e}\t{decoy_num_b}\t{decoy_num_y}\t{decoy_pct_matched:.2f}\t"
                 line += f"{decoy_delta_rt_str}\t{decoy_delta_mz_precursor_str}\t{decoy_delta_mz_fragments_str}\n"
                 
             else:
@@ -3973,9 +4141,9 @@ class DIAResultsWriter:
                 
                 line = f"{target_peptide.sequence}\t{charge}\t{target_peptide.protein_id}\t{target_peptide.mass:.6f}\t{window_str}\t{num_spectra}\t"
                 line += f"{target_xcorr:.4f}\t{target_rt:.2f}\t{target_scan_num}\t{target_evalue:.6e}\t{target_zscore:.4f}\t"
-                line += f"{target_hyperscore:.4f}\t{target_num_b}\t{target_num_y}\t{target_pct_matched:.2f}\t"
+                line += f"{target_hyperscore:.4e}\t{target_num_b}\t{target_num_y}\t{target_pct_matched:.2f}\t"
                 line += f"{decoy_peptide.sequence}\t{decoy_xcorr:.4f}\t{decoy_rt:.2f}\t{decoy_scan_num}\t{decoy_evalue:.6e}\t{decoy_zscore:.4f}\t"
-                line += f"{decoy_hyperscore:.4f}\t{decoy_num_b}\t{decoy_num_y}\t{decoy_pct_matched:.2f}\n"
+                line += f"{decoy_hyperscore:.4e}\t{decoy_num_b}\t{decoy_num_y}\t{decoy_pct_matched:.2f}\n"
 
             self.file_handle.write(line)
     
@@ -3998,20 +4166,21 @@ class DIAResultsWriter:
 
 
 # QC Data Filtering Functions
-def filter_qc_data_by_fdr(qc_data, winners_df, fdr_threshold=0.01):
+def filter_qc_data_by_fdr(qc_data, winners_df, fdr_threshold=0.01, score_column='LibCosine'):
     """
     Filter QC data to only include precursors at or below the specified FDR threshold.
     
     Args:
         qc_data: Dictionary with 'ms1_mass_errors', 'ms2_mass_errors', 'rt_pairs'
-        winners_df: DataFrame from competition with columns ['Peptide', 'Charge', 'IsTarget', 'LibCosine']
+        winners_df: DataFrame from competition with columns ['Peptide', 'Charge', 'IsTarget', score_column]
         fdr_threshold: FDR threshold (default 0.01 for 1% FDR)
+        score_column: Name of score column to use for FDR calculation (default 'LibCosine', can be 'XCorr')
     
     Returns:
         Filtered qc_data dictionary with same structure but only high-confidence precursors
     """
-    # Calculate FDR for each precursor based on LibCosine score
-    winners_sorted = winners_df.sort_values('LibCosine', ascending=False).copy()
+    # Calculate FDR for each precursor based on the score column
+    winners_sorted = winners_df.sort_values(score_column, ascending=False).copy()
     winners_sorted['cumulative_targets'] = (winners_sorted['IsTarget'] == 'Target').cumsum()
     winners_sorted['cumulative_decoys'] = (winners_sorted['IsTarget'] == 'Decoy').cumsum()
     winners_sorted['fdr'] = winners_sorted['cumulative_decoys'] / winners_sorted['cumulative_targets'].replace(0, 1)
@@ -4039,10 +4208,19 @@ def filter_qc_data_by_fdr(qc_data, winners_df, fdr_threshold=0.01):
     ]
     
     # Filter RT pairs - match by precursor (peptide+charge)
-    filtered_rt = [
-        entry for entry in qc_data['rt_pairs']
-        if (entry['peptide'], entry['charge']) in valid_precursors and entry['is_target']
-    ]
+    # Deduplicate: keep only the best RT pair per precursor (highest lib_cosine)
+    # since peptides can appear in multiple isolation windows
+    rt_by_precursor = {}
+    for entry in qc_data['rt_pairs']:
+        if (entry['peptide'], entry['charge']) in valid_precursors and entry['is_target']:
+            precursor_key = (entry['peptide'], entry['charge'])
+            if precursor_key not in rt_by_precursor:
+                rt_by_precursor[precursor_key] = entry
+            elif entry['lib_cosine'] > rt_by_precursor[precursor_key]['lib_cosine']:
+                # Keep the RT pair with higher lib_cosine (better match quality)
+                rt_by_precursor[precursor_key] = entry
+    
+    filtered_rt = list(rt_by_precursor.values())
     
     print(f"  MS1 mass accuracy: {len(qc_data['ms1_mass_errors']):,} total → {len(filtered_ms1):,} at <{fdr_threshold*100:.0f}% FDR")
     if len(filtered_ms1) < len(valid_precursors):
@@ -4172,15 +4350,21 @@ def plot_rt_correlation(rt_pairs, output_prefix):
     lib_rt = target_df['library_rt'].values
     meas_rt = target_df['measured_rt'].values
     
-    # Fit LOESS using cubic spline as approximation
+    # Fit LOESS using cubic spline as approximation with fallback to linear
     # Sort by library RT for smooth fit
     sort_idx = np.argsort(lib_rt)
     lib_rt_sorted = lib_rt[sort_idx]
     meas_rt_sorted = meas_rt[sort_idx]
     
+    # Try LOESS/spline fit first, fall back to linear if it fails
+    fit_method = 'spline'
     try:
         # Use UnivariateSpline with smoothing
-        spl = UnivariateSpline(lib_rt_sorted, meas_rt_sorted, s=len(lib_rt_sorted)*0.1)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # Convert warnings to errors
+            spl = UnivariateSpline(lib_rt_sorted, meas_rt_sorted, s=len(lib_rt_sorted)*0.1)
+        
         lib_rt_fit = np.linspace(lib_rt_sorted.min(), lib_rt_sorted.max(), 500)
         meas_rt_fit = spl(lib_rt_fit)
         
@@ -4189,47 +4373,65 @@ def plot_rt_correlation(rt_pairs, output_prefix):
         residuals = meas_rt_sorted - meas_rt_pred
         sd_residuals = np.std(residuals)
         
-        # Create plot
-        fig, ax = plt.subplots(figsize=(10, 10))
+        # Check if result is valid (not nan)
+        if np.isnan(sd_residuals) or np.isnan(meas_rt_fit).any():
+            raise ValueError("Spline fit produced NaN values")
+            
+    except (Warning, Exception) as e:
+        # Fall back to linear regression
+        print(f"  Spline fitting failed or produced warnings, using linear regression for plot")
+        fit_method = 'linear'
         
-        # Use hexbin for density visualization if many points, otherwise scatter
-        if len(target_df) > 1000:
-            # Hexbin plot for high-density visualization
-            hexbin = ax.hexbin(lib_rt, meas_rt, gridsize=50, cmap='Blues', mincnt=1, alpha=0.8)
-            plt.colorbar(hexbin, ax=ax, label='Peptide Count')
-            plot_type = 'hexbin'
-        else:
-            # Scatter plot for smaller datasets
-            ax.scatter(lib_rt, meas_rt, alpha=0.3, s=20, c='blue', label='Target peptides')
-            plot_type = 'scatter'
+        # Linear regression
+        from scipy import stats
+        slope, intercept, r_value, p_value, std_err = stats.linregress(lib_rt_sorted, meas_rt_sorted)
         
-        # LOESS fit
-        ax.plot(lib_rt_fit, meas_rt_fit, 'r-', linewidth=2, label='LOESS fit', zorder=10)
-        ax.plot(lib_rt_fit, meas_rt_fit + sd_residuals, 'orange', linestyle='--', linewidth=1.5, 
-                label=f'+SD ({sd_residuals:.2f})', zorder=10)
-        ax.plot(lib_rt_fit, meas_rt_fit - sd_residuals, 'orange', linestyle='--', linewidth=1.5, 
-                label=f'-SD ({sd_residuals:.2f})', zorder=10)
+        lib_rt_fit = np.linspace(lib_rt_sorted.min(), lib_rt_sorted.max(), 500)
+        meas_rt_fit = slope * lib_rt_fit + intercept
         
-        # Note: Library RT may be in iRT units (unitless), not minutes
-        # Don't assume perfect correlation (slope=1) - removed diagonal line
-        
-        ax.set_xlabel('Library RT (may be iRT units)', fontsize=12)
-        ax.set_ylabel('Measured RT (minutes)', fontsize=12)
-        ax.set_title(f'Retention Time Correlation (<1% FDR targets)\nN = {len(target_df):,} peptides', 
-                    fontsize=14, fontweight='bold')
-        ax.legend(fontsize=10)
-        ax.grid(alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(f'{output_prefix}_rt_correlation.png', dpi=300)
-        plt.close()
-        print(f"RT correlation plot saved: {output_prefix}_rt_correlation.png")
-        print(f"  Visualization type: {plot_type}")
-        print(f"  SD of residuals = {sd_residuals:.2f}")
-        
-    except Exception as e:
-        print(f"\nError generating RT correlation plot: {e}")
-        print("  This may occur with insufficient data points or RT range")
+        # Calculate residuals
+        meas_rt_pred = slope * lib_rt_sorted + intercept
+        residuals = meas_rt_sorted - meas_rt_pred
+        sd_residuals = np.std(residuals)
+    
+    # Create plot
+    fig, ax = plt.subplots(figsize=(10, 10))
+    
+    # Use hexbin for density visualization if many points, otherwise scatter
+    if len(target_df) > 1000:
+        # Hexbin plot for high-density visualization
+        hexbin = ax.hexbin(lib_rt, meas_rt, gridsize=50, cmap='Blues', mincnt=1, alpha=0.8)
+        plt.colorbar(hexbin, ax=ax, label='Peptide Count')
+        plot_type = 'hexbin'
+    else:
+        # Scatter plot for smaller datasets
+        ax.scatter(lib_rt, meas_rt, alpha=0.3, s=20, c='blue', label='Target peptides')
+        plot_type = 'scatter'
+    
+    # Fit line (LOESS/spline or linear)
+    fit_label = 'LOESS fit' if fit_method == 'spline' else 'Linear fit'
+    ax.plot(lib_rt_fit, meas_rt_fit, 'r-', linewidth=2, label=fit_label, zorder=10)
+    ax.plot(lib_rt_fit, meas_rt_fit + sd_residuals, 'orange', linestyle='--', linewidth=1.5, 
+            label=f'+SD ({sd_residuals:.2f})', zorder=10)
+    ax.plot(lib_rt_fit, meas_rt_fit - sd_residuals, 'orange', linestyle='--', linewidth=1.5, 
+            label=f'-SD ({sd_residuals:.2f})', zorder=10)
+    
+    # Note: Library RT may be in iRT units (unitless), not minutes
+    # Don't assume perfect correlation (slope=1) - removed diagonal line
+    
+    ax.set_xlabel('Library RT (may be iRT units)', fontsize=12)
+    ax.set_ylabel('Measured RT (minutes)', fontsize=12)
+    ax.set_title(f'Retention Time Correlation (<1% FDR targets)\nN = {len(target_df):,} peptides', 
+                fontsize=14, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f'{output_prefix}_rt_correlation.png', dpi=300)
+    plt.close()
+    print(f"RT correlation plot saved: {output_prefix}_rt_correlation.png")
+    print(f"  Visualization type: {plot_type}")
+    print(f"  SD of residuals = {sd_residuals:.2f}")
 
 
 def run_calibration_workflow(xcorr_engine, library, spectra, ms1_spectra, charge_states,
@@ -4289,8 +4491,8 @@ def run_calibration_workflow(xcorr_engine, library, spectra, ms1_spectra, charge
             # Create target with charge info
             target = PeptideCand(sequence=sequence, protein_id='CALIBRATION', mass=mass, charge=charge)
             
-            # Generate decoy
-            decoy_seq = xcorr_engine.generate_decoy_sequence(sequence, decoy_cycle_length)
+            # Generate decoy with proper enzyme parameter
+            decoy_seq = xcorr_engine.generate_decoy_sequence(sequence, decoy_cycle_length, enzyme)
             decoy_mass = sum(xcorr_engine.aa_masses.get(aa, 0) for aa in decoy_seq)
             decoy_mass += xcorr_engine.h2o_mass
             decoy = PeptideCand(sequence=decoy_seq, protein_id='DECOY_CALIBRATION', mass=decoy_mass, charge=charge)
@@ -4408,26 +4610,41 @@ def run_calibration_workflow(xcorr_engine, library, spectra, ms1_spectra, charge
         
         # Convert results to DataFrame for FDR filtering
         winners_data = []
+        
+        # Determine which score to use for competition based on fragment tolerance unit
+        # When using mz (Dalton) units, use XCorr instead of LibCosine
+        use_xcorr_for_calibration = (lib_fragment_tol_unit == 'mz')
+        score_name = 'XCorr' if use_xcorr_for_calibration else 'LibCosine'
+        
+        if use_xcorr_for_calibration:
+            print(f"\n  Using XCorr for calibration FDR (lib_fragment_tol_unit = {lib_fragment_tol_unit})")
+        
         for pair_data in all_results:
             target = pair_data['target']
             decoy = pair_data['decoy']
             
-            # Determine winner (higher LibCosine wins)
-            target_score = target.get('best_lib_cosine_target', 0)
-            decoy_score = decoy.get('best_lib_cosine_decoy', 0)
+            # Determine winner based on selected score
+            if use_xcorr_for_calibration:
+                # Use XCorr for competition
+                target_score = target.get('best_xcorr', 0)
+                decoy_score = decoy.get('best_xcorr', 0)
+            else:
+                # Use LibCosine for competition (default)
+                target_score = target.get('best_lib_cosine_target', 0)
+                decoy_score = decoy.get('best_lib_cosine_decoy', 0)
             
             if target_score >= decoy_score:
                 winners_data.append({
                     'Peptide': target['peptide'].sequence,
                     'Charge': target['charge'],
-                    'LibCosine': target_score,
+                    score_name: target_score,
                     'IsTarget': 'Target'
                 })
             else:
                 winners_data.append({
                     'Peptide': decoy['peptide'].sequence,
                     'Charge': decoy['charge'],
-                    'LibCosine': decoy_score,
+                    score_name: decoy_score,
                     'IsTarget': 'Decoy'
                 })
         
@@ -4435,7 +4652,7 @@ def run_calibration_workflow(xcorr_engine, library, spectra, ms1_spectra, charge
         
         # Filter to 1% FDR
         print("\n  Filtering calibration results to 1% FDR...")
-        filtered_qc = filter_qc_data_by_fdr(all_qc_data, winners_df, fdr_threshold=0.01)
+        filtered_qc = filter_qc_data_by_fdr(all_qc_data, winners_df, fdr_threshold=0.01, score_column=score_name)
         num_confident = filtered_qc['num_precursors']
         
         print(f"  High-confidence target precursors at 1% FDR: {num_confident}")
@@ -4444,14 +4661,35 @@ def run_calibration_workflow(xcorr_engine, library, spectra, ms1_spectra, charge
             total_calibration_time = time.time() - calibration_start
             print(f"✓ Calibration successful: {num_confident} confident peptides ({total_calibration_time/60:.1f} min total)")
             
-            # Calculate calibration parameters
-            print("\n  Calculating m/z calibration...")
-            mz_cal = xcorr_engine.calculate_mz_calibration(filtered_qc)
+            # Determine which m/z calibrations to perform
+            # Skip MS1 calibration if lib_precursor_tol_unit is 'mz'
+            # Skip MS2 calibration if lib_fragment_tol_unit is 'mz'
+            calibrate_ms1 = (lib_precursor_tol_unit != 'mz')
+            calibrate_ms2 = (lib_fragment_tol_unit != 'mz')
             
-            print(f"    MS1: mean = {mz_cal['ms1_mean']:.4f} {mz_cal['ms1_unit']}, "
-                  f"SD = {mz_cal['ms1_sd']:.4f} {mz_cal['ms1_unit']}")
-            print(f"    MS2: mean = {mz_cal['ms2_mean']:.4f} {mz_cal['ms2_unit']}, "
-                  f"SD = {mz_cal['ms2_sd']:.4f} {mz_cal['ms2_unit']}")
+            # Calculate calibration parameters
+            if calibrate_ms1 or calibrate_ms2:
+                print("\n  Calculating m/z calibration...")
+                mz_cal = xcorr_engine.calculate_mz_calibration(filtered_qc)
+                
+                if calibrate_ms1:
+                    print(f"    MS1: mean = {mz_cal['ms1_mean']:.4f} {mz_cal['ms1_unit']}, "
+                          f"SD = {mz_cal['ms1_sd']:.4f} {mz_cal['ms1_unit']}")
+                else:
+                    print(f"    MS1: SKIPPED (tolerance unit is 'mz', no calibration needed)")
+                    
+                if calibrate_ms2:
+                    print(f"    MS2: mean = {mz_cal['ms2_mean']:.4f} {mz_cal['ms2_unit']}, "
+                          f"SD = {mz_cal['ms2_sd']:.4f} {mz_cal['ms2_unit']}")
+                else:
+                    print(f"    MS2: SKIPPED (tolerance unit is 'mz', no calibration needed)")
+            else:
+                print("\n  Skipping m/z calibration (both tolerance units are 'mz')")
+                # Create dummy mz_cal for structure consistency
+                mz_cal = {
+                    'ms1_mean': 0.0, 'ms1_sd': 0.0, 'ms1_unit': 'mz',
+                    'ms2_mean': 0.0, 'ms2_sd': 0.0, 'ms2_unit': 'mz'
+                }
             
             print("\n  Fitting RT calibration...")
             rt_cal = xcorr_engine.fit_rt_calibration(filtered_qc['rt_pairs'])
@@ -4462,28 +4700,34 @@ def run_calibration_workflow(xcorr_engine, library, spectra, ms1_spectra, charge
             print(f"    RT window (3σ) = ±{3 * rt_cal['residual_sd']:.2f} min")
             
             # Create calibration dictionary
+            # Set ms1_calibration to None if lib_precursor_tol_unit is 'mz'
+            # Set ms2_calibration to None if lib_fragment_tol_unit is 'mz'
             calibration = {
                 'calibration_metadata': {
                     'timestamp': datetime.now().isoformat(),
                     'num_library_peptides_sampled': num_peptides,
                     'num_passing_fdr': num_confident,
                     'fdr_threshold': 0.01,
-                    'calibration_successful': True
+                    'calibration_successful': True,
+                    'ms1_calibrated': calibrate_ms1,
+                    'ms2_calibrated': calibrate_ms2
                 },
                 'ms1_calibration': {
-                    'mean': mz_cal['ms1_mean'],
-                    'sd': mz_cal['ms1_sd'],
+                    'mean': mz_cal['ms1_mean'] if calibrate_ms1 else 0.0,
+                    'sd': mz_cal['ms1_sd'] if calibrate_ms1 else 0.0,
                     'unit': mz_cal['ms1_unit'],
-                    'adjusted_tolerance': mz_cal['ms1_mean'] + 3 * mz_cal['ms1_sd'],
-                    'window_halfwidth_multiplier': 3.0
-                },
+                    'adjusted_tolerance': (mz_cal['ms1_mean'] + 3 * mz_cal['ms1_sd']) if calibrate_ms1 else None,
+                    'window_halfwidth_multiplier': 3.0 if calibrate_ms1 else None,
+                    'calibrated': calibrate_ms1
+                } if calibrate_ms1 else None,
                 'ms2_calibration': {
-                    'mean': mz_cal['ms2_mean'],
-                    'sd': mz_cal['ms2_sd'],
+                    'mean': mz_cal['ms2_mean'] if calibrate_ms2 else 0.0,
+                    'sd': mz_cal['ms2_sd'] if calibrate_ms2 else 0.0,
                     'unit': mz_cal['ms2_unit'],
-                    'adjusted_tolerance': mz_cal['ms2_mean'] + 3 * mz_cal['ms2_sd'],
-                    'window_halfwidth_multiplier': 3.0
-                },
+                    'adjusted_tolerance': (mz_cal['ms2_mean'] + 3 * mz_cal['ms2_sd']) if calibrate_ms2 else None,
+                    'window_halfwidth_multiplier': 3.0 if calibrate_ms2 else None,
+                    'calibrated': calibrate_ms2
+                } if calibrate_ms2 else None,
                 'rt_calibration': rt_cal
             }
             
@@ -4496,10 +4740,12 @@ def run_calibration_workflow(xcorr_engine, library, spectra, ms1_spectra, charge
             print("\n  Generating QC plots...")
             qc_output_prefix = os.path.splitext(output_file)[0] + '.calibration'
             
-            plot_mass_accuracy_histograms(
-                filtered_qc['ms1_mass_errors'],
-                filtered_qc['ms2_mass_errors'],
-                qc_output_prefix,
+            # Only plot mass accuracy if at least one m/z calibration was performed
+            if calibrate_ms1 or calibrate_ms2:
+                plot_mass_accuracy_histograms(
+                    filtered_qc['ms1_mass_errors'] if calibrate_ms1 else [],
+                    filtered_qc['ms2_mass_errors'] if calibrate_ms2 else [],
+                    qc_output_prefix,
                 ms1_unit=mz_cal['ms1_unit'],
                 ms2_unit=mz_cal['ms2_unit'],
                 num_precursors=num_confident
@@ -4603,6 +4849,10 @@ def process_isolation_window_worker(args):
 
     # Determine if this is calibration mode: no calibration input + no parquet output
     is_calibration_mode = (calibration is None and parquet_file is None and library is not None)
+    
+    # During calibration: skip XCorr ONLY if using PPM units (LibCosine is sufficient)
+    # If using MZ units: MUST calculate XCorr for calibration scoring
+    skip_xcorr = is_calibration_mode and (lib_fragment_tol_unit == 'ppm')
 
     # Perform DIA peptide-centric search
     search_result = xcorr_engine.search_dia_peptide_centric(
@@ -4617,7 +4867,7 @@ def process_isolation_window_worker(args):
         lib_fragment_tol_unit=lib_fragment_tol_unit,
         lib_precursor_tol_unit=lib_precursor_tol_unit,
         calibration=calibration,  # Pass calibration for RT filtering and adjusted tolerances
-        skip_xcorr_matrix=is_calibration_mode,  # Skip XCorr during calibration, calculate during full search
+        skip_xcorr_matrix=skip_xcorr,  # Skip XCorr only during PPM calibration
         verbose=verbose
     )
 
@@ -4925,6 +5175,8 @@ def run_mokapot(results_df: pd.DataFrame, library_mode: bool = True, n_workers: 
         if max_hyperscore > 1e50:
             print(f"  Warning: Hyperscore overflow detected (max={max_hyperscore:.2e}), capping at 1e50")
             pin_df['Hyperscore'] = pin_df['Hyperscore'].clip(upper=1e50)
+        # Format Hyperscore in scientific notation for output
+        pin_df['Hyperscore'] = pin_df['Hyperscore'].apply(lambda x: f"{x:.4e}" if pd.notna(x) else x)
     
     # Write PIN file
     pin_df.to_csv(pin_output, sep='\t', index=False)
@@ -5002,7 +5254,7 @@ def main():
     
     parser = argparse.ArgumentParser(description='Comet-style Fast XCorr Database Search with Target-Decoy Competition')
     parser.add_argument('fasta_file', help='FASTA file containing protein sequences')
-    parser.add_argument('mzml_file', help='mzML file containing mass spectra')
+    parser.add_argument('mzml_file', help='Spectrum file: mzML, mzXML, or Thermo RAW (.raw)')
     parser.add_argument('--output', '-o', default='', help='Output file (pepXML format). If not specified, uses mzML filename with .pepXML extension')
     parser.add_argument('--pin_output', '-p', default='', help='Percolator Input (PIN) output file. If not specified, uses mzML filename with .pin extension')
     parser.add_argument('--dia_mode', action='store_true', 
@@ -5250,23 +5502,35 @@ def main():
     
     # No need for separate peptide indexing - we'll search pairs directly
     mzml_start = time.time()
-    print("Reading mzML file...")
+    
+    # Detect file type for informative message
+    file_type = "RAW" if args.mzml_file.lower().endswith('.raw') else "mzML"
+    print(f"Reading {file_type} file...")
     if args.max_spectra > 0:
         print(f"Limiting to first {args.max_spectra} MS2 spectra")
     
     # Check if DIA mode with library is enabled - use combined reader
     if args.dia_mode and args.speclib:
-        print("Using combined single-pass mzML reader (MS1 + MS2)...")
-        spectra, ms1_spectra = xcorr_engine.read_mzml_combined(args.mzml_file, args.max_spectra)
+        print(f"Using combined single-pass {file_type} reader (MS1 + MS2)...")
+        spectra, ms1_spectra = xcorr_engine.read_spectra_combined(args.mzml_file, args.max_spectra)
         mzml_elapsed = time.time() - mzml_start
         print(f"  Loaded {len(spectra)} MS2 spectra")
         print(f"  Loaded {len(ms1_spectra)} MS1 spectra for precursor isotope scoring")
-        print(f"  mzML read completed in {mzml_elapsed/60:.1f} min (elapsed: {(time.time()-workflow_start_time)/60:.1f} min)")
+        print(f"  {file_type} read completed in {mzml_elapsed/60:.1f} min (elapsed: {(time.time()-workflow_start_time)/60:.1f} min)")
     else:
         # Standard MS2-only read
-        spectra = xcorr_engine.read_mzml(args.mzml_file, args.max_spectra)
+        if args.mzml_file.lower().endswith('.raw'):
+            # For RAW files, use combined reader but only extract MS2
+            if not ALPHARAW_AVAILABLE:
+                raise ImportError(
+                    "alpharaw is required to read Thermo RAW files. "
+                    "Install with: pip install alpharaw"
+                )
+            spectra, _ = xcorr_engine.read_spectra_combined(args.mzml_file, args.max_spectra)
+        else:
+            spectra = xcorr_engine.read_mzml(args.mzml_file, args.max_spectra)
         mzml_elapsed = time.time() - mzml_start
-        print(f"  mzML read completed in {mzml_elapsed/60:.1f} min (elapsed: {(time.time()-workflow_start_time)/60:.1f} min)")
+        print(f"  {file_type} read completed in {mzml_elapsed/60:.1f} min (elapsed: {(time.time()-workflow_start_time)/60:.1f} min)")
         ms1_spectra = None
     
     print(f"Processing {len(spectra)} MS2 spectra with Target-Decoy Competition")
@@ -5470,11 +5734,49 @@ def main():
         
         # TSV results already written incrementally during processing
         
-        # Perform target-decoy competition and calculate FDR
-        print("\n=== TARGET-DECOY COMPETITION ANALYSIS ===")
-        print("Reading TSV results to perform competition...")
+        # DEDUPLICATION: Keep only best result per precursor across all isolation windows
+        print("\n=== DEDUPLICATING RESULTS ACROSS ISOLATION WINDOWS ===")
+        print("Reading TSV results...")
         
         tsv_df = pd.read_csv(args.dia_output, sep='\t')
+        
+        # Check if precursors appear in multiple isolation windows
+        precursor_counts = tsv_df.groupby(['Peptide', 'Charge']).size()
+        duplicated_precursors = precursor_counts[precursor_counts > 1]
+        
+        if len(duplicated_precursors) > 0:
+            print(f"  Found {len(duplicated_precursors):,} precursors appearing in multiple isolation windows")
+            print(f"  Total rows before deduplication: {len(tsv_df):,}")
+            
+            # Determine scoring column based on mode
+            is_library_mode = 'LibCosine' in tsv_df.columns
+            if is_library_mode:
+                primary_score_col = 'LibCosine'
+                print("  Using LibCosine as primary score for deduplication")
+            else:
+                primary_score_col = 'BestXCorr'
+                print("  Using XCorr as primary score for deduplication")
+            
+            # For each precursor, keep only the row with best primary score
+            # Sort by (Peptide, Charge, primary_score) descending, then drop duplicates keeping first
+            tsv_df_sorted = tsv_df.sort_values(
+                by=['Peptide', 'Charge', primary_score_col],
+                ascending=[True, True, False]
+            )
+            tsv_df = tsv_df_sorted.drop_duplicates(subset=['Peptide', 'Charge'], keep='first')
+            
+            print(f"  Total rows after deduplication: {len(tsv_df):,}")
+            print(f"  Rows removed: {len(tsv_df_sorted) - len(tsv_df):,}")
+            
+            # Overwrite TSV file with deduplicated results
+            print(f"  Writing deduplicated results to {args.dia_output}...")
+            tsv_df.to_csv(args.dia_output, sep='\t', index=False)
+            print("  Done!")
+        else:
+            print(f"  No duplicate precursors found (all {len(tsv_df):,} precursors appear in exactly one window)")
+        
+        # Perform target-decoy competition and calculate FDR
+        print("\n=== TARGET-DECOY COMPETITION ANALYSIS ===")
         
         # Determine if this is library mode or non-library mode
         is_library_mode = 'LibCosine' in tsv_df.columns
@@ -5679,6 +5981,9 @@ def main():
             
             # Save updated results with Mokapot columns
             print(f"\nSaving results with Mokapot scores: {args.dia_output}")
+            # Format Hyperscore in scientific notation before saving
+            if 'Hyperscore' in tsv_df.columns:
+                tsv_df['Hyperscore'] = tsv_df['Hyperscore'].apply(lambda x: f"{x:.4e}" if pd.notna(x) else x)
             tsv_df.to_csv(args.dia_output, sep='\t', index=False)
             print("  Updated TSV file with mokapot_precursor_qvalue and mokapot_peptide_qvalue columns")
             

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-pyXcorrDIA is a fast proteomics database search engine that implements the SEQUEST Cross-Correlation (XCorr) algorithm based on Comet's approach. It performs peptide identification from mass spectrometry data using target-decoy competition for FDR estimation.
+pyXcorrDIA is a proteomics database search engine that implements the SEQUEST Cross-Correlation (XCorr) algorithm based on Comet's approach. It performs peptide identification from mass spectrometry data using target-decoy competition for FDR estimation.
 
 **Key Purpose**: High-performance peptide-spectrum matching (PSM) for data-independent acquisition (DIA) proteomics experiments with spectral library support.
 

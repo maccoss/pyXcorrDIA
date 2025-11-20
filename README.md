@@ -14,7 +14,7 @@ A simple python DIA search tool for prototyping ideas.
 - **Multi-enzyme support** - 10 protease digestion options including Trypsin, Lys-C, Arg-C, and more
 - **Fast spectrum preprocessing** - Efficient binning, windowing normalization, and Fast XCorr calculation
 - **Target-decoy search** - Built-in decoy generation and target-decoy competition
-- **Multiple file formats** - Supports mzML and MGF (via pyteomics) input
+- **Multiple file formats** - Supports mzML, mzXML, MGF (via pyteomics), and Thermo RAW files (via alpharaw)
 - **Flexible modifications** - Configurable static modifications (default: Carbamidomethyl-C)
 - **Multiple output formats** - pepXML and Percolator Input (PIN) files for spectrum-centric (needs testing); simplified TSV for DIA
 - **E-value calculation** - Comet's E-value approach for improved sensitivity (non-library mode)
@@ -40,7 +40,48 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
+
+# Optional: Install alpharaw for Thermo RAW file support
+pip install alpharaw
 ```
+
+### Thermo RAW File Support
+
+To read Thermo RAW files directly, you need to install alpharaw and its dependencies:
+
+**Windows:**
+```bash
+pip install alpharaw
+```
+
+**Linux / MacOS (Intel):**
+```bash
+# First install mono (required for .NET interop)
+conda install mono
+
+# Then install alpharaw
+pip install alpharaw
+```
+
+**MacOS (Apple Silicon M1/M2/M3):**
+```bash
+# Install mono via homebrew
+brew install mono
+
+# May need to install specific version if you get runtime errors
+# conda install mono=6.12.0.182 -c anaconda -y
+
+# Then install alpharaw
+pip install alpharaw
+```
+
+Once installed, you can use RAW files directly:
+
+```bash
+python pyXcorrDIA.py database.fasta data.raw --dia_mode --speclib library.parquet
+```
+
+If alpharaw is not installed, pyXcorrDIA will still work with mzML and mzXML files.
 
 ## Quick Start
 

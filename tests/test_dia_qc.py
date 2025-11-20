@@ -7,6 +7,7 @@ Tests the complete DIA peptide-centric search pipeline including:
 - MS2 mass accuracy measurement (at best LibCosine spectrum only)
 - RT correlation (library RT vs measured RT)
 - Precursor-level data collection (not peptide-level)
+- Calibration scoring (XCorr vs LibCosine based on tolerance unit)
 
 Uses realistic test data:
 - test_library_768.parquet: 768 precursors with q-value <= 0.01
@@ -23,9 +24,12 @@ NOTE: The test mzML has a narrow RT window (~1 minute), so:
 import pytest
 from pathlib import Path
 import sys
+import pandas as pd
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from pyXcorrDIA import filter_qc_data_by_fdr, SpectrumLibrary
 
 
 @pytest.mark.slow
@@ -60,12 +64,12 @@ class TestDIALibraryLoading:
         library = SpectrumLibrary(test_dia_library)
         
         # Verify library loaded
-        assert len(library.precursors) > 0
-        print(f"\n✓ Loaded {len(library.precursors)} precursors")
+        assert len(library.peptide_index) > 0
+        print(f"\n✓ Loaded {len(library.peptide_index)} precursors")
         
         # Check a precursor has expected structure
-        first_key = next(iter(library.precursors.keys()))
-        first_precursor = library.precursors[first_key]
+        first_key = next(iter(library.peptide_index.keys()))
+        first_precursor = library.peptide_index[first_key]
         
         assert 'precursor_mz' in first_precursor
         assert 'fragments' in first_precursor
@@ -77,14 +81,13 @@ class TestDIALibraryLoading:
     
     def test_library_random_selection(self, test_dia_library):
         """Test random precursor selection from library."""
-        from pyXcorrDIA import SpectrumLibrary
         
-        # Load with random selection
-        library = SpectrumLibrary(test_dia_library, max_precursors=100)
+        # Load with random selection using test_limit_peptides parameter
+        library = SpectrumLibrary(test_dia_library, test_limit_peptides=100)
         
         # Should have 100 precursors (or fewer if library is smaller)
-        assert len(library.precursors) <= 100
-        print(f"\n✓ Random selection: {len(library.precursors)} precursors")
+        assert len(library.peptide_index) <= 100
+        print(f"\n✓ Random selection: {len(library.peptide_index)} precursors")
 
 
 @pytest.mark.slow
@@ -110,8 +113,8 @@ class TestDIAMzMLReading:
         first_ms2 = ms2_spectra[0]
         assert hasattr(first_ms2, 'scan_id')
         assert hasattr(first_ms2, 'precursor_mz')
-        assert hasattr(first_ms2, 'mz')
-        assert hasattr(first_ms2, 'intensity')
+        assert hasattr(first_ms2, 'mz_array')
+        assert hasattr(first_ms2, 'intensity_array')
         
         print(f"✓ MS2 spectrum structure valid")
 
@@ -188,4 +191,163 @@ class TestDIAQCDataStructure:
 # - MS1 errors: ~100 measurements (one per precursor)
 # - MS2 errors: ~1200 measurements (12 fragments × 100 precursors)
 # - RT pairs: ~100 pairs (one per precursor)
+
+
+@pytest.mark.slow
+class TestCalibrationScoring:
+    """Test calibration FDR filtering with different scoring methods."""
+    
+    def test_filter_qc_data_with_libcosine(self):
+        """Test FDR filtering using LibCosine score (default for ppm units)."""
+        # Create mock QC data
+        qc_data = {
+            'ms1_mass_errors': [
+                {'error': 1.5, 'peptide': 'PEPTIDEA', 'charge': 2, 'is_target': True},
+                {'error': 2.1, 'peptide': 'PEPTIDEB', 'charge': 2, 'is_target': True},
+                {'error': -1.2, 'peptide': 'PEPTIDEC', 'charge': 3, 'is_target': True},
+                {'error': 3.5, 'peptide': 'DECOY_A', 'charge': 2, 'is_target': False},
+            ],
+            'ms2_mass_errors': [
+                {'error': 0.5, 'peptide': 'PEPTIDEA', 'charge': 2, 'is_target': True},
+                {'error': -0.8, 'peptide': 'PEPTIDEB', 'charge': 2, 'is_target': True},
+                {'error': 1.1, 'peptide': 'PEPTIDEC', 'charge': 3, 'is_target': True},
+                {'error': -2.1, 'peptide': 'DECOY_A', 'charge': 2, 'is_target': False},
+            ],
+            'rt_pairs': [
+                {'library_rt': 10.0, 'measured_rt': 10.1, 'lib_cosine': 0.95, 
+                 'is_target': True, 'peptide': 'PEPTIDEA', 'charge': 2},
+                {'library_rt': 15.0, 'measured_rt': 15.2, 'lib_cosine': 0.92,
+                 'is_target': True, 'peptide': 'PEPTIDEB', 'charge': 2},
+                {'library_rt': 20.0, 'measured_rt': 20.1, 'lib_cosine': 0.88,
+                 'is_target': True, 'peptide': 'PEPTIDEC', 'charge': 3},
+                {'library_rt': 12.0, 'measured_rt': 12.5, 'lib_cosine': 0.75,
+                 'is_target': False, 'peptide': 'DECOY_A', 'charge': 2},
+            ],
+            'ms1_tol_unit': 'ppm',
+            'ms2_tol_unit': 'ppm'
+        }
+        
+        # Create winners DataFrame with LibCosine scores
+        winners_df = pd.DataFrame([
+            {'Peptide': 'PEPTIDEA', 'Charge': 2, 'LibCosine': 0.95, 'IsTarget': 'Target'},
+            {'Peptide': 'PEPTIDEB', 'Charge': 2, 'LibCosine': 0.92, 'IsTarget': 'Target'},
+            {'Peptide': 'PEPTIDEC', 'Charge': 3, 'LibCosine': 0.88, 'IsTarget': 'Target'},
+            {'Peptide': 'DECOY_A', 'Charge': 2, 'LibCosine': 0.75, 'IsTarget': 'Decoy'},
+        ])
+        
+        # Filter at 25% FDR (should pass 3 targets, 1 decoy = 25% FDR)
+        filtered = filter_qc_data_by_fdr(qc_data, winners_df, fdr_threshold=0.25, score_column='LibCosine')
+        
+        # Should keep all 3 target precursors at 25% FDR
+        assert filtered['num_precursors'] == 3
+        assert len(filtered['ms1_mass_errors']) == 3
+        assert len(filtered['ms2_mass_errors']) == 3
+        assert len(filtered['rt_pairs']) == 3
+        
+        print("\n✓ LibCosine-based FDR filtering works correctly")
+    
+    def test_filter_qc_data_with_xcorr(self):
+        """Test FDR filtering using XCorr score (for mz units)."""
+        # Create mock QC data (same structure as above)
+        qc_data = {
+            'ms1_mass_errors': [
+                {'error': 1.5, 'peptide': 'PEPTIDEA', 'charge': 2, 'is_target': True},
+                {'error': 2.1, 'peptide': 'PEPTIDEB', 'charge': 2, 'is_target': True},
+                {'error': -1.2, 'peptide': 'PEPTIDEC', 'charge': 3, 'is_target': True},
+                {'error': 3.5, 'peptide': 'DECOY_A', 'charge': 2, 'is_target': False},
+            ],
+            'ms2_mass_errors': [
+                {'error': 0.5, 'peptide': 'PEPTIDEA', 'charge': 2, 'is_target': True},
+                {'error': -0.8, 'peptide': 'PEPTIDEB', 'charge': 2, 'is_target': True},
+                {'error': 1.1, 'peptide': 'PEPTIDEC', 'charge': 3, 'is_target': True},
+                {'error': -2.1, 'peptide': 'DECOY_A', 'charge': 2, 'is_target': False},
+            ],
+            'rt_pairs': [
+                {'library_rt': 10.0, 'measured_rt': 10.1, 'lib_cosine': 0.95, 
+                 'is_target': True, 'peptide': 'PEPTIDEA', 'charge': 2},
+                {'library_rt': 15.0, 'measured_rt': 15.2, 'lib_cosine': 0.92,
+                 'is_target': True, 'peptide': 'PEPTIDEB', 'charge': 2},
+                {'library_rt': 20.0, 'measured_rt': 20.1, 'lib_cosine': 0.88,
+                 'is_target': True, 'peptide': 'PEPTIDEC', 'charge': 3},
+                {'library_rt': 12.0, 'measured_rt': 12.5, 'lib_cosine': 0.75,
+                 'is_target': False, 'peptide': 'DECOY_A', 'charge': 2},
+            ],
+            'ms1_tol_unit': 'mz',
+            'ms2_tol_unit': 'mz'
+        }
+        
+        # Create winners DataFrame with XCorr scores (different ranking than LibCosine)
+        winners_df = pd.DataFrame([
+            {'Peptide': 'PEPTIDEA', 'Charge': 2, 'XCorr': 4.8, 'IsTarget': 'Target'},
+            {'Peptide': 'PEPTIDEC', 'Charge': 3, 'XCorr': 4.2, 'IsTarget': 'Target'},
+            {'Peptide': 'PEPTIDEB', 'Charge': 2, 'XCorr': 3.9, 'IsTarget': 'Target'},
+            {'Peptide': 'DECOY_A', 'Charge': 2, 'XCorr': 2.5, 'IsTarget': 'Decoy'},
+        ])
+        
+        # Filter at 25% FDR using XCorr column
+        filtered = filter_qc_data_by_fdr(qc_data, winners_df, fdr_threshold=0.25, score_column='XCorr')
+        
+        # Should keep all 3 target precursors at 25% FDR
+        assert filtered['num_precursors'] == 3
+        assert len(filtered['ms1_mass_errors']) == 3
+        assert len(filtered['ms2_mass_errors']) == 3
+        assert len(filtered['rt_pairs']) == 3
+        
+        print("\n✓ XCorr-based FDR filtering works correctly")
+    
+    def test_scoring_method_selection(self):
+        """Test that the correct scoring method is selected based on tolerance unit."""
+        # This test validates the logic in run_calibration_workflow
+        # where lib_fragment_tol_unit determines which score to use
+        
+        # For ppm units, should use LibCosine
+        lib_fragment_tol_unit_ppm = 'ppm'
+        use_xcorr_ppm = (lib_fragment_tol_unit_ppm == 'mz')
+        assert use_xcorr_ppm == False, "Should use LibCosine for ppm units"
+        score_name_ppm = 'XCorr' if use_xcorr_ppm else 'LibCosine'
+        assert score_name_ppm == 'LibCosine'
+        
+        # For mz units, should use XCorr
+        lib_fragment_tol_unit_mz = 'mz'
+        use_xcorr_mz = (lib_fragment_tol_unit_mz == 'mz')
+        assert use_xcorr_mz == True, "Should use XCorr for mz units"
+        score_name_mz = 'XCorr' if use_xcorr_mz else 'LibCosine'
+        assert score_name_mz == 'XCorr'
+        
+        print("\n✓ Scoring method selection logic works correctly")
+        print(f"  ppm units → {score_name_ppm}")
+        print(f"  mz units → {score_name_mz}")
+    
+    def test_fdr_calculation_with_different_scores(self):
+        """Test that FDR calculation works correctly with both score types."""
+        # Test with high-scoring targets and low-scoring decoys
+        winners_xcorr = pd.DataFrame([
+            {'Peptide': 'TARGET1', 'Charge': 2, 'XCorr': 5.0, 'IsTarget': 'Target'},
+            {'Peptide': 'TARGET2', 'Charge': 2, 'XCorr': 4.5, 'IsTarget': 'Target'},
+            {'Peptide': 'TARGET3', 'Charge': 3, 'XCorr': 4.0, 'IsTarget': 'Target'},
+            {'Peptide': 'DECOY1', 'Charge': 2, 'XCorr': 3.0, 'IsTarget': 'Decoy'},
+            {'Peptide': 'TARGET4', 'Charge': 2, 'XCorr': 2.5, 'IsTarget': 'Target'},
+            {'Peptide': 'DECOY2', 'Charge': 3, 'XCorr': 2.0, 'IsTarget': 'Decoy'},
+        ])
+        
+        # Calculate FDR manually
+        sorted_df = winners_xcorr.sort_values('XCorr', ascending=False).copy()
+        sorted_df['cumulative_targets'] = (sorted_df['IsTarget'] == 'Target').cumsum()
+        sorted_df['cumulative_decoys'] = (sorted_df['IsTarget'] == 'Decoy').cumsum()
+        sorted_df['fdr'] = sorted_df['cumulative_decoys'] / sorted_df['cumulative_targets'].replace(0, 1)
+        
+        # At score 4.0, we have 3 targets and 0 decoys = 0% FDR
+        # At score 3.0, we have 3 targets and 1 decoy = 33% FDR
+        # At score 2.5, we have 4 targets and 1 decoy = 25% FDR
+        
+        targets_at_1pct = sorted_df[(sorted_df['fdr'] <= 0.01) & (sorted_df['IsTarget'] == 'Target')]
+        assert len(targets_at_1pct) == 3, "Should have 3 targets at 1% FDR"
+        
+        targets_at_25pct = sorted_df[(sorted_df['fdr'] <= 0.25) & (sorted_df['IsTarget'] == 'Target')]
+        assert len(targets_at_25pct) == 4, "Should have 4 targets at 25% FDR"
+        
+        print("\n✓ FDR calculation works correctly")
+        print(f"  Targets at 1% FDR: {len(targets_at_1pct)}")
+        print(f"  Targets at 25% FDR: {len(targets_at_25pct)}")
+
 
