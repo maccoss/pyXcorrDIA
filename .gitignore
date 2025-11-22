@@ -12,6 +12,7 @@ comet.params
 *.pyc
 report*.parquet
 *.dia.tsv
+<<<<<<< Updated upstream
 /.ruff_cache
 /.claude
 /.pytest_cache
@@ -28,3 +29,15 @@ data/mokapot_feature_weights.txt
 data/Ast-Neo-15min-2mz-4ms-200agc-10.dia.log
 data/Ast-Neo-15min-2mz-4ms-200agc-10.dia.calibration.json
 data/Ast-Neo-15min-2mz-4ms-200agc-10.mzML
+/venv
+Ecl_2023_0209_neo_pepsep_150um_15cm_1-9_60min_TRX-DDA-Hs27-Xray-Recovery-0Gy-T1-0h-Pool-FR0_214.mzML
+Ste-2025-01-08_I_1Th_GPFDIA_400-500_15m_015.mzML
+=======
+__pycache__/pyXcorrDIA.cpython-312.pyc
+DIANN-Output/report-lib.predicted.speclib
+tests/data/test_dia_60000-70000.mzML
+tests/data/test_dia_full.mzML
+/data
+/venv
+*.mzML
+>>>>>>> Stashed changes
