@@ -1,24 +1,28 @@
 {
   "calibration_metadata": {
-    "timestamp": "2025-11-18T20:50:43.397597",
+    "timestamp": "2025-11-20T15:00:50.822916",
     "num_library_peptides_sampled": 2000,
     "num_passing_fdr": 690,
     "fdr_threshold": 0.01,
-    "calibration_successful": true
+    "calibration_successful": true,
+    "ms1_calibrated": true,
+    "ms2_calibrated": true
   },
   "ms1_calibration": {
     "mean": 0.6714470398492087,
     "sd": 2.528196457929429,
     "unit": "ppm",
     "adjusted_tolerance": 8.256036413637496,
-    "window_halfwidth_multiplier": 3.0
+    "window_halfwidth_multiplier": 3.0,
+    "calibrated": true
   },
   "ms2_calibration": {
     "mean": -0.6000113315819786,
     "sd": 3.095870235527986,
     "unit": "ppm",
     "adjusted_tolerance": 8.68759937500198,
-    "window_halfwidth_multiplier": 3.0
+    "window_halfwidth_multiplier": 3.0,
+    "calibrated": true
   },
   "rt_calibration": {
     "method": "loess",
